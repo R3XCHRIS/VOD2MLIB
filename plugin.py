@@ -459,7 +459,17 @@ class Plugin(HttpfsControlMixin):
         logger.info("VOD .strm Generator v%s", self.version)
         logger.info("Action: %s", action)
         logger.info("=" * 60)
-        
+
+        # Option 1 self-heal: any non-mount interaction reconciles the mount if it's
+        # supposed to be up. Mount actions are skipped so an explicit Disable isn't
+        # immediately undone. Best-effort — a reconcile hiccup must not block the action.
+        if not action.startswith("httpfs_"):
+            try:
+                if self._httpfs_state().get("enabled"):
+                    self._httpfs_reconcile(settings, logger)
+            except Exception as e:
+                logger.warning("mount reconcile (pre-action) failed: %s", e)
+
         if action == "scan_all_vods":
             return self._scan_all_vods(settings, logger)
         elif action == "generate_movies":
@@ -1996,6 +2006,26 @@ try:
         except Exception as e:
             logger.warning("Failed to bump PeriodicTask.last_run_at: %s", e)
         return result
+
+    @_vod2mlib_shared_task(name=Plugin._HTTPFS_HEALTHCHECK_CELERY)
+    def _vod2mlib_mount_healthcheck():
+        """Beat-driven mount supervisor (registered by [MOUNT] Enable).
+
+        Reconciles the mount against its desired state using the plugin's *live*
+        settings read from PluginConfig — not a snapshot — so it can never drift.
+        This is what restarts the mount after a crash or a container restart: beat
+        reloads this task from the DB on startup and the next tick repairs the mount.
+        """
+        import logging
+        logger = logging.getLogger("vod2mlib.mount")
+        settings = {}
+        try:
+            from apps.plugins.models import PluginConfig
+            cfg = PluginConfig.objects.get(key=Plugin._HTTPFS_PLUGIN_KEY)
+            settings = cfg.settings or {}
+        except Exception as e:
+            logger.warning("mount healthcheck: could not load live settings (%s)", e)
+        return Plugin()._httpfs_reconcile(settings, logger)
 except Exception as _celery_register_err:
     # Celery may not be importable in some environments. Log to stderr so the
     # cause is visible if the user wonders why scheduled rescans never run.

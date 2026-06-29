@@ -55,3 +55,5 @@ coverage.xml
 # VOD2MLIB mount mode runtime artifacts (written into the plugin dir at runtime)
 *.pid
 mountsrv/server.log
+httpfs_state.json
+httpfs.lock
