@@ -192,7 +192,7 @@ def format_external_ids(tmdb_id: Any = None, imdb_id: Any = None) -> str:
     return (' ' + ' '.join(ids)) if ids else ''
 
 
-def title_with_year(parsed: Dict[str, Any]) -> str:
+def _title_with_year(parsed: Dict[str, Any]) -> str:
     base = parsed['title']
     if parsed.get('year'):
         base += ' (%d)' % parsed['year']
@@ -208,7 +208,7 @@ def folder_name(name, year=None, tmdb_id=None, imdb_id=None) -> str:
     at the same folder name no matter which output produced it.
     """
     p = parse_title(name, year)
-    return sanitize_filename(title_with_year(p) + format_external_ids(tmdb_id, imdb_id))
+    return sanitize_filename(_title_with_year(p) + format_external_ids(tmdb_id, imdb_id))
 
 
 def season_dir_name(season_number: int) -> str:
@@ -235,11 +235,11 @@ def episode_display_title(episode_name: str) -> str:
     return ''
 
 
-def ext_of(relation) -> str:
+def _ext_of(relation) -> str:
     return (getattr(relation, 'container_extension', None) or 'mkv').lstrip('.')
 
 
-def provider_suffix(provider_label: str, stream_id) -> str:
+def _provider_suffix(provider_label: str, stream_id) -> str:
     """' - <provider> - <stream_id>' (or just ' - <stream_id>'); the stream_id
     makes a mount filename unique and lets it resolve back to one provider stream."""
     if provider_label:
@@ -251,23 +251,23 @@ def provider_suffix(provider_label: str, stream_id) -> str:
 
 def movie_filename(name, year, tmdb_id, imdb_id, relation, provider_label='') -> str:
     p = parse_title(name, year)
-    base = title_with_year(p) + format_external_ids(tmdb_id, imdb_id)
+    base = _title_with_year(p) + format_external_ids(tmdb_id, imdb_id)
     sid = getattr(relation, 'stream_id', '')
-    return sanitize_filename(base + provider_suffix(provider_label, sid)) + '.' + ext_of(relation)
+    return sanitize_filename(base + _provider_suffix(provider_label, sid)) + '.' + _ext_of(relation)
 
 
 def episode_filename(series_name, series_year, season_number, episode_number,
                      episode_name, relation, provider_label='') -> str:
     p = parse_title(series_name, series_year)
-    head = title_with_year(p)
+    head = _title_with_year(p)
     se = 'S%02dE%02d' % (int(season_number or 0), int(episode_number or 0))
     ep_title = episode_display_title(episode_name)
     out = '%s - %s' % (head, se)
     if ep_title:
         out += ' - %s' % ep_title
     sid = getattr(relation, 'stream_id', '')
-    out += provider_suffix(provider_label, sid)
-    return sanitize_filename(out) + '.' + ext_of(relation)
+    out += _provider_suffix(provider_label, sid)
+    return sanitize_filename(out) + '.' + _ext_of(relation)
 
 
 # --- .strm file names (one file per movie/episode) -------------------------------
@@ -285,7 +285,7 @@ def episode_basename(series_name, series_year, season_number, episode_number,
     '.strm'/'.nfo'. Identical title head to the mount's episode_filename, so a .strm
     library and the mount name the same episode the same way."""
     p = parse_title(series_name, series_year)
-    head = title_with_year(p)
+    head = _title_with_year(p)
     se = 'S%02dE%02d' % (int(season_number or 0), int(episode_number or 0))
     ep_title = episode_display_title(episode_name)
     out = '%s - %s' % (head, se)

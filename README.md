@@ -190,6 +190,37 @@ How it works: clicking `[MOUNT] Enable` starts a small HTTP server inside the Di
 - The mount is a long-running child process and adds three PyPI dependencies — heavier than the dependency-free `.strm` generator, which is why it's strictly opt-in.
 - `[MOUNT] Disable` stops the server; the `.strm` generator is unaffected either way. You can run both modes at once if you like.
 
+### Refreshing the mount after the catalogue changes
+
+The mount server itself is always live — every listing is a fresh DB query, so new and removed titles are reflected instantly *at the server*. What lags is **rclone's own VFS directory cache** on the host: with `--dir-cache-time 1h` (above), rclone keeps serving a directory's contents from memory for up to an hour, so Plex won't see new or dropped titles until that cache expires.
+
+To force rclone to re-read immediately, use its remote-control API. **This runs on the host where `rclone mount` runs, not inside the Dispatcharr container** — the plugin lives in the container and has no route to the host rclone daemon, so it can't do this for you.
+
+1. Enable the remote control when you start the mount (add to the `rclone mount` command above):
+
+   ```bash
+   rclone mount vod2mlib: /mnt/vod2mlib \
+     --allow-other --read-only --dir-cache-time 1h --poll-interval 0 \
+     --vfs-cache-mode full --cache-dir /var/cache/vod2mlib \
+     --rc --rc-addr 127.0.0.1:5572 --rc-no-auth
+   ```
+
+   (Drop `--rc-no-auth` and use `--rc-user`/`--rc-pass` if the host isn't trusted.)
+
+2. After generating/adding titles, expire the cache so the next listing re-queries the server:
+
+   ```bash
+   # Refresh everything (cheap — just re-reads directory listings):
+   rclone rc vfs/refresh recursive=true
+
+   # Or scope it to one branch to avoid re-walking the whole library:
+   rclone rc vfs/refresh dir=Movies/All recursive=true
+   ```
+
+3. Then trigger a Plex library scan (or let Plex's scheduled scan pick it up) so Plex re-reads the now-fresh directories.
+
+To automate it, run the `rclone rc` call from a host-side cron a few minutes after your VOD2MLIB schedule fires. If you'd rather not run the RC API at all, just rely on `--dir-cache-time` — new titles simply appear once it expires.
+
 ## Troubleshooting
 
 **"Unknown action" error in the toast.** Dispatcharr cached an old version of the plugin module. `docker restart dispatcharr` clears it. Toggling enable/disable on the plugin also forces a reload.

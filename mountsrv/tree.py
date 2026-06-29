@@ -6,8 +6,8 @@ Layout (siblings ``All`` + per-category, per design):
 
 Files are keyed on the provider ``stream_id`` (unique per M3U account), so a file
 path resolves to an exact provider stream without depending on lossy title
-re-parsing. Folder -> object lookups are warmed during directory listing and fall
-back to a tmdb/title parse for cold access.
+re-parsing. Folder -> object lookups resolve by tmdb/imdb id when the folder
+carries one, falling back to a selective title match for id-less folders.
 """
 
 import os
@@ -15,7 +15,7 @@ import re
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional, Dict
+from typing import List, Optional
 
 try:
     from .integration import (
@@ -120,9 +120,6 @@ class VirtualTree:
 
     def __init__(self):
         self._integrator = DispatcharrIntegrator()
-        # folder name -> Movie/Series id, warmed during listing for cheap descent.
-        self._movie_map: Dict[str, int] = {}
-        self._series_map: Dict[str, str] = {}
 
     @property
     def available(self) -> bool:
@@ -140,32 +137,6 @@ class VirtualTree:
                 category_type=content_type, m3u_relations__enabled=True,
             ).values_list('name', flat=True).distinct().order_by('name')
         )
-
-    def movies(self, category: Optional[str] = None) -> List[dict]:
-        """Return [{folder, size, stream_count}] for enabled movies."""
-        try:
-            from apps.vod.models import M3UMovieRelation
-        except ImportError:
-            return []
-        qs = M3UMovieRelation.objects.filter(**_enabled()).select_related(
-            'movie', 'category', 'm3u_account')
-        if category:
-            qs = qs.filter(category__name=category)
-
-        grouped: Dict[int, dict] = {}
-        for rel in qs:
-            mv = rel.movie
-            g = grouped.setdefault(mv.id, {'movie': mv, 'rels': []})
-            g['rels'].append(rel)
-
-        out = []
-        for g in grouped.values():
-            mv = g['movie']
-            folder = self._integrator.movie_folder_name(mv)
-            out.append({'folder': folder, 'stream_count': len(g['rels']),
-                        'size': estimate_size(mv.duration_secs)})
-        out.sort(key=lambda e: e['folder'].lower())
-        return out
 
     def movies_stream(self, category: Optional[str] = None):
         """Yield movie folder names (one per movie), streamed with bounded memory.
@@ -210,9 +181,10 @@ class VirtualTree:
             **_enabled(movie=movie), **sized).select_related('m3u_account', 'category')
         if category:
             qs = qs.filter(category__name=category)
-        multi = qs.count() > 1
+        rels = list(qs)               # materialise once; we count and iterate it
+        multi = len(rels) > 1
         out = []
-        for rel in qs:
+        for rel in rels:
             provider = (rel.m3u_account.name[:24] if (multi and rel.m3u_account) else '')
             fn = self._integrator.movie_filename(movie, rel, provider)
             url = self._integrator.get_proxy_url("movie", str(movie.uuid), rel.stream_id)
@@ -220,27 +192,6 @@ class VirtualTree:
                         'size': size_from_metadata(rel.custom_properties, movie.duration_secs),
                         'stream_url': url})
         out.sort(key=lambda e: e['filename'].lower())
-        return out
-
-    def series(self, category: Optional[str] = None) -> List[dict]:
-        try:
-            from apps.vod.models import M3USeriesRelation
-        except ImportError:
-            return []
-        qs = M3USeriesRelation.objects.filter(**_enabled()).select_related(
-            'series', 'category').order_by('series__name')
-        if category:
-            qs = qs.filter(category__name=category)
-        seen = set()
-        out = []
-        for rel in qs:
-            s = rel.series
-            if s.id in seen:
-                continue
-            seen.add(s.id)
-            folder = self._integrator.series_folder_name(s)
-            out.append({'folder': folder, 'uuid': str(s.uuid)})
-        out.sort(key=lambda e: e['folder'].lower())
         return out
 
     def series_stream(self, category: Optional[str] = None):
@@ -309,11 +260,6 @@ class VirtualTree:
             from apps.vod.models import Movie
         except ImportError:
             return None
-        mid = self._movie_map.get(folder_name)
-        if mid:
-            mv = Movie.objects.filter(id=mid).first()
-            if mv:
-                return mv
         title, year, tmdb, imdb = _parse_folder(folder_name)
         if tmdb:
             mv = Movie.objects.filter(tmdb_id=tmdb).first()
@@ -330,11 +276,6 @@ class VirtualTree:
             from apps.vod.models import Series
         except ImportError:
             return None
-        uuid = self._series_map.get(folder_name)
-        if uuid:
-            s = Series.objects.filter(uuid=uuid).first()
-            if s:
-                return s
         title, year, tmdb, imdb = _parse_folder(folder_name)
         if tmdb:
             s = Series.objects.filter(tmdb_id=tmdb).first()

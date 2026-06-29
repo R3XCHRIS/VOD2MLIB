@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 _executor = ThreadPoolExecutor(max_workers=8)
 _directory_cache = LRUCache(max_size=5000, ttl=300)
+# Streamed-listing flush granularity: ~512 rows (~40 KB of markup) per ASGI message.
+_ROWS_PER_FLUSH = 512
 
 
 def shutdown_executor() -> None:
@@ -146,12 +148,15 @@ class HTTPFilesystem:
         if len(comps) == 2 and comps[0] in ("Movies", "Series"):
             return self._stream_listing(path, comps)
         try:
-            cached = _directory_cache.get(f"dir:{path}")
-            if cached is None:
-                cached = await self._build_listing(path)
-                _directory_cache.set(f"dir:{path}", cached)
-            html = _DIR_TEMPLATE.render(path=path, entries=cached)
-            return HTMLResponse(content=html)
+            # Cache the *rendered* HTML, not the entry dicts: a cache hit then skips
+            # the Jinja render entirely instead of re-rendering on every request.
+            key = f"dir:{path}"
+            rendered = _directory_cache.get(key)
+            if rendered is None:
+                entries = await self._build_listing(path)
+                rendered = _DIR_TEMPLATE.render(path=path, entries=entries)
+                _directory_cache.set(key, rendered)
+            return HTMLResponse(content=rendered)
         except Exception:
             logger.exception("Failed to serve directory %s", path)
             return Response(status_code=500, content="Error listing directory")
@@ -170,16 +175,26 @@ class HTTPFilesystem:
                 close_old_connections = None
             if close_old_connections:
                 close_old_connections()
+            # Batch rows into ~chunk-sized buffers before yielding. A 100k-entry dir
+            # otherwise emits 100k ASGI messages (one per ~80-byte row), each a
+            # threadpool hop + send; flushing every _ROWS_PER_FLUSH rows cuts that by
+            # ~2.5 orders of magnitude while keeping memory at O(flush).
+            buf = [_LISTING_HEAD.format(path=html.escape(path)), _stream_row("../", "../")]
+            n = 0
             try:
-                yield _LISTING_HEAD.format(path=html.escape(path))
-                yield _stream_row("../", "../")
                 for folder in source(category):
-                    yield _stream_row(folder + "/", quote(folder) + "/")
-                yield _LISTING_TAIL
+                    buf.append(_stream_row(folder + "/", quote(folder) + "/"))
+                    n += 1
+                    if n >= _ROWS_PER_FLUSH:
+                        yield "".join(buf)
+                        buf, n = [], 0
+                buf.append(_LISTING_TAIL)
+                yield "".join(buf)
             except Exception:
                 logger.exception("Failed while streaming directory %s", path)
-                # Response is already in flight; close the markup so clients don't hang.
-                yield _LISTING_TAIL
+                # Response is already in flight; flush what we have and close the
+                # markup so clients don't hang on a truncated document.
+                yield "".join(buf) + _LISTING_TAIL
             finally:
                 if close_old_connections:
                     close_old_connections()
@@ -204,19 +219,16 @@ class HTTPFilesystem:
 
         category = None if comps[1] == "All" else comps[1]
 
+        # len==2 (/Movies/{All|cat}, /Series/{All|cat}) is the unbounded listing and
+        # is served by _stream_listing in serve_directory before reaching here, so
+        # only len>=3 paths fall through to these rendered branches.
         if top == "Movies":
-            if len(comps) == 2:                                  # /Movies/{All|cat}
-                movies = await self._run(self.tree.movies, category)
-                return parent + [_dir_entry(m['folder']) for m in movies]
             if len(comps) == 3:                                  # /Movies/{cat}/{folder}
                 files = await self._run(self.tree.movie_files, comps[2], category)
                 return parent + [_file_entry(f['filename'], f['size']) for f in files]
             return parent
 
         # Series
-        if len(comps) == 2:                                      # /Series/{All|cat}
-            shows = await self._run(self.tree.series, category)
-            return parent + [_dir_entry(s['folder']) for s in shows]
         if len(comps) == 3:                                      # /Series/{cat}/{show}
             seasons = await self._run(self.tree.seasons, comps[2], category)
             return parent + [_dir_entry(s) for s in seasons]

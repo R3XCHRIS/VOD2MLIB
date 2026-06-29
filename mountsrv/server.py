@@ -7,6 +7,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import Response, JSONResponse
+from starlette.middleware.gzip import GZipMiddleware
 
 try:
     from .tree import VirtualTree
@@ -44,6 +45,22 @@ class _DjangoRequestShim:
         self.META = meta
 
 
+def _refresh_db_connection():
+    """Discard a stale/closed thread-local Django connection before an ORM call.
+
+    FastAPI runs these sync dependencies in a threadpool. Django connections are
+    thread-local and can be left closed/aborted between requests, so the first
+    query on that thread raises 'connection already closed' — which the fail-closed
+    gate below turns into a blanket 403 (rclone then sees the mount as I/O errors).
+    The tree path already brackets its queries this way via _db_task; the auth and
+    network gates need the same hygiene."""
+    try:
+        from django.db import close_old_connections
+    except ImportError:
+        return
+    close_old_connections()
+
+
 def check_network_access(request: Request):
     """Enforce Dispatcharr's STREAMS network-access policy. Fail CLOSED: deny if the
     hook can't be imported or errors — this is the primary protection when auth is
@@ -54,9 +71,13 @@ def check_network_access(request: Request):
     except (ImportError, AttributeError):
         logger.error("network policy hook unavailable — denying request (fail-closed)")
         raise HTTPException(status_code=403, detail="Forbidden")
+    _refresh_db_connection()
     try:
         allowed = network_access_allowed(_DjangoRequestShim(request), "STREAMS")
     except Exception as e:
+        # Clear the poisoned connection so the next request recovers instead of
+        # latching this thread into permanent denial.
+        _refresh_db_connection()
         logger.error("network policy check errored (%s) — denying request (fail-closed)", e)
         raise HTTPException(status_code=403, detail="Forbidden")
     if not allowed:
@@ -82,6 +103,7 @@ def check_api_key_auth(request: Request):
             headers={"WWW-Authenticate": "ApiKey"}
         )
 
+    _refresh_db_connection()
     try:
         from django.contrib.auth import get_user_model
         User = get_user_model()
@@ -251,6 +273,13 @@ def create_app(tree: VirtualTree) -> FastAPI:
             logger.info("Shutdown complete")
 
     app = FastAPI(title="VOD HTTP Filesystem", lifespan=lifespan)
+    # The directory tree is large, highly repetitive HTML — the /Movies/All and
+    # /Series/All listings can be megabytes of <a> rows. gzip cuts that ~10x on the
+    # wire. Starlette compresses streaming responses chunk-by-chunk (it never buffers
+    # the whole body), so the row-streamed listings stay O(chunk) in memory. Empty
+    # bodies (302 file redirects, healthz) fall under minimum_size and are untouched,
+    # so the playback path carries no overhead. Level 6 balances ratio vs CPU on text.
+    app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)
     httpfs = HTTPFilesystem(tree)
 
     @app.post("/hydrate/run")
@@ -339,5 +368,8 @@ def run_server(port: int, log_level: str = "info"):
         host=_BIND_HOST,
         port=port,
         log_level=log_level,
-        access_log=True
+        # Off: per-request access logging appended to mountsrv/server.log unbounded.
+        # Plex/rclone hammer the mount, so this file grew without limit. Startup
+        # lines and tracebacks (tiny, bounded) still land in the log.
+        access_log=False,
     )
