@@ -14,7 +14,10 @@ a single inventory of the whole env contract.
 
 from dataclasses import dataclass
 
-# Settings-derived env contract (parent -> child).
+# The full parent->child env contract, named once here. Every mount module reads
+# these constants (not string literals) so the two sides can never drift.
+
+# Settings-derived (written by MountConfig.to_env from plugin settings).
 ENV_DISPATCHARR_URL = "VOD2MLIB_DISPATCHARR_URL"
 ENV_ENABLE_AUTH = "VOD2MLIB_ENABLE_AUTH"
 ENV_HYDRATE_CONCURRENCY = "VOD2MLIB_HYDRATE_CONCURRENCY"
@@ -22,14 +25,15 @@ ENV_HYDRATE_ON_LOAD = "VOD2MLIB_HYDRATE_ON_LOAD"
 ENV_HYDRATE_TIMES = "VOD2MLIB_HYDRATE_TIMES"
 ENV_HYDRATE_TZ = "VOD2MLIB_HYDRATE_TZ"
 
-# Internal (non-settings) knobs with sane defaults, for the full env inventory.
-INTERNAL_ENV = (
-    "VOD2MLIB_BIND_HOST",          # listen host (default 0.0.0.0)
-    "VOD2MLIB_REQUIRE_SIZE",       # size gate (default true)
-    "VOD2MLIB_PROBE_SIZE",         # probe provider for size on open (default false)
-    "VOD2MLIB_PROBE_CONCURRENCY",  # parallel probes (default 4)
-    "VOD2MLIB_HYDRATE_MAX_MINUTES",
-)
+# Internal knobs (not user settings) with sane defaults, read directly by the child.
+ENV_BIND_HOST = "VOD2MLIB_BIND_HOST"                    # listen host (default 0.0.0.0)
+ENV_REQUIRE_SIZE = "VOD2MLIB_REQUIRE_SIZE"              # size gate (default true)
+ENV_PROBE_SIZE = "VOD2MLIB_PROBE_SIZE"                  # probe provider on open (default false)
+ENV_PROBE_CONCURRENCY = "VOD2MLIB_PROBE_CONCURRENCY"    # parallel probes (default 4)
+ENV_HYDRATE_MAX_MINUTES = "VOD2MLIB_HYDRATE_MAX_MINUTES"
+
+INTERNAL_ENV = (ENV_BIND_HOST, ENV_REQUIRE_SIZE, ENV_PROBE_SIZE,
+                ENV_PROBE_CONCURRENCY, ENV_HYDRATE_MAX_MINUTES)
 
 
 def _b(v) -> str:

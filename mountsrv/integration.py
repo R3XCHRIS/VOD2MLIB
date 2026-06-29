@@ -15,16 +15,17 @@ from collections import defaultdict
 from typing import List, Dict, Any, Optional
 
 try:
-    from apps.vod.models import Series, Episode
-    from apps.vod.models import M3USeriesRelation, M3UEpisodeRelation
+    from apps.vod.models import Series, M3UEpisodeRelation
     DJANGO_AVAILABLE = True
 except ImportError:
     DJANGO_AVAILABLE = False
-    Series = Episode = None
-    M3USeriesRelation = M3UEpisodeRelation = None
+    Series = M3UEpisodeRelation = None
 
 from vodlib import naming as _naming
 from vodlib.playback import proxy_url as _proxy_url
+from vodlib.config import (
+    ENV_DISPATCHARR_URL, ENV_REQUIRE_SIZE, ENV_PROBE_SIZE, ENV_PROBE_CONCURRENCY,
+)
 
 # Re-export the canonical normaliser so the mount's tree.py keeps one import site.
 parse_title = _naming.parse_title
@@ -35,14 +36,13 @@ _DEFAULT_BASE_URL = "http://127.0.0.1:9191"
 
 
 def _get_dispatcharr_base_url() -> str:
-    """Operator-configured Dispatcharr base URL (the proxy/probe target)."""
-    url = os.environ.get("VOD2MLIB_DISPATCHARR_URL", _DEFAULT_BASE_URL).rstrip("/")
-    try:
-        from urllib.parse import urlparse
-        if urlparse(url).scheme not in ("http", "https"):
-            logger.warning("Ignoring non-HTTP base URL; using default")
-            return _DEFAULT_BASE_URL
-    except Exception:
+    """Operator-configured Dispatcharr base URL (the proxy/probe target). Validated
+    with the one shared validator so a misconfigured value can't make urllib speak a
+    non-HTTP scheme."""
+    from vodlib.playback import validate_base_url
+    url = os.environ.get(ENV_DISPATCHARR_URL, _DEFAULT_BASE_URL).rstrip("/")
+    if validate_base_url(url) is not None:
+        logger.warning("Ignoring invalid Dispatcharr base URL; using default")
         return _DEFAULT_BASE_URL
     return url
 
@@ -54,9 +54,6 @@ class DispatcharrIntegrator:
         return DJANGO_AVAILABLE
 
     # --- naming (delegates entirely to the shared core) --------------------------
-
-    def parse(self, raw: str, year_field: Any = None) -> Dict[str, Any]:
-        return _naming.parse_title(raw, year_field)
 
     @staticmethod
     def folder_name_from_fields(name, year=None, tmdb_id=None, imdb_id=None) -> str:
@@ -120,7 +117,7 @@ class DispatcharrIntegrator:
             # Size gate: hide episodes whose size Dispatcharr doesn't know yet, so
             # Plex never sees an unsized (un-probable) episode.
             ep_sized = ({"custom_properties__info__info__bitrate__gt": 0}
-                        if os.environ.get("VOD2MLIB_REQUIRE_SIZE", "true").lower() == "true"
+                        if os.environ.get(ENV_REQUIRE_SIZE, "true").lower() == "true"
                         else {})
             relations = M3UEpisodeRelation.objects.filter(
                 episode_id__in=episode_ids,
@@ -212,10 +209,10 @@ def size_from_metadata(custom_properties, duration_secs: Optional[int] = None) -
 
 
 # --- accurate size probing ------------------------------------------------------
-_PROBE_ENABLED = os.environ.get("VOD2MLIB_PROBE_SIZE", "false").lower() == "true"
+_PROBE_ENABLED = os.environ.get(ENV_PROBE_SIZE, "false").lower() == "true"
 _size_cache: Dict[str, int] = {}
 _size_cache_lock = threading.Lock()
-_probe_sem = threading.Semaphore(int(os.environ.get("VOD2MLIB_PROBE_CONCURRENCY", "4")))
+_probe_sem = threading.Semaphore(int(os.environ.get(ENV_PROBE_CONCURRENCY, "4")))
 
 
 def probe_real_size(content_type: str, uuid: str, stream_id: str,

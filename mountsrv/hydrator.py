@@ -1,6 +1,6 @@
 """Background size-hydration.
 
-vodfs only surfaces titles whose size Dispatcharr already knows (stored bitrate).
+The mount only surfaces titles whose size Dispatcharr already knows (stored bitrate).
 This drips Dispatcharr's own refresh tasks so the rest fill in over time — movie
 detail (``refresh_movie_advanced_data``) and un-hydrated series
 (``batch_refresh_series_episodes``) — paced by a rate limit and run on a schedule
@@ -21,7 +21,12 @@ import logging
 import threading
 import datetime
 
-logger = logging.getLogger("vodfs.hydrator")
+from vodlib.config import (
+    ENV_HYDRATE_CONCURRENCY, ENV_HYDRATE_ON_LOAD, ENV_HYDRATE_TIMES,
+    ENV_HYDRATE_TZ, ENV_HYDRATE_MAX_MINUTES,
+)
+
+logger = logging.getLogger("vod2mlib.hydrator")
 
 
 def _parse_times(raw):
@@ -39,14 +44,14 @@ class Hydrator:
         # Parallel get_vod_info fetches. The work is network-bound (~0.5s/round-trip),
         # so concurrency — not a per-second rate — is what determines throughput.
         # 0 disables hydration. This is also the provider-load throttle (N in flight).
-        self.concurrency = max(0, int(os.environ.get("VOD2MLIB_HYDRATE_CONCURRENCY", "8") or 0))
-        self.on_load = os.environ.get("VOD2MLIB_HYDRATE_ON_LOAD", "true").lower() == "true"
-        self.times = _parse_times(os.environ.get("VOD2MLIB_HYDRATE_TIMES", ""))
-        self.tz = os.environ.get("VOD2MLIB_HYDRATE_TZ", "America/Chicago")
+        self.concurrency = max(0, int(os.environ.get(ENV_HYDRATE_CONCURRENCY, "8") or 0))
+        self.on_load = os.environ.get(ENV_HYDRATE_ON_LOAD, "true").lower() == "true"
+        self.times = _parse_times(os.environ.get(ENV_HYDRATE_TIMES, ""))
+        self.tz = os.environ.get(ENV_HYDRATE_TZ, "America/Chicago")
         # A pass stops after this many minutes so a scheduled run can't bleed into
         # peak hours; it just resumes (where it left off) on the next scheduled time.
         # 0 = unbounded. Advanced env knob, not a UI field.
-        self.max_minutes = float(os.environ.get("VOD2MLIB_HYDRATE_MAX_MINUTES", "240") or 0)
+        self.max_minutes = float(os.environ.get(ENV_HYDRATE_MAX_MINUTES, "240") or 0)
         self._deadline = None
         self._thread = None
         self._lock = threading.Lock()
@@ -65,7 +70,7 @@ class Hydrator:
                 return
             self._stop.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True,
-                                            name="vodfs-hydrator")
+                                            name="vod2mlib-hydrator")
             self._thread.start()
             logger.info("Hydrator started: concurrency=%s on_load=%s times=%s tz=%s",
                         self.concurrency, self.on_load, self.times, self.tz)
@@ -229,7 +234,7 @@ class Hydrator:
 
     def _drip_series(self):
         try:
-            from apps.vod.models import M3USeriesRelation, Series
+            from apps.vod.models import M3USeriesRelation
             from apps.vod.tasks import batch_refresh_series_episodes
             from .tree import _enabled
         except ImportError:
@@ -237,7 +242,7 @@ class Hydrator:
                 from tree import _enabled  # noqa: F401
             except ImportError:
                 return 0
-            from apps.vod.models import M3USeriesRelation, Series
+            from apps.vod.models import M3USeriesRelation
             from apps.vod.tasks import batch_refresh_series_episodes
         # un-hydrated series (no episodes yet), grouped by account for the batch task
         rels = (M3USeriesRelation.objects.filter(**_enabled())

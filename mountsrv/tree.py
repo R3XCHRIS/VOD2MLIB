@@ -28,6 +28,8 @@ except ImportError:
         size_from_metadata, size_from_bitrate,
     )
 
+from vodlib.config import ENV_REQUIRE_SIZE
+
 logger = logging.getLogger(__name__)
 
 _VIDEO_CT = "video/x-matroska"
@@ -42,7 +44,7 @@ _SEASON_RE = re.compile(r'^Season\s+(\d{1,3})$', re.IGNORECASE)
 # over time (movies via refresh_movie_advanced_data; episodes during series
 # hydration), and titles appear as their size lands. Set VOD2MLIB_REQUIRE_SIZE=false to
 # show everything (then enable VOD2MLIB_PROBE_SIZE so playback still gets a real size).
-_REQUIRE_SIZE = os.environ.get("VOD2MLIB_REQUIRE_SIZE", "true").lower() == "true"
+_REQUIRE_SIZE = os.environ.get(ENV_REQUIRE_SIZE, "true").lower() == "true"
 # JSON paths to the stored overall bitrate (two Dispatcharr shapes).
 _MOVIE_SIZED = {"custom_properties__detailed_info__bitrate__gt": 0}
 _SERIES_HAS_SIZED_EP = {

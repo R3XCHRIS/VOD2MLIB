@@ -56,7 +56,6 @@ class Plugin(HttpfsControlMixin):
     MAX_WORKERS = 3
     LOG_EVERY = 50
     LOG_FIRST_N = 10
-    MAX_FILENAME_LEN = 200
 
     # Schedule task identity (django-celery-beat row name + Celery task name)
     SCHEDULE_TASK_NAME = "vod2mlib.auto_rescan"
@@ -1625,11 +1624,6 @@ class Plugin(HttpfsControlMixin):
         text = text.replace('"', '&quot;')
         text = text.replace("'", '&apos;')
         return text
-    
-    def _sanitize_filename(self, name: str) -> str:
-        """Sanitize a single path component. Delegates to the one shared sanitizer
-        (vodlib.naming) so the .strm generator and the mount apply identical rules."""
-        return _naming.sanitize_filename(name)
 
     def _rescan_all(self, settings: Dict[str, Any], logger):
         """Combined scan + generate movies + generate series. Used by the cron schedule.

@@ -4,7 +4,7 @@ This is the opt-in second output mode. The classic .strm/.nfo generator (plugin.
 is untouched and still the default; everything here only runs when the user clicks
 one of the [MOUNT] actions.
 
-It manages a standalone ASGI child server (the ``httpfs/`` subpackage, vendored from
+It manages a standalone ASGI child server (the ``mountsrv/`` subpackage, vendored from
 VODFS — MIT, Copyright (c) 2026 OneHotTake) that exposes the live Dispatcharr VOD
 library as a read-only HTTP filesystem. rclone mounts it; Plex reads real,
 Plex-correctly-named files that 302-redirect into Dispatcharr's native VOD proxy.

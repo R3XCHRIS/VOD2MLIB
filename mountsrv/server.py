@@ -5,7 +5,6 @@ import logging
 import os
 import uvicorn
 from contextlib import asynccontextmanager
-from typing import List
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import Response, JSONResponse
 
@@ -18,27 +17,50 @@ except (ImportError, AttributeError):
     from httpfs import HTTPFilesystem, shutdown_executor, _directory_cache
     from integration import DispatcharrIntegrator
 
+from vodlib.config import ENV_ENABLE_AUTH, ENV_BIND_HOST
+
 logger = logging.getLogger(__name__)
 
-_ENABLE_AUTH = os.environ.get("VOD2MLIB_ENABLE_AUTH", "false").lower() == "true"
+_ENABLE_AUTH = os.environ.get(ENV_ENABLE_AUTH, "false").lower() == "true"
 # Bind host. Defaults to 0.0.0.0: the server runs inside the Dispatcharr
 # container and must be reachable through Docker's published port by rclone/Plex,
 # which a 127.0.0.1-only listener prevents. Lock down with VOD2MLIB_BIND_HOST and/or
 # enable_auth + Dispatcharr's STREAMS network policy when exposing it.
-_BIND_HOST = os.environ.get("VOD2MLIB_BIND_HOST", "0.0.0.0")
+_BIND_HOST = os.environ.get(ENV_BIND_HOST, "0.0.0.0")
 
-_server_ready = False
-_startup_errors: List[str] = []
+
+class _DjangoRequestShim:
+    """Adapt a Starlette request to the ``.META`` interface Dispatcharr's
+    ``network_access_allowed`` expects (it was written for Django requests and reads
+    ``request.META["HTTP_X_REAL_IP"]``/``["REMOTE_ADDR"]``). Without this shim the
+    policy hook raises ``AttributeError`` on every call — which the previous code
+    swallowed, silently disabling the STREAMS check. Wiring it correctly makes the
+    gate actually enforce."""
+    def __init__(self, request: Request):
+        meta = {"REMOTE_ADDR": (request.client.host if request.client else "127.0.0.1")}
+        xri = request.headers.get("x-real-ip")
+        if xri:
+            meta["HTTP_X_REAL_IP"] = xri
+        self.META = meta
 
 
 def check_network_access(request: Request):
-    """Check if client IP is allowed per Dispatcharr STREAMS policy"""
+    """Enforce Dispatcharr's STREAMS network-access policy. Fail CLOSED: deny if the
+    hook can't be imported or errors — this is the primary protection when auth is
+    off. (The STREAMS policy defaults to allow-all; operators restrict it in
+    Dispatcharr settings, and only then does this gate narrow access.)"""
     try:
         from dispatcharr.utils import network_access_allowed
-        if not network_access_allowed(request, "STREAMS"):
-            raise HTTPException(status_code=403, detail="Forbidden")
     except (ImportError, AttributeError):
-        pass
+        logger.error("network policy hook unavailable — denying request (fail-closed)")
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        allowed = network_access_allowed(_DjangoRequestShim(request), "STREAMS")
+    except Exception as e:
+        logger.error("network policy check errored (%s) — denying request (fail-closed)", e)
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 
 def check_api_key_auth(request: Request):
@@ -74,25 +96,18 @@ def check_api_key_auth(request: Request):
 
 
 def _check_django_available():
-    """Check Django availability at startup"""
-    global _server_ready, _startup_errors
-
-    integrator = DispatcharrIntegrator()
-    if integrator.is_available():
+    """Log whether Django/VOD models are reachable at startup (no state kept)."""
+    if DispatcharrIntegrator().is_available():
         logger.info("Django available - all queries will be live against DB")
     else:
-        msg = "Django/VOD models not available - listings will be empty"
-        logger.warning(msg)
-        _startup_errors.append(msg)
-
-    _server_ready = True
+        logger.warning("Django/VOD models not available - listings will be empty")
 
 
 def _external_base_url(request) -> str:
     """Reconstruct the URL the client actually reached us on, honouring reverse-proxy
-    headers. Behind Dispatcharr's nginx (location /vodfs/), the browser hits
-    /vodfs/rclone_conf and these headers carry the real host + /vodfs prefix — so the
-    rclone config points at the right place with no configured IP to get wrong."""
+    headers. Behind a reverse proxy (e.g. Dispatcharr's nginx at location /vod2mlib/),
+    the browser hits /vod2mlib/rclone_conf and these headers carry the real host +
+    prefix — so the rclone config points at the right place with no IP to get wrong."""
     h = request.headers
     proto = h.get("x-forwarded-proto") or request.url.scheme or "http"
     host = h.get("x-forwarded-host") or h.get("host") or request.url.netloc
@@ -239,54 +254,27 @@ def create_app(tree: VirtualTree) -> FastAPI:
     httpfs = HTTPFilesystem(tree)
 
     @app.post("/hydrate/run")
-    async def hydrate_run(_auth=Depends(check_api_key_auth)):
-        """Kick an immediate hydration pass (the 'Hydrate Now' action)."""
+    async def hydrate_run(
+        _network=Depends(check_network_access),
+        _auth=Depends(check_api_key_auth),
+    ):
+        """Kick an immediate hydration pass (the 'Hydrate Now' action). Mutating +
+        triggers provider fetches, so it carries the same network/auth gate as the
+        file endpoints — never leave it open to any caller on a published port."""
         ok = hydrator.trigger_now()
         return JSONResponse(content={"triggered": ok, "status": hydrator.status()})
 
     @app.get("/hydrate/status")
-    async def hydrate_status(_auth=Depends(check_api_key_auth)):
+    async def hydrate_status(
+        _network=Depends(check_network_access),
+        _auth=Depends(check_api_key_auth),
+    ):
         return JSONResponse(content=hydrator.status())
 
     @app.get("/healthz")
     async def healthz():
-        """Basic health check"""
+        """Basic liveness check (no library/state disclosure)."""
         return Response(status_code=200, content="OK")
-
-    @app.get("/readyz")
-    async def readyz():
-        """Readiness check"""
-        if not _server_ready:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "not_ready",
-                    "errors": _startup_errors
-                }
-            )
-
-        status = {
-            "status": "ready",
-            "architecture": "live-db-queries",
-            "warnings": []
-        }
-
-        if _startup_errors:
-            status['warnings'].extend(_startup_errors)
-
-        return JSONResponse(content=status)
-
-    @app.get("/status")
-    async def status():
-        """Detailed status"""
-        return JSONResponse(content={
-            "architecture": "live-db-queries",
-            "system": {
-                "auth_enabled": _ENABLE_AUTH,
-                "ready": _server_ready,
-                "startup_errors": _startup_errors
-            }
-        })
 
     @app.get("/rclone_conf")
     async def rclone_conf(

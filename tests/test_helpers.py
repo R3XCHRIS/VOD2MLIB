@@ -9,8 +9,6 @@ import sys
 # Make the repo root importable so `import plugin` resolves to plugin.py.
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-import logging
-
 import pytest
 
 from plugin import Plugin
@@ -39,35 +37,9 @@ def p():
     return Plugin()
 
 
-# ---------- _clean_title ----------
-
-class TestSanitizeFilename:
-    # _sanitize_filename now delegates to the single shared sanitizer
-    # (vodlib.naming.sanitize_filename): illegal chars become spaces (keeping word
-    # boundaries), runs of whitespace collapse, '.'/'..'/'' fall back to 'Unknown'.
-    def test_strips_invalid_chars_to_spaces(self, p):
-        assert p._sanitize_filename('a<b>c:"d/e\\f|g?h*i') == "a b c d e f g h i"
-
-    def test_strips_control_chars(self, p):
-        assert p._sanitize_filename("a\x00b\x1fc") == "a b c"
-
-    def test_collapses_runs_of_spaces(self, p):
-        assert p._sanitize_filename("a   b   c") == "a b c"
-
-    def test_tabs_become_space(self, p):
-        assert p._sanitize_filename("a\t\tb") == "a b"
-
-    def test_dotdot_becomes_unknown(self, p):
-        # Path-traversal defence: '.' and '..' can never be a path component.
-        assert p._sanitize_filename("..") == "Unknown"
-        assert p._sanitize_filename(".") == "Unknown"
-
-    def test_empty_input(self, p):
-        assert p._sanitize_filename("") == "Unknown"
-        assert p._sanitize_filename(None) == "Unknown"
-
-    def test_normal_movie_name(self, p):
-        assert p._sanitize_filename("Aladdin (2026)") == "Aladdin (2026)"
+# ---------- filename sanitisation is the shared core's job now ----------
+# Coverage for the one sanitizer lives in tests/test_naming.py::TestSanitize
+# (vodlib.naming.sanitize_filename); the old plugin-local delegator is gone.
 
 
 # ---------- _parse_cron ----------
