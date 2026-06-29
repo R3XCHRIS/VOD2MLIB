@@ -77,8 +77,10 @@ class HttpfsControlMixin:
     _HTTPFS_DATA_DIR = "/data/plugins/vod2mlib"
     _HTTPFS_DEFAULT_PORT = 8889
     _HTTPFS_PLUGIN_KEY = "vod2mlib"
-    # The cmdline marker that attributes a process to our child server.
-    _HTTPFS_RUNNER_MARK = "standalone_runner.py"
+    # The cmdline marker that attributes a process to OUR child server. Includes the
+    # plugin-dir segment so a sibling plugin's same-named "standalone_runner.py" can
+    # never be mis-identified as ours via the legacy cmdline fallback.
+    _HTTPFS_RUNNER_MARK = "vod2mlib/mountsrv/standalone_runner.py"
     # Crash-loop breaker: stop auto-respawning after this many consecutive
     # readiness failures (~N minutes at the healthcheck interval). Reset by Enable.
     _HTTPFS_MAX_FAILURES = 5

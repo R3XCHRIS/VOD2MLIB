@@ -281,7 +281,7 @@ The plugin delivers one library two ways (`.strm` files and the Plex mount) on t
   - `playback.py` — the one playback path: the Dispatcharr proxy URL builder + base-URL validation.
   - `config.py` — the one configuration schema for the mount, derived from plugin settings.
 - **`plugin.py`** — the `Plugin` class (`fields`/`actions`/`run()` per Dispatcharr's contract). The `.strm`/`.nfo` generator and the cron scheduler. Builds names/URLs via `vodlib`.
-- **`httpfs_control.py`** — the `[MOUNT]` lifecycle: starts/stops the mount child, installs deps, builds its config via `vodlib.config`.
+- **`vod2mlib_control.py`** — the `[MOUNT]` lifecycle: starts/stops/supervises the mount child, installs deps, builds its config via `vodlib.config`. (Plugin-unique filename: Dispatcharr loads all plugins into one interpreter, so a generic module name would collide in `sys.modules` with another plugin's.)
 - **`mountsrv/`** — the standalone ASGI mount server (FastAPI/uvicorn) that rclone talks to. Its data layer does live Dispatcharr ORM queries + size logic; all naming/URLs come from `vodlib`. Vendored from [VODFS](https://github.com/OneHotTake/vodfs) (MIT) and refactored onto the shared core.
 - `plugin.json` is the catalogue manifest; Dispatcharr's runtime reads `fields`/`actions` from the Python class (the JSON is kept in sync for the catalogue and pre-enable preview).
 - Schedule registration uses `django-celery-beat`'s `PeriodicTask` + `CrontabSchedule`; the cron-fired `@shared_task` `vod2mlib.scheduled_rescan` constructs a fresh `Plugin()` and dispatches. Settings are snapshotted into the task's `kwargs` at Apply-time.

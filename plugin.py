@@ -18,10 +18,14 @@ import sys
 from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# The optional rclone/Plex mount mode lives in httpfs_control.py (vendored child
-# server in httpfs/). Ensure the plugin dir is importable regardless of how
-# Dispatcharr loads this module, then pull in the mixin. If it can't be imported
-# the classic .strm generator must still work, so we degrade to a no-op base.
+# The optional rclone/Plex mount mode lives in vod2mlib_control.py (vendored child
+# server in mountsrv/). The module name is plugin-unique on purpose: Dispatcharr
+# imports every plugin's helpers into one shared interpreter under a flat namespace,
+# so a generic name like "httpfs_control" would collide in sys.modules with another
+# plugin's same-named file and silently load the wrong one. Ensure the plugin dir is
+# importable regardless of how Dispatcharr loads this module, then pull in the mixin.
+# If it can't be imported the classic .strm generator must still work, so we degrade
+# to a no-op base.
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
@@ -32,7 +36,7 @@ from vodlib import naming as _naming
 from vodlib.playback import proxy_url as _proxy_url, validate_base_url as _validate_base_url
 
 try:
-    from httpfs_control import HttpfsControlMixin
+    from vod2mlib_control import HttpfsControlMixin
 except Exception as _httpfs_import_err:  # pragma: no cover
     print(f"[vod2mlib] httpfs mount mode unavailable: {_httpfs_import_err}",
           file=sys.stderr)

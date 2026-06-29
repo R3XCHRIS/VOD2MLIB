@@ -1,4 +1,4 @@
-"""Behavior lock for the mount supervisor (httpfs_control.HttpfsControlMixin).
+"""Behavior lock for the mount supervisor (vod2mlib_control.HttpfsControlMixin).
 
 These tests pin the agreed matrices:
   - B: is_ours() identity gate (I1-I7)
@@ -19,7 +19,7 @@ import logging
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import httpfs_control as hc  # noqa: E402
+import vod2mlib_control as hc  # noqa: E402
 
 LOG = logging.getLogger("test.mount")
 
@@ -69,8 +69,9 @@ def test_I4_dead_pid_not_ours(fs, monkeypatch):
 
 def test_I5_legacy_cmdline_match_is_ours(fs, monkeypatch):
     monkeypatch.setattr(fs, "_httpfs_proc_alive", lambda pid: True)
-    monkeypatch.setattr(fs, "_httpfs_proc_cmdline",
-                        lambda pid: "python /x/mountsrv/standalone_runner.py --port 8889")
+    monkeypatch.setattr(
+        fs, "_httpfs_proc_cmdline",
+        lambda pid: "python /data/plugins/vod2mlib/mountsrv/standalone_runner.py --port 8889")
     assert fs._httpfs_is_ours({"pid": 4321, "starttime": None}) is True
 
 
