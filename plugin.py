@@ -49,7 +49,7 @@ class Plugin(HttpfsControlMixin):
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.16.0"
+    version = "1.16.1"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "

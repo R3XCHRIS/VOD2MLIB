@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.16.0",
+  "version": "1.16.1",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",

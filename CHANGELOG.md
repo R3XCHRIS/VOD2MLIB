@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.16.1 — mount hardening, supervisor, collision-proof modules
+
+Robustness pass over the v1.16.0 Plex mount (no `.strm` changes):
+
+- **Fixed a spurious `403` that made the mount unusable.** The network/auth gates queried the DB without stale-connection hygiene, so under load they failed closed and rclone saw the whole mount as I/O errors. Gates now refresh the connection before the ORM call; fail-closed intent is unchanged.
+- **gzip + streamed directory tree.** Large `/Movies/All` listings go out ~10× smaller, compressed incrementally so memory stays bounded; the `302` playback path is untouched. Rows are batched per flush and rendered listings are cached as bytes. `access_log` no longer grows `mountsrv/server.log` unbounded.
+- **Mount supervisor.** The mount child is now identity-safe (tracked by pid + `/proc` start-time, recycled-PID proof and zombie-aware) and self-recovering: a celery-beat healthcheck reconciles it on an interval, so it comes back automatically after a crash or a Dispatcharr restart. A crash-loop breaker stops futile respawns and surfaces the failure in `[MOUNT] Status`. Requires the plugin data dir to be writable by the Dispatcharr runtime user (documented in the README).
+- **Collision-proof module names.** Dispatcharr loads every plugin into one shared interpreter, so generically-named modules clash in `sys.modules` with another plugin's same-named files. Renamed to plugin-unique `vod2mlib_control.py` and the `vod2mlib_core/` package.
+
 ## v1.16.0 — Plex support via a unified library engine (integrates VODFS)
 
 VOD2MLIB now delivers your VOD catalogue **two ways from one engine**: `.strm` files (Jellyfin/Emby/Kodi/ChannelsDVR) and a live HTTP **mount for Plex** — which can't play `.strm`. The Plex mount comes from [VODFS](https://github.com/OneHotTake/vodfs) (MIT, © 2026 OneHotTake), but this is not a bolt-on: the two outputs are built on a single shared core.
