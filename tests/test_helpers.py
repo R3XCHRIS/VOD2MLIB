@@ -39,7 +39,7 @@ def p():
 
 # ---------- filename sanitisation is the shared core's job now ----------
 # Coverage for the one sanitizer lives in tests/test_naming.py::TestSanitize
-# (vodlib.naming.sanitize_filename); the old plugin-local delegator is gone.
+# (vod2mlib_core.naming.sanitize_filename); the old plugin-local delegator is gone.
 
 
 # ---------- _parse_cron ----------

@@ -1,7 +1,7 @@
 """Dispatcharr VOD data access for the HTTP mount.
 
 Naming and proxy-URL formation are NOT defined here — they live in the shared core
-(`vodlib.naming`, `vodlib.playback`) and are used identically by the .strm
+(`vod2mlib_core.naming`, `vod2mlib_core.playback`) and are used identically by the .strm
 generator. This module is only the mount's *data* layer: live ORM queries for
 episodes and the provider-metadata size logic Plex needs to play.
 """
@@ -21,9 +21,9 @@ except ImportError:
     DJANGO_AVAILABLE = False
     Series = M3UEpisodeRelation = None
 
-from vodlib import naming as _naming
-from vodlib.playback import proxy_url as _proxy_url
-from vodlib.config import (
+from vod2mlib_core import naming as _naming
+from vod2mlib_core.playback import proxy_url as _proxy_url
+from vod2mlib_core.config import (
     ENV_DISPATCHARR_URL, ENV_REQUIRE_SIZE, ENV_PROBE_SIZE, ENV_PROBE_CONCURRENCY,
 )
 
@@ -39,7 +39,7 @@ def _get_dispatcharr_base_url() -> str:
     """Operator-configured Dispatcharr base URL (the proxy/probe target). Validated
     with the one shared validator so a misconfigured value can't make urllib speak a
     non-HTTP scheme."""
-    from vodlib.playback import validate_base_url
+    from vod2mlib_core.playback import validate_base_url
     url = os.environ.get(ENV_DISPATCHARR_URL, _DEFAULT_BASE_URL).rstrip("/")
     if validate_base_url(url) is not None:
         logger.warning("Ignoring invalid Dispatcharr base URL; using default")

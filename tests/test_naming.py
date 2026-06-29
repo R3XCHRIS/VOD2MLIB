@@ -1,4 +1,4 @@
-"""Tests for the single shared core: vodlib.naming + vodlib.playback.
+"""Tests for the single shared core: vod2mlib_core.naming + vod2mlib_core.playback.
 
 This is the one naming path and the one playback path used by BOTH the .strm
 generator and the HTTP mount, so it carries the title-cleaning coverage that used
@@ -10,8 +10,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vodlib import naming as n
-from vodlib import playback
+from vod2mlib_core import naming as n
+from vod2mlib_core import playback
 
 
 # ---------- parse_title ----------

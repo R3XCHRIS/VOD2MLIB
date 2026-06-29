@@ -28,7 +28,7 @@ except ImportError:
         size_from_metadata, size_from_bitrate,
     )
 
-from vodlib.config import ENV_REQUIRE_SIZE
+from vod2mlib_core.config import ENV_REQUIRE_SIZE
 
 logger = logging.getLogger(__name__)
 

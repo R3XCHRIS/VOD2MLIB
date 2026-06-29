@@ -1,4 +1,4 @@
-"""vodlib — the single shared core for VOD2MLIB.
+"""vod2mlib_core — the single shared core for VOD2MLIB.
 
 Every concern that used to be duplicated across the .strm generator and the HTTP
 mount lives here exactly once:

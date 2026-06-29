@@ -158,7 +158,7 @@ def test_S4_already_dead_on_sigterm_is_graceful(fs, monkeypatch):
 def _prep_spawn(fs, monkeypatch, *, deps=None, url=None, healthy_seq=None, poll=None):
     fake_cfg = types.SimpleNamespace(port=8889, dispatcharr_url="http://h:9191",
                                      to_env=lambda: {})
-    import vodlib.config as vc
+    import vod2mlib_core.config as vc
     monkeypatch.setattr(vc.MountConfig, "from_settings",
                         lambda *a, **k: fake_cfg, raising=True)
     monkeypatch.setattr(fs, "_httpfs_validate_base_url", lambda u: url)

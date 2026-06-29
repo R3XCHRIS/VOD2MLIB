@@ -18,7 +18,7 @@ except (ImportError, AttributeError):
     from httpfs import HTTPFilesystem, shutdown_executor, _directory_cache
     from integration import DispatcharrIntegrator
 
-from vodlib.config import ENV_ENABLE_AUTH, ENV_BIND_HOST
+from vod2mlib_core.config import ENV_ENABLE_AUTH, ENV_BIND_HOST
 
 logger = logging.getLogger(__name__)
 

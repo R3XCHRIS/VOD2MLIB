@@ -32,8 +32,8 @@ if _PLUGIN_DIR not in sys.path:
 
 # The single shared core: one naming path, one playback path, one config path.
 # Both the .strm generator (this file) and the HTTP mount (mountsrv/) build on it.
-from vodlib import naming as _naming
-from vodlib.playback import proxy_url as _proxy_url, validate_base_url as _validate_base_url
+from vod2mlib_core import naming as _naming
+from vod2mlib_core.playback import proxy_url as _proxy_url, validate_base_url as _validate_base_url
 
 try:
     from vod2mlib_control import HttpfsControlMixin
@@ -74,7 +74,7 @@ class Plugin(HttpfsControlMixin):
     _PLUGIN_FILE_SUFFIXES = ('.strm', '.nfo')
 
     # Title/year/quality cleaning now lives in the single naming path
-    # (vodlib.naming) and is shared with the mount. The only regex kept here is
+    # (vod2mlib_core.naming) and is shared with the mount. The only regex kept here is
     # the language-prefix matcher used by category→genre extraction below
     # (genres are a .strm-NFO concern, not a naming concern).
     # Whitespace required before the dash so 'AC-130' is preserved.
@@ -805,7 +805,7 @@ class Plugin(HttpfsControlMixin):
     def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False):
         """Compute the target folder for a series. Returns (folder_path, clean_name, year).
 
-        The folder name comes from the single naming path (vodlib.naming) — the
+        The folder name comes from the single naming path (vod2mlib_core.naming) — the
         same canonical name the mount produces — always carrying {tmdb-}/{imdb-}
         when known. When nest=True the folder is wrapped in a category subfolder
         named by the raw M3U category (or 'Unassigned' if none). `append_tmdb_id`

@@ -68,7 +68,7 @@ def run_server(port: int = 8888):
         sys.exit(1)
 
     # Add the mountsrv directory (for `from server import ...`) AND the plugin root
-    # (for `import vodlib`, the shared core) to the path.
+    # (for `import vod2mlib_core`, the shared core) to the path.
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     plugin_root = os.path.dirname(plugin_dir)
     for p in (plugin_dir, plugin_root):

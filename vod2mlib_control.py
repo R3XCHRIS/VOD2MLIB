@@ -413,7 +413,7 @@ class HttpfsControlMixin:
     @staticmethod
     def _httpfs_validate_base_url(url: str):
         # One playback path → one URL validator.
-        from vodlib.playback import validate_base_url
+        from vod2mlib_core.playback import validate_base_url
         return validate_base_url(url)
 
     def _httpfs_log_path(self) -> str:
@@ -431,7 +431,7 @@ class HttpfsControlMixin:
           _UrlError / _DepError / _PortInUse  → configuration/conflict (not counted)
           _ReadinessError                     → spawned but never healthy (counted)
         """
-        from vodlib.config import MountConfig
+        from vod2mlib_core.config import MountConfig
         cfg = MountConfig.from_settings(settings)
         port = cfg.port
 

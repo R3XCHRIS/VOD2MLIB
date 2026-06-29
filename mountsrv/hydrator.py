@@ -21,7 +21,7 @@ import logging
 import threading
 import datetime
 
-from vodlib.config import (
+from vod2mlib_core.config import (
     ENV_HYDRATE_CONCURRENCY, ENV_HYDRATE_ON_LOAD, ENV_HYDRATE_TIMES,
     ENV_HYDRATE_TZ, ENV_HYDRATE_MAX_MINUTES,
 )

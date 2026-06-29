@@ -4,11 +4,11 @@
 
 VOD2MLIB now delivers your VOD catalogue **two ways from one engine**: `.strm` files (Jellyfin/Emby/Kodi/ChannelsDVR) and a live HTTP **mount for Plex** — which can't play `.strm`. The Plex mount comes from [VODFS](https://github.com/OneHotTake/vodfs) (MIT, © 2026 OneHotTake), but this is not a bolt-on: the two outputs are built on a single shared core.
 
-**One path for everything.** A new `vodlib/` core holds exactly one implementation of each concern, used by both outputs:
+**One path for everything.** A new `vod2mlib_core/` core holds exactly one implementation of each concern, used by both outputs:
 
-- **One naming path** (`vodlib/naming.py`) — title cleaning, year extraction, `Title (Year) {tmdb-…} {imdb-…}` folders, `Season NN`, `SxxEyy`. A movie lands at the *same folder name* whether written as `.strm` or served on the mount. This engine is strictly better than what either side had before: it strips provider noise (quality/language prefixes, bracket tags, dotted release names, list numbers) *and* preserves title-years like `Blade Runner 2049`, `Room 1408`, `1984`.
-- **One playback path** (`vodlib/playback.py`) — a single function builds the Dispatcharr proxy URL. It's the contents of each `.strm` and the `302` target of every mount file-open.
-- **One configuration path** (`vodlib/config.py`) — the mount's settings flow through one schema; the `Dispatcharr URL` is shared with the `.strm` output.
+- **One naming path** (`vod2mlib_core/naming.py`) — title cleaning, year extraction, `Title (Year) {tmdb-…} {imdb-…}` folders, `Season NN`, `SxxEyy`. A movie lands at the *same folder name* whether written as `.strm` or served on the mount. This engine is strictly better than what either side had before: it strips provider noise (quality/language prefixes, bracket tags, dotted release names, list numbers) *and* preserves title-years like `Blade Runner 2049`, `Room 1408`, `1984`.
+- **One playback path** (`vod2mlib_core/playback.py`) — a single function builds the Dispatcharr proxy URL. It's the contents of each `.strm` and the `302` target of every mount file-open.
+- **One configuration path** (`vod2mlib_core/config.py`) — the mount's settings flow through one schema; the `Dispatcharr URL` is shared with the `.strm` output.
 
 **New for Plex:**
 - `[MOUNT]` actions: Enable / Disable / Status / rclone config / Hydrate sizes now.
