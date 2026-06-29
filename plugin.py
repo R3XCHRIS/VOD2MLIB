@@ -14,15 +14,38 @@ This fork:  https://github.com/R3XCHRIS/VOD2MLIB
 """
 import os
 import re
+import sys
 from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# The optional rclone/Plex mount mode lives in httpfs_control.py (vendored child
+# server in httpfs/). Ensure the plugin dir is importable regardless of how
+# Dispatcharr loads this module, then pull in the mixin. If it can't be imported
+# the classic .strm generator must still work, so we degrade to a no-op base.
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
 
-class Plugin:
+# The single shared core: one naming path, one playback path, one config path.
+# Both the .strm generator (this file) and the HTTP mount (mountsrv/) build on it.
+from vodlib import naming as _naming
+from vodlib.playback import proxy_url as _proxy_url, validate_base_url as _validate_base_url
+
+try:
+    from httpfs_control import HttpfsControlMixin
+except Exception as _httpfs_import_err:  # pragma: no cover
+    print(f"[vod2mlib] httpfs mount mode unavailable: {_httpfs_import_err}",
+          file=sys.stderr)
+
+    class HttpfsControlMixin:  # type: ignore
+        pass
+
+
+class Plugin(HttpfsControlMixin):
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.15.2"
+    version = "1.16.0"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -47,32 +70,12 @@ class Plugin:
     # File suffixes the plugin writes (used by cleanup and skip logic)
     _PLUGIN_FILE_SUFFIXES = ('.strm', '.nfo')
 
-    # Title cleaning. Whitespace required before the dash so 'AC-130' is preserved.
+    # Title/year/quality cleaning now lives in the single naming path
+    # (vodlib.naming) and is shared with the mount. The only regex kept here is
+    # the language-prefix matcher used by category→genre extraction below
+    # (genres are a .strm-NFO concern, not a naming concern).
+    # Whitespace required before the dash so 'AC-130' is preserved.
     _LANGUAGE_PREFIX_RE = re.compile(r'^[A-Z]{2,3}\s+-\s*')
-    _TRAILING_YEAR_RE = re.compile(r'\s*\((\d{4})\)\s*$')
-
-    # First-(YYYY) detector for v1.15.0+ folder-name cleanup. Some providers ship
-    # titles like "Cool Hand Luke 4K (1967) PAUL NEWMAN (1967)" — ChannelsDVR
-    # scrapes off the folder name and fails to match those because of the
-    # trailing junk. Truncating at the first (YYYY) yields "Cool Hand Luke 4K"
-    # which then has quality tokens stripped to give "Cool Hand Luke".
-    _FIRST_YEAR_RE = re.compile(r'\((\d{4})\)')
-
-    # Bare trailing year (no parens) at the very end of a title, e.g.
-    # "Wicked: For Good - 2025". The negative lookbehind stops it matching the
-    # tail of a longer digit run ("12345"). Used by
-    # _strip_redundant_trailing_year to de-duplicate the year a provider stuffs
-    # into the title against the (YYYY) suffix the plugin adds.
-    _BARE_TRAILING_YEAR_RE = re.compile(r'(?<!\d)(\d{4})\s*$')
-
-    # Quality / encoding tokens commonly stuffed into provider VOD titles.
-    # Stripped from folder names so media-server scrapers see a clean title.
-    # Word-boundary anchored so legitimate substrings ("Whiplash" etc.) survive.
-    _QUALITY_TOKEN_RE = re.compile(
-        r'\b(4K|UHD|FHD|HD|SD|HDR(?:10\+?)?|HEVC|H\.?26[45]|x26[45]|'
-        r'1080p|720p|2160p|480p|BluRay|BDRip|DVDRip|WEB-?DL|HDTV|REMUX)\b',
-        re.IGNORECASE,
-    )
 
     # Year-bucket category names like "2026 Movies", "1990s Series",
     # "2020 TV Shows" — these are navigation buckets from the IPTV provider's
@@ -88,7 +91,7 @@ class Plugin:
             "id": "_about",
             "label": "About",
             "type": "info",
-            "description": "Workflow:\n  1. Configure paths below.\n  2. Actions → Scan → see catalogue totals.\n  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n  4. (Optional) Turn ON Refresh Existing Series, set cron, click Apply Schedule for nightly auto-rescan.\n\nDocs: https://github.com/R3XCHRIS/VOD2MLIB",
+            "description": "Turns your Dispatcharr VOD catalogue into a correctly-named media library, delivered two ways from one engine:\n  • .strm files on disk — for Jellyfin, Emby, Kodi, ChannelsDVR.\n  • a live HTTP mount (rclone) — for Plex, which can't play .strm.\nBoth share the same title cleaning, folder naming, and playback URLs, so a title lands the same name whichever output you use.\n\nWorkflow:\n  1. Set the Dispatcharr URL and (for .strm) the root folders below.\n  2. Actions → Scan → see catalogue totals.\n  3. .strm: Generate Movies / Generate Series (start with Batch Size 10).\n  4. Plex: [MOUNT] Enable, then mount with rclone (see [MOUNT] rclone config).\n\nDocs: https://github.com/R3XCHRIS/VOD2MLIB",
         },
         {
             "id": "_section_paths",
@@ -248,6 +251,55 @@ class Plugin:
                 {"value": "rescan_all", "label": "Full rescan (movies + series)"}
             ],
             "help_text": "Which action the scheduler should run on each tick."
+        },
+        {
+            "id": "_section_mount",
+            "label": "[PLEX]",
+            "type": "info",
+            "description": "Plex delivery of the same library. Plex can't play .strm, so instead the plugin serves your VOD catalogue as a live read-only HTTP filesystem you mount with rclone; Plex reads real, correctly-named files (identical naming to the .strm output) that stream via Dispatcharr's VOD proxy. Click [MOUNT] Enable to start it; the mount runs as a small server inside Dispatcharr and installs uvicorn/fastapi/jinja2 on first enable (the .strm output needs no extra packages). Uses the same Dispatcharr URL as above.",
+        },
+        {
+            "id": "httpfs_port",
+            "label": "Mount HTTP Port",
+            "type": "number",
+            "default": 8889,
+            "help_text": "Port the mount server listens on (inside the container; publish it so rclone can reach it). rclone connects here; the Dispatcharr URL above is the playback redirect target. Default 8889."
+        },
+        {
+            "id": "httpfs_enable_auth",
+            "label": "Mount Authentication (Token-based)",
+            "type": "boolean",
+            "default": False,
+            "help_text": "Require a Dispatcharr API key on every mount request. Enable if the port is exposed beyond a trusted network. When ON, add the API key to the rclone config's headers line."
+        },
+        {
+            "id": "httpfs_hydrate_concurrency",
+            "label": "Mount Size-Hydration Concurrency",
+            "type": "number",
+            "default": 8,
+            "help_text": "Parallel fetches the mount uses to backfill real file sizes from your provider (Plex needs true sizes to play). 0 disables hydration (only already-sized titles show). Default 8."
+        },
+        {
+            "id": "httpfs_hydrate_on_load",
+            "label": "Mount: Full size-sync on enable",
+            "type": "boolean",
+            "default": True,
+            "help_text": "On [MOUNT] Enable, kick off a one-time size hydration pass so titles become visible to Plex sooner."
+        },
+        {
+            "id": "httpfs_scheduled_times",
+            "label": "Mount Hydration Times (24h)",
+            "type": "string",
+            "default": "0300",
+            "help_text": "Comma-separated HHMM times to run a daily size-hydration pass (e.g. '0300,1500'). Empty disables the schedule."
+        },
+        {
+            "id": "httpfs_timezone",
+            "label": "Mount Hydration Timezone",
+            "type": "string",
+            "default": "",
+            "placeholder": "America/New_York",
+            "help_text": "IANA timezone for the hydration times above. Empty = UTC."
         }
     ]
 
@@ -357,8 +409,48 @@ class Plugin:
                 "message": "This deletes every .strm and .nfo file this plugin created under your Series root. User-added files in those folders are preserved. Continue?",
             },
         },
+        {
+            "id": "httpfs_enable",
+            "label": "[MOUNT] Enable Plex mount",
+            "description": "Start the HTTP filesystem server for rclone/Plex. Installs uvicorn/fastapi/jinja2 on first run.",
+            "button_label": "Enable",
+            "button_variant": "filled",
+            "button_color": "grape",
+        },
+        {
+            "id": "httpfs_status",
+            "label": "[MOUNT] Status",
+            "description": "Show mount server state, visible title counts, and hydration progress.",
+            "button_label": "Status",
+            "button_variant": "outline",
+            "button_color": "blue",
+        },
+        {
+            "id": "httpfs_rclone_config",
+            "label": "[MOUNT] rclone config",
+            "description": "Where to get the paste-ready rclone remote for the mount.",
+            "button_label": "Show",
+            "button_variant": "outline",
+            "button_color": "blue",
+        },
+        {
+            "id": "httpfs_hydrate_now",
+            "label": "[MOUNT] Hydrate sizes now",
+            "description": "Trigger an immediate size-hydration pass so more titles become visible to Plex.",
+            "button_label": "Hydrate",
+            "button_variant": "outline",
+            "button_color": "grape",
+        },
+        {
+            "id": "httpfs_disable",
+            "label": "[MOUNT] Disable Plex mount",
+            "description": "Stop the HTTP filesystem server. The .strm generator is unaffected.",
+            "button_label": "Disable",
+            "button_variant": "outline",
+            "button_color": "orange",
+        },
     ]
-    
+
     def run(self, action: str, params: dict, context: dict):
         """Execute plugin action."""
         logger = context.get("logger")
@@ -389,8 +481,27 @@ class Plugin:
             return self._schedule_status(settings, logger)
         elif action == "schedule_test_fire":
             return self._schedule_test_fire(settings, logger)
+        elif action == "httpfs_enable":
+            return self.httpfs_enable(settings, logger)
+        elif action == "httpfs_disable":
+            return self.httpfs_disable(logger)
+        elif action == "httpfs_status":
+            return self.httpfs_status(settings, logger)
+        elif action == "httpfs_rclone_config":
+            return self.httpfs_rclone_config(settings, logger)
+        elif action == "httpfs_hydrate_now":
+            return self.httpfs_hydrate_now(settings, logger)
 
         return {"status": "error", "message": f"Unknown action: {action}"}
+
+    def stop(self, context: dict):
+        """Called when the plugin is disabled/deleted/reloaded — kill the mount child."""
+        import logging
+        logger = context.get("logger") or logging.getLogger("vod2mlib")
+        try:
+            self.httpfs_stop_on_unload(logger)
+        except Exception as e:
+            logger.warning("httpfs stop_on_unload failed: %s", e)
     
     def _scan_all_vods(self, settings: Dict[str, Any], logger):
         """Scan and show total movies and series available."""
@@ -454,21 +565,6 @@ class Plugin:
             logger.error("Scan failed: %s", e)
             return {"status": "error", "message": f"Scan error: {e}"}
     
-    def _category_subfolder(self, category_name: str, nest: bool) -> str:
-        """Return the category subfolder segment to insert into a path.
-
-        Returns "" when nest is False (caller should not insert a layer).
-        Returns the sanitised raw category name when nest is True and a
-        category is provided. Returns "Unassigned" when nest is True but
-        no category is available.
-        """
-        if not nest:
-            return ""
-        cat = (category_name or "").strip()
-        if not cat:
-            return "Unassigned"
-        return self._sanitize_filename(cat)
-
     def _movie_target_paths(self, movie, root_folder: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False):
         """Compute the (folder_path, strm_filename, clean_name, year) for a movie.
 
@@ -481,81 +577,22 @@ class Plugin:
         affected — only the folder name, since that's what scrapers read.
         """
         raw_name = movie.name or f"Unknown Movie {movie.id}"
-        clean_name, title_year = self._extract_clean_name_and_year(raw_name)
-        year = movie.year or title_year
-        clean_name, year = self._strip_redundant_trailing_year(clean_name, year)
-        safe = self._sanitize_filename(clean_name)
-        if year:
-            base_name = f"{safe} ({year})"
-            strm_filename = f"{safe} ({year}).strm"
-        else:
-            base_name = safe
-            strm_filename = f"{safe}.strm"
-        folder_name = self._apply_tmdb_suffix(base_name, movie, append_tmdb_id)
-        cat_segment = self._category_subfolder(category_name, nest)
+        parsed = _naming.parse_title(raw_name, getattr(movie, "year", None))
+        # The canonical folder name from the shared core — same engine, same result
+        # the mount would produce for this movie. Always carries {tmdb-}/{imdb-} when
+        # known (that is what makes scraper matching exact); `append_tmdb_id` is now
+        # implicit in the one naming path and the parameter is retained only for
+        # call-site compatibility.
+        folder_name = _naming.folder_name(
+            raw_name, getattr(movie, "year", None),
+            getattr(movie, "tmdb_id", None), getattr(movie, "imdb_id", None))
+        strm_filename = _naming.strm_filename(folder_name)
+        cat_segment = _naming.category_segment(category_name, nest)
         if cat_segment:
             folder_path = os.path.join(root_folder, cat_segment, folder_name)
         else:
             folder_path = os.path.join(root_folder, folder_name)
-        return folder_path, strm_filename, clean_name, year
-
-    def _strip_redundant_trailing_year(self, name, year):
-        """Remove a bare trailing year a provider stuffed into the title, so it
-        doesn't get doubled against the `(YYYY)` suffix the plugin adds.
-
-        Two modes:
-          * If `year` is known and the title ends with that exact year
-            (optionally after a separator), strip it — `Wicked: For Good - 2025`
-            + year 2025 -> `Wicked: For Good`.
-          * If `year` is None and the title ends with a plausible bare year
-            (1900–2100), ADOPT it as the year and strip it — so
-            `Wicked: For Good - 2025` with no DB year still yields a clean
-            `Wicked: For Good (2025)/` folder.
-
-        Guards:
-          * `Blade Runner 2049` (DB year 2017) — trailing 2049 ≠ 2017, kept.
-          * `Room 1408` (DB year 2007) — 1408 ≠ 2007 and < 1900, kept.
-          * `1984` / `2012` where the year IS the whole title — never stripped
-            to empty.
-
-        Returns `(name, year)` — `year` may be newly adopted in mode two.
-        """
-        if not name:
-            return name, year
-        m = self._BARE_TRAILING_YEAR_RE.search(name)
-        if not m:
-            return name, year
-        trailing = int(m.group(1))
-        if year is None:
-            if not (1900 <= trailing <= 2100):
-                return name, year
-            adopted = trailing
-        elif trailing == year:
-            adopted = year
-        else:
-            return name, year
-        stripped = name[: m.start()].rstrip(" -–—_:.,").strip()
-        if not stripped:
-            # The year is the entire title (e.g. "1984", "2012") — keep it.
-            return name, year
-        return stripped, adopted
-
-    def _apply_tmdb_suffix(self, base_name: str, obj, append_tmdb_id: bool) -> str:
-        """Append `{tmdb-NNN}` to a folder base name when the toggle is on and
-        the object exposes a tmdb_id. Returns unchanged otherwise.
-
-        Plex's [Personal Media Movies] agent treats `{tmdb-N}` / `{imdb-ttN}`
-        as a forced-match override. ChannelsDVR's local-media scraper does the
-        same. Off by default since flipping the toggle changes existing folder
-        names — users would need to clean up the old folders or accept the new
-        ones living alongside.
-        """
-        if not append_tmdb_id:
-            return base_name
-        tmdb_id = (getattr(obj, "tmdb_id", "") or "").strip()
-        if not tmdb_id:
-            return base_name
-        return f"{base_name} {{tmdb-{tmdb_id}}}"
+        return folder_path, strm_filename, parsed["title"], parsed["year"]
 
     def _generate_movies(self, settings: Dict[str, Any], logger, refresh_urls: bool = False):
         """Generate movie .strm files according to batch size.
@@ -664,7 +701,7 @@ class Plugin:
                 skipped += 1
                 continue
 
-            proxy_url = f"{dispatcharr_url}/proxy/vod/movie/{movie.uuid}?stream_id={relation.stream_id}"
+            proxy_url = _proxy_url(dispatcharr_url, "movie", movie.uuid, relation.stream_id)
 
             written = created_strm + refreshed_strm
             log_this = (written + 1) % self.LOG_EVERY == 1 or written < self.LOG_FIRST_N
@@ -755,25 +792,21 @@ class Plugin:
     def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False):
         """Compute the target folder for a series. Returns (folder_path, clean_name, year).
 
-        When nest=True the folder is wrapped in a category subfolder named
-        by the raw M3U category (or 'Unassigned' if none).
-
-        When append_tmdb_id=True AND the series has a tmdb_id, the folder name
-        gets a `{tmdb-NNN}` suffix for Plex/ChannelsDVR exact matching. See
-        `_apply_tmdb_suffix` for caveats around flipping the toggle on an
-        existing library.
+        The folder name comes from the single naming path (vodlib.naming) — the
+        same canonical name the mount produces — always carrying {tmdb-}/{imdb-}
+        when known. When nest=True the folder is wrapped in a category subfolder
+        named by the raw M3U category (or 'Unassigned' if none). `append_tmdb_id`
+        is retained for call-site compatibility; ids are always included now.
         """
         raw_name = series.name or f"Unknown Series {series.id}"
-        clean_name, title_year = self._extract_clean_name_and_year(raw_name)
-        year = series.year or title_year
-        clean_name, year = self._strip_redundant_trailing_year(clean_name, year)
-        safe = self._sanitize_filename(clean_name)
-        base_name = f"{safe} ({year})" if year else safe
-        folder_name = self._apply_tmdb_suffix(base_name, series, append_tmdb_id)
-        cat_segment = self._category_subfolder(category_name, nest)
+        parsed = _naming.parse_title(raw_name, getattr(series, "year", None))
+        folder_name = _naming.folder_name(
+            raw_name, getattr(series, "year", None),
+            getattr(series, "tmdb_id", None), getattr(series, "imdb_id", None))
+        cat_segment = _naming.category_segment(category_name, nest)
         if cat_segment:
-            return os.path.join(series_root, cat_segment, folder_name), clean_name, year
-        return os.path.join(series_root, folder_name), clean_name, year
+            return os.path.join(series_root, cat_segment, folder_name), parsed["title"], parsed["year"]
+        return os.path.join(series_root, folder_name), parsed["title"], parsed["year"]
 
     def _series_already_processed(self, series_folder: str) -> bool:
         """A series is considered processed if its folder contains any 'Season ...' subdir."""
@@ -1070,16 +1103,13 @@ class Plugin:
                 season_num = episode.season_number or 0
                 episode_num = episode.episode_number or 0
 
-                season_folder_name = f"Season {season_num:02d}"
+                season_folder_name = _naming.season_dir_name(season_num)
                 season_folder = os.path.join(series_folder, season_folder_name)
 
-                episode_title = episode.name or ""
-                if episode_title:
-                    clean_title = self._clean_title(episode_title)
-                    filename = f"{series_name} - S{season_num:02d}E{episode_num:02d} - {clean_title}"
-                else:
-                    filename = f"{series_name} - S{season_num:02d}E{episode_num:02d}"
-                filename = self._sanitize_filename(filename)
+                # One naming path: same SxxEyy base the mount produces for this episode.
+                filename = _naming.episode_basename(
+                    series.name, getattr(series, "year", None),
+                    season_num, episode_num, episode.name or "")
 
                 strm_path = os.path.join(season_folder, f"{filename}.strm")
                 is_existing = os.path.isfile(strm_path)
@@ -1087,7 +1117,7 @@ class Plugin:
                     continue
 
                 os.makedirs(season_folder, exist_ok=True)
-                proxy_url = f"{dispatcharr_url}/proxy/vod/episode/{episode.uuid}?stream_id={episode_rel.stream_id}"
+                proxy_url = _proxy_url(dispatcharr_url, "episode", episode.uuid, episode_rel.stream_id)
                 with open(strm_path, 'w', encoding='utf-8') as f:
                     f.write(proxy_url)
                 if is_existing:
@@ -1240,11 +1270,15 @@ class Plugin:
         the action and surface error_message to the user.
         """
         url_clean = (url or "").strip()
-        if not url_clean:
-            return False, (
-                "Dispatcharr URL is empty. Set it in the plugin Settings "
-                "(and click Save) before running this action."
-            )
+        # Structural validity (empty / scheme / host) comes from the one shared
+        # playback validator; the .strm-specific placeholder + localhost checks
+        # below are layered on top.
+        structural = _validate_base_url(url_clean)
+        if structural is not None:
+            if not url_clean:
+                return False, ("Dispatcharr URL is empty. Set it in the plugin Settings "
+                               "(and click Save) before running this action.")
+            return False, structural
         if url_clean == self.PLACEHOLDER_DISPATCHARR_URL:
             return False, (
                 f"Dispatcharr URL is still the placeholder example "
@@ -1352,75 +1386,13 @@ class Plugin:
             msg += f", preserved {r['preserved_dirs']} (user files)"
         return {"status": "ok", "message": msg, **r}
     
-    def _clean_title(self, title: str) -> str:
-        """Remove language prefixes like 'EN - ', 'FR - ' from titles.
-
-        Requires whitespace before the dash so real titles like 'AC-130' or
-        'MI-5' are not stripped.
-        """
-        if not title:
-            return title
-        return self._LANGUAGE_PREFIX_RE.sub('', title).strip()
-
-    def _strip_trailing_year(self, title: str):
-        """Strip a trailing ' (YYYY)' from a title.
-
-        Returns (cleaned_title, year) where year is an int if found, else None.
-        Used to avoid double-year folder names when the source title already
-        contains the year.
-        """
-        if not title:
-            return title or "", None
-        match = self._TRAILING_YEAR_RE.search(title)
-        if not match:
-            return title, None
-        return self._TRAILING_YEAR_RE.sub('', title).rstrip(), int(match.group(1))
-
-    def _extract_clean_name_and_year(self, raw_name: str):
-        """Aggressive folder-name cleanup for movies & series.
-
-        Strips language prefix, truncates at the FIRST (YYYY) so trailing
-        provider junk (cast names, duplicate years, etc.) is discarded, then
-        strips quality / encoding tokens from the surviving prefix. Returns
-        (clean_name, year) where year is an int if a (YYYY) was found.
-
-        Examples:
-            "Cool Hand Luke 4K (1967) PAUL NEWMAN (1967)" → ("Cool Hand Luke", 1967)
-            "EN - The Matrix (1999)"                     → ("The Matrix", 1999)
-            "Whiplash 1080p HEVC (2014)"                 → ("Whiplash", 2014)
-            "Avatar"                                     → ("Avatar", None)
-
-        Used by `_movie_target_paths` and `_series_target_folder`. The simpler
-        `_clean_title` / `_strip_trailing_year` helpers stay as-is for NFO
-        generation, which wants gentler handling.
-        """
-        if not raw_name:
-            # Preserve the falsy type contract used by _clean_title:
-            # "" stays "", None stays None. Callers always pre-coalesce
-            # the upstream name field so None never reaches us in practice.
-            return raw_name, None
-        # Language prefix first (same regex as _clean_title).
-        title = self._LANGUAGE_PREFIX_RE.sub('', raw_name).strip()
-        # Truncate at the first (YYYY) — everything after is provider noise.
-        match = self._FIRST_YEAR_RE.search(title)
-        year = None
-        if match:
-            year = int(match.group(1))
-            title = title[:match.start()]
-        # Strip quality tokens and collapse repeated whitespace.
-        title = self._QUALITY_TOKEN_RE.sub('', title)
-        title = re.sub(r'\s+', ' ', title).strip()
-        # Trim trailing punctuation left behind by token removal (e.g. "Title -").
-        title = title.rstrip(' -_.,;:').strip()
-        return title, year
-    
     def _extract_genres(self, category_name: str) -> list:
         """Extract genre names from category name."""
         if not category_name:
             return []
 
-        # Strip language prefix using the same regex as _clean_title to avoid
-        # the AC-130-becomes-130 over-strip bug.
+        # Strip a leading language prefix ('EN - ', 'FR - ') from the category.
+        # Whitespace-before-dash anchoring avoids the AC-130-becomes-130 over-strip.
         genre_text = self._LANGUAGE_PREFIX_RE.sub('', category_name)
 
         # Remove (movie) or (series) suffix
@@ -1485,9 +1457,9 @@ class Plugin:
     def _generate_tvshow_nfo(self, series, category_name: str) -> str:
         """Generate tvshow.nfo XML content for a series."""
         raw_title = series.name or "Unknown"
-        title = self._clean_title(raw_title)
-        title, title_year = self._strip_trailing_year(title)
-        year = series.year or title_year or ""
+        parsed = _naming.parse_title(raw_title, getattr(series, "year", None))
+        title = parsed["title"] or "Unknown"
+        year = series.year or parsed["year"] or ""
         plot = series.description or ""
         rating = (getattr(series, "rating", "") or "").strip()
         tmdb_id = (getattr(series, "tmdb_id", "") or "").strip()
@@ -1533,8 +1505,7 @@ class Plugin:
     def _generate_episode_nfo(self, episode) -> str:
         """Generate episode.nfo XML content for an episode."""
         raw_title = episode.name or ""
-        title = self._clean_title(raw_title) if raw_title else "Episode"
-        title, _ = self._strip_trailing_year(title)
+        title = (_naming.episode_display_title(raw_title) or "Episode") if raw_title else "Episode"
         season_num = episode.season_number or 0
         episode_num = episode.episode_number or 0
         plot = episode.description or ""
@@ -1578,9 +1549,9 @@ class Plugin:
     def _generate_nfo(self, movie, category_name: str) -> str:
         """Generate NFO XML content for a movie."""
         raw_title = movie.name or "Unknown"
-        title = self._clean_title(raw_title)
-        title, title_year = self._strip_trailing_year(title)
-        year = movie.year or title_year or ""
+        parsed = _naming.parse_title(raw_title, getattr(movie, "year", None))
+        title = parsed["title"] or "Unknown"
+        year = movie.year or parsed["year"] or ""
         plot = movie.description or ""
         rating = (movie.rating or "").strip()
         tmdb_id = (movie.tmdb_id or "").strip()
@@ -1656,23 +1627,9 @@ class Plugin:
         return text
     
     def _sanitize_filename(self, name: str) -> str:
-        """Sanitize filename by removing invalid characters."""
-        if not name:
-            return "Unknown"
-        
-        # Remove invalid characters for Windows/Linux filesystems
-        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
-        
-        # Replace multiple spaces with single space
-        name = re.sub(r'\s+', ' ', name)
-        
-        # Trim and limit length
-        name = name.strip()[:self.MAX_FILENAME_LEN]
-        
-        # Remove trailing dots/spaces (Windows issue)
-        name = name.rstrip('. ')
-
-        return name or "Unknown"
+        """Sanitize a single path component. Delegates to the one shared sanitizer
+        (vodlib.naming) so the .strm generator and the mount apply identical rules."""
+        return _naming.sanitize_filename(name)
 
     def _rescan_all(self, settings: Dict[str, Any], logger):
         """Combined scan + generate movies + generate series. Used by the cron schedule.

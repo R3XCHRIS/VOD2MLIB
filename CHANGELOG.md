@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.16.0 — Plex support via a unified library engine (integrates VODFS)
+
+VOD2MLIB now delivers your VOD catalogue **two ways from one engine**: `.strm` files (Jellyfin/Emby/Kodi/ChannelsDVR) and a live HTTP **mount for Plex** — which can't play `.strm`. The Plex mount comes from [VODFS](https://github.com/OneHotTake/vodfs) (MIT, © 2026 OneHotTake), but this is not a bolt-on: the two outputs are built on a single shared core.
+
+**One path for everything.** A new `vodlib/` core holds exactly one implementation of each concern, used by both outputs:
+
+- **One naming path** (`vodlib/naming.py`) — title cleaning, year extraction, `Title (Year) {tmdb-…} {imdb-…}` folders, `Season NN`, `SxxEyy`. A movie lands at the *same folder name* whether written as `.strm` or served on the mount. This engine is strictly better than what either side had before: it strips provider noise (quality/language prefixes, bracket tags, dotted release names, list numbers) *and* preserves title-years like `Blade Runner 2049`, `Room 1408`, `1984`.
+- **One playback path** (`vodlib/playback.py`) — a single function builds the Dispatcharr proxy URL. It's the contents of each `.strm` and the `302` target of every mount file-open.
+- **One configuration path** (`vodlib/config.py`) — the mount's settings flow through one schema; the `Dispatcharr URL` is shared with the `.strm` output.
+
+**New for Plex:**
+- `[MOUNT]` actions: Enable / Disable / Status / rclone config / Hydrate sizes now.
+- `[PLEX]` settings: mount HTTP port (default `8889`), token auth, and size-hydration (Plex needs true file sizes to play; the mount backfills them from your provider on a schedule).
+- The mount runs as a small server inside Dispatcharr and installs `uvicorn`/`fastapi`/`jinja2` on first `[MOUNT] Enable` (the `.strm` output still needs no extra packages).
+
+**⚠ Breaking for existing `.strm` libraries — folder names changed.** Because `.strm` now uses the unified naming, movie/series folders always carry `{tmdb-…}`/`{imdb-…}` when known (previously opt-in via *Append TMDB ID*) and use the more aggressive provider-noise cleanup. To migrate an existing library cleanly: run `[⚠ DANGER] Clean up`, then re-generate. New installs are unaffected. The *Append TMDB ID* toggle is now implicit (ids are always included) and retained only for compatibility.
+
 ## v1.15.2 — active-account filter, bare-year cleanup, schedule-drift warning
 
 Four community-reported fixes, all backwards-compatible.

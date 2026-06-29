@@ -18,6 +18,7 @@
 
 - **Original author:** [shedunraid](https://github.com/shedunraid) — created v0.x–v1.3 ([upstream repo](https://github.com/shedunraid/VOD2MLIB)).
 - **Fork maintainer:** [R3XCHRIS](https://github.com/R3XCHRIS) — v1.4+ adds scheduling and bug fixes. Listed in the [official Dispatcharr Plugins catalogue](https://github.com/Dispatcharr/Plugins/tree/main/plugins/vod2mlib) since v1.14.3. Upstream has been dormant since early 2026; this fork continues maintenance.
+- **Plex mount mode (v1.16.0+):** vendors [VODFS](https://github.com/OneHotTake/vodfs) by [OneHotTake](https://github.com/OneHotTake) (MIT) — the `mountsrv/` HTTP-filesystem server. See [Plex mount mode](#plex-mount-mode-optional).
 - MIT License.
 
 ---
@@ -152,12 +153,42 @@ The cron snapshots your settings at click-time. **Re-click Apply after changing 
 
 Plex does **not** play `.strm` files (it can index them but the URL inside doesn't play). This is a long-standing Plex limitation — it's been an unfulfilled feature request for 5+ years.
 
-Workable alternatives:
+**For Plex, use the built-in mount mode (v1.16.0+).** Instead of writing `.strm`, VOD2MLIB can serve your live VOD library as a read-only HTTP filesystem that you mount with [rclone](https://rclone.org). Plex then reads *real*, correctly-named files (`{tmdb-}` matched) that stream via Dispatcharr's VOD proxy — so playback, seeking and analysis all work. See [Plex mount mode](#plex-mount-mode-optional) below. (This vendors [VODFS](https://github.com/OneHotTake/vodfs); credit to OneHotTake.)
 
-- **Jellyfin alongside Plex.** Jellyfin plays `.strm` natively. Run it in a container next to Plex, point both at the same library folder (see [Sharing the VODs folder](#sharing-the-vods-folder-with-media-servers) above).
-- **ChannelsDVR's Personal Media** — works perfectly out of the box. Point CDVR at the Movies/Series root.
+Other media servers don't need the mount — `.strm` works directly:
+
+- **Jellyfin** plays `.strm` natively. Point it at the library folder (see [Sharing the VODs folder](#sharing-the-vods-folder-with-media-servers) above).
+- **ChannelsDVR's Personal Media** — works out of the box. Point CDVR at the Movies/Series root.
 - **Kodi** — works.
 - **Emby** — works.
+
+(Jellyfin/Emby/Kodi can use the mount too, but there's no reason to — `.strm` is simpler for them.)
+
+## Plex mount mode
+
+The Plex delivery of your library — the same catalogue, same naming as the `.strm` output, served as a filesystem Plex can actually play. Start it with `[MOUNT] Enable`.
+
+How it works: clicking `[MOUNT] Enable` starts a small HTTP server inside the Dispatcharr container that exposes the live VOD library as a browsable filesystem. You point `rclone` at it and mount the result where Plex can read it. Every directory listing is a live DB query; every file open `302`-redirects into Dispatcharr's native VOD proxy. No files are written to disk.
+
+**Setup:**
+
+1. In plugin settings, set **Dispatcharr URL** to an address Plex's host can reach (this is the playback redirect target), and pick a **Mount HTTP Port** (default `8889`) — publish that port from the container.
+2. Click **`[MOUNT] Enable`**. On first run it installs `uvicorn`/`fastapi`/`jinja2` into Dispatcharr (the only time this plugin needs external deps — the `.strm` mode never does).
+3. Click **`[MOUNT] Status`** to confirm it's running and see how many titles are visible. Click **`[MOUNT] rclone config`** for a paste-ready remote.
+4. Mount it on the host that feeds Plex:
+
+   ```bash
+   rclone mount vod2mlib: /mnt/vod2mlib \
+     --allow-other --read-only --dir-cache-time 1h --poll-interval 0 \
+     --vfs-cache-mode full --cache-dir /var/cache/vod2mlib
+   ```
+
+5. In Plex, add a **Movie** library at `/mnt/vod2mlib/Movies/All` and a **TV** library at `/mnt/vod2mlib/Series/All` (or point at individual categories for smaller, faster libraries). Use the current **Plex Movie** / **Plex TV Series** agents. Set "Generate video preview thumbnails" and "extensive media analysis" to **never** — deep analysis pulls large data from your provider.
+
+**Notes:**
+- Plex needs the *true* file size to play. The mount backfills sizes from your provider on a schedule (see the **Hydration** settings); titles appear in Plex as their sizes land. `[MOUNT] Hydrate sizes now` forces a pass.
+- The mount is a long-running child process and adds three PyPI dependencies — heavier than the dependency-free `.strm` generator, which is why it's strictly opt-in.
+- `[MOUNT] Disable` stops the server; the `.strm` generator is unaffected either way. You can run both modes at once if you like.
 
 ## Troubleshooting
 
@@ -210,10 +241,19 @@ The bundled logo is reproducible — replace `tools/source_logo.png` and run `py
 
 ## Architecture (for contributors)
 
-- The plugin is a single `plugin.py` declaring a `Plugin` class with `fields`, `actions`, and `run()` per Dispatcharr's plugin contract.
-- `plugin.json` is the manifest the [Dispatcharr/Plugins catalogue](https://github.com/Dispatcharr/Plugins) reads. Dispatcharr's runtime reads action metadata from the Python class — the JSON is for the catalogue and pre-enable preview.
-- Schedule registration uses `django-celery-beat`'s `PeriodicTask` + `CrontabSchedule`. The cron-fired task is a module-level `@shared_task` named `vod2mlib.scheduled_rescan` that constructs a fresh `Plugin()` and dispatches.
-- Settings are snapshotted into the PeriodicTask's `kwargs` at Apply-time so the cron runs with deterministic config. Re-click Apply to refresh.
+The plugin delivers one library two ways (`.strm` files and the Plex mount) on top of a **single shared core**. Each concern is implemented exactly once:
+
+- **`vodlib/`** — the shared core, pure and unit-tested:
+  - `naming.py` — the one naming path: title cleaning, year extraction, `Title (Year) {tmdb-…} {imdb-…}` folders, `Season NN`, `SxxEyy`, `.strm`/mount filenames.
+  - `playback.py` — the one playback path: the Dispatcharr proxy URL builder + base-URL validation.
+  - `config.py` — the one configuration schema for the mount, derived from plugin settings.
+- **`plugin.py`** — the `Plugin` class (`fields`/`actions`/`run()` per Dispatcharr's contract). The `.strm`/`.nfo` generator and the cron scheduler. Builds names/URLs via `vodlib`.
+- **`httpfs_control.py`** — the `[MOUNT]` lifecycle: starts/stops the mount child, installs deps, builds its config via `vodlib.config`.
+- **`mountsrv/`** — the standalone ASGI mount server (FastAPI/uvicorn) that rclone talks to. Its data layer does live Dispatcharr ORM queries + size logic; all naming/URLs come from `vodlib`. Vendored from [VODFS](https://github.com/OneHotTake/vodfs) (MIT) and refactored onto the shared core.
+- `plugin.json` is the catalogue manifest; Dispatcharr's runtime reads `fields`/`actions` from the Python class (the JSON is kept in sync for the catalogue and pre-enable preview).
+- Schedule registration uses `django-celery-beat`'s `PeriodicTask` + `CrontabSchedule`; the cron-fired `@shared_task` `vod2mlib.scheduled_rescan` constructs a fresh `Plugin()` and dispatches. Settings are snapshotted into the task's `kwargs` at Apply-time.
+
+Tests in `tests/` cover the shared core (`test_naming.py`) and the plugin helpers (`test_helpers.py`); run `python3 -m pytest tests/`.
 
 ## Changelog
 

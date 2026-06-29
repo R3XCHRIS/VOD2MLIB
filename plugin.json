@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.15.2",
+  "version": "1.16.0",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -12,7 +12,7 @@
       "id": "_about",
       "label": "About",
       "type": "info",
-      "description": "Workflow:\n  1. Configure paths below.\n  2. Actions → Scan → see catalogue totals.\n  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n  4. (Optional) Turn ON Refresh Existing Series, set cron, click Apply Schedule for nightly auto-rescan.\n\nDocs: https://github.com/R3XCHRIS/VOD2MLIB"
+      "description": "Turns your Dispatcharr VOD catalogue into a correctly-named media library, delivered two ways from one engine:\n  • .strm files on disk — for Jellyfin, Emby, Kodi, ChannelsDVR.\n  • a live HTTP mount (rclone) — for Plex, which can't play .strm.\nBoth share the same title cleaning, folder naming, and playback URLs, so a title lands the same name whichever output you use.\n\nWorkflow:\n  1. Set the Dispatcharr URL and (for .strm) the root folders below.\n  2. Actions → Scan → see catalogue totals.\n  3. .strm: Generate Movies / Generate Series (start with Batch Size 10).\n  4. Plex: [MOUNT] Enable, then mount with rclone (see [MOUNT] rclone config).\n\nDocs: https://github.com/R3XCHRIS/VOD2MLIB"
     },
     {
       "id": "_section_paths",
@@ -25,7 +25,7 @@
       "label": "Root Folder for Movies",
       "type": "string",
       "default": "/VODS/Movies",
-      "help_text": "Path inside the Dispatcharr container where movie folders will be created. Map a host folder to /VODS in your container."
+      "help_text": "Path inside the Dispatcharr container where movie folders will be created."
     },
     {
       "id": "series_root_folder",
@@ -54,22 +54,39 @@
       "type": "select",
       "default": "250",
       "options": [
-        {"value": "10", "label": "10 movies"},
-        {"value": "100", "label": "100 movies"},
-        {"value": "200", "label": "200 movies"},
-        {"value": "250", "label": "250 movies"},
-        {"value": "500", "label": "500 movies"},
-        {"value": "1000", "label": "1000 movies"},
-        {"value": "all", "label": "All movies"}
+        {
+          "value": "10",
+          "label": "10 movies"
+        },
+        {
+          "value": "100",
+          "label": "100 movies"
+        },
+        {
+          "value": "200",
+          "label": "200 movies"
+        },
+        {
+          "value": "500",
+          "label": "500 movies"
+        },
+        {
+          "value": "1000",
+          "label": "1000 movies"
+        },
+        {
+          "value": "all",
+          "label": "All movies"
+        }
       ],
-      "help_text": "Number of movies to process in this run. Start small (10) to verify, then scale up."
+      "help_text": "Number of movies to process in this run"
     },
     {
       "id": "generate_nfo",
       "label": "Generate Movie NFO Files",
       "type": "boolean",
       "default": true,
-      "help_text": "Create .nfo metadata files alongside each movie .strm."
+      "help_text": "Create .nfo metadata files for movies"
     },
     {
       "id": "nest_movies_by_category",
@@ -83,14 +100,14 @@
       "label": "Dedupe Movies Across Categories",
       "type": "boolean",
       "default": false,
-      "help_text": "When `Nest Movies by Category` is ON and a movie is tagged with multiple categories upstream (e.g. 'Action' AND 'Sci-Fi'), write the `.strm` under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Movies by Category` is OFF — multi-category movies already resolve to the same folder in that case. Use this when you want one folder per movie regardless of provider tagging. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — it just stops creating new ones. To clean up existing duplicates, run `[⚠ DANGER] Clean up Movies` once, then re-generate."
+      "help_text": "When `Nest Movies by Category` is ON and a movie is tagged with multiple categories upstream (e.g. 'Action' AND 'Sci-Fi'), write the `.strm` under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Movies by Category` is OFF — in that case multi-category movies already resolve to the same folder. Use this when you want one folder per movie regardless of provider tagging; your media server's genre tags still reflect every category via the NFO. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — it just stops creating new ones. To clean up existing duplicates, run `[⚠ DANGER] Clean up Movies` once, then re-generate."
     },
     {
       "id": "append_tmdb_id_to_folder",
       "label": "Append TMDB ID to folder names",
       "type": "boolean",
       "default": false,
-      "help_text": "Append `{tmdb-NNN}` to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex's Personal Media agent and ChannelsDVR's local-media scraper both honour this convention for forced exact matches. ⚠ MIGRATION: the plugin does NOT rename existing folders in place — turning this on (or off) for an already-generated library writes the new folder names ALONGSIDE the old ones, creating duplicates. To switch cleanly, run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate; or accept the duplicates until the old folders age out."
+      "help_text": "Append `{tmdb-NNN}` to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex's Personal Media agent and ChannelsDVR's local-media scraper both honour this convention for forced exact matches, which is the safest defence against name collisions and bad metadata scrapes. ⚠ MIGRATION: the plugin does NOT rename existing folders in place — turning this on (or off) for an already-generated library writes the new folder names ALONGSIDE the old ones, creating duplicates. To switch cleanly, run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate; or accept the duplicates until the old folders age out."
     },
     {
       "id": "_section_series",
@@ -104,27 +121,42 @@
       "type": "select",
       "default": "10",
       "options": [
-        {"value": "1", "label": "1 series (testing)"},
-        {"value": "5", "label": "5 series"},
-        {"value": "10", "label": "10 series"},
-        {"value": "25", "label": "25 series"},
-        {"value": "all", "label": "All series (slow!)"}
+        {
+          "value": "1",
+          "label": "1 series (testing)"
+        },
+        {
+          "value": "5",
+          "label": "5 series"
+        },
+        {
+          "value": "10",
+          "label": "10 series"
+        },
+        {
+          "value": "25",
+          "label": "25 series"
+        },
+        {
+          "value": "all",
+          "label": "All series (slow!)"
+        }
       ],
-      "help_text": "Number of series to process. Episodes are auto-fetched per series."
+      "help_text": "Series to process (episodes auto-fetched for each)"
     },
     {
       "id": "generate_series_nfo",
       "label": "Generate Series NFO Files",
       "type": "boolean",
       "default": true,
-      "help_text": "Create tvshow.nfo and per-episode .nfo metadata files."
+      "help_text": "Create .nfo metadata files for series and episodes"
     },
     {
       "id": "refresh_existing",
       "label": "Refresh Existing Series (rescan-friendly)",
       "type": "boolean",
       "default": false,
-      "help_text": "Re-evaluate series that already have folders, picking up new episodes added upstream AND rewriting existing episode .strm files so they pick up the current Dispatcharr URL. .nfo files (including tvshow.nfo) are only written when missing, so your edits are preserved. Off = fast manual iteration (skip done series); On = scan everything for new content and refresh existing URLs. Turn ON before clicking Apply Schedule for cron rescans of target 'generate_series'. Note: 'rescan_all' forces this ON regardless."
+      "help_text": "Re-evaluate series that already have folders, picking up new episodes added upstream AND rewriting existing episode .strm files so they pick up the current Dispatcharr URL. .nfo files (including tvshow.nfo) are only written when missing, so your edits are preserved. Turn ON for cron rescans."
     },
     {
       "id": "nest_series_by_category",
@@ -151,7 +183,7 @@
       "label": "Auto-Rescan Schedule (cron)",
       "type": "string",
       "default": "0 3 * * *",
-      "help_text": "Standard 5-field cron: 'minute hour day-of-month month day-of-week'. Default '0 3 * * *' = every day at 03:00. Used by Apply Schedule."
+      "help_text": "Standard 5-field cron: 'minute hour day-of-month month day-of-week'. Default '0 3 * * *' = every day at 03:00. Used by 'Apply Schedule'."
     },
     {
       "id": "schedule_timezone",
@@ -167,12 +199,73 @@
       "type": "select",
       "default": "rescan_all",
       "options": [
-        {"value": "scan_all_vods", "label": "Scan only (totals)"},
-        {"value": "generate_movies", "label": "Movies only"},
-        {"value": "generate_series", "label": "Series only"},
-        {"value": "rescan_all", "label": "Full rescan (movies + series)"}
+        {
+          "value": "scan_all_vods",
+          "label": "Scan only (totals)"
+        },
+        {
+          "value": "generate_movies",
+          "label": "Movies only"
+        },
+        {
+          "value": "generate_series",
+          "label": "Series only"
+        },
+        {
+          "value": "rescan_all",
+          "label": "Full rescan (movies + series)"
+        }
       ],
-      "help_text": "Which action the scheduler should run on each tick. 'Full rescan' is recommended."
+      "help_text": "Which action the scheduler should run on each tick."
+    },
+    {
+      "id": "_section_mount",
+      "label": "[PLEX]",
+      "type": "info",
+      "description": "Plex delivery of the same library. Plex can't play .strm, so instead the plugin serves your VOD catalogue as a live read-only HTTP filesystem you mount with rclone; Plex reads real, correctly-named files (identical naming to the .strm output) that stream via Dispatcharr's VOD proxy. Click [MOUNT] Enable to start it; the mount runs as a small server inside Dispatcharr and installs uvicorn/fastapi/jinja2 on first enable (the .strm output needs no extra packages). Uses the same Dispatcharr URL as above."
+    },
+    {
+      "id": "httpfs_port",
+      "label": "Mount HTTP Port",
+      "type": "number",
+      "default": 8889,
+      "help_text": "Port the mount server listens on (inside the container; publish it so rclone can reach it). rclone connects here; the Dispatcharr URL above is the playback redirect target. Default 8889."
+    },
+    {
+      "id": "httpfs_enable_auth",
+      "label": "Mount Authentication (Token-based)",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Require a Dispatcharr API key on every mount request. Enable if the port is exposed beyond a trusted network. When ON, add the API key to the rclone config's headers line."
+    },
+    {
+      "id": "httpfs_hydrate_concurrency",
+      "label": "Mount Size-Hydration Concurrency",
+      "type": "number",
+      "default": 8,
+      "help_text": "Parallel fetches the mount uses to backfill real file sizes from your provider (Plex needs true sizes to play). 0 disables hydration (only already-sized titles show). Default 8."
+    },
+    {
+      "id": "httpfs_hydrate_on_load",
+      "label": "Mount: Full size-sync on enable",
+      "type": "boolean",
+      "default": true,
+      "help_text": "On [MOUNT] Enable, kick off a one-time size hydration pass so titles become visible to Plex sooner."
+    },
+    {
+      "id": "httpfs_scheduled_times",
+      "label": "Mount Hydration Times (24h)",
+      "type": "string",
+      "default": "0300",
+      "help_text": "Comma-separated HHMM times to run a daily size-hydration pass (e.g. '0300,1500'). Empty disables the schedule."
+    },
+    {
+      "id": "httpfs_timezone",
+      "label": "Mount Hydration Timezone",
+      "type": "string",
+      "default": "",
+      "placeholder": "America/New_York",
+      "help_text": "IANA timezone for the hydration times above. Empty = UTC."
     }
   ],
   "actions": [
@@ -280,6 +373,46 @@
         "title": "Delete generated series files?",
         "message": "This deletes every .strm and .nfo file this plugin created under your Series root. User-added files in those folders are preserved. Continue?"
       }
+    },
+    {
+      "id": "httpfs_enable",
+      "label": "[MOUNT] Enable Plex mount",
+      "description": "Start the HTTP filesystem server for rclone/Plex. Installs uvicorn/fastapi/jinja2 on first run.",
+      "button_label": "Enable",
+      "button_variant": "filled",
+      "button_color": "grape"
+    },
+    {
+      "id": "httpfs_status",
+      "label": "[MOUNT] Status",
+      "description": "Show mount server state, visible title counts, and hydration progress.",
+      "button_label": "Status",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "httpfs_rclone_config",
+      "label": "[MOUNT] rclone config",
+      "description": "Where to get the paste-ready rclone remote for the mount.",
+      "button_label": "Show",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "httpfs_hydrate_now",
+      "label": "[MOUNT] Hydrate sizes now",
+      "description": "Trigger an immediate size-hydration pass so more titles become visible to Plex.",
+      "button_label": "Hydrate",
+      "button_variant": "outline",
+      "button_color": "grape"
+    },
+    {
+      "id": "httpfs_disable",
+      "label": "[MOUNT] Disable Plex mount",
+      "description": "Stop the HTTP filesystem server. The .strm generator is unaffected.",
+      "button_label": "Disable",
+      "button_variant": "outline",
+      "button_color": "orange"
     }
   ]
 }

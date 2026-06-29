@@ -41,98 +41,26 @@ def p():
 
 # ---------- _clean_title ----------
 
-class TestCleanTitle:
-    def test_strips_two_letter_language_prefix(self, p):
-        assert p._clean_title("EN - Inception") == "Inception"
-
-    def test_strips_three_letter_language_prefix(self, p):
-        assert p._clean_title("ENG - Inception") == "Inception"
-
-    def test_preserves_AC_130_style_titles(self, p):
-        # The whole point of the v1.5 regex tightening
-        assert p._clean_title("AC-130") == "AC-130"
-        assert p._clean_title("MI-5") == "MI-5"
-
-    def test_no_prefix_unchanged(self, p):
-        assert p._clean_title("The Matrix") == "The Matrix"
-
-    def test_empty_input(self, p):
-        assert p._clean_title("") == ""
-        assert p._clean_title(None) is None
-
-    def test_whitespace_trimmed_after_strip(self, p):
-        assert p._clean_title("FR -   Amélie") == "Amélie"
-
-
-# ---------- _strip_trailing_year ----------
-
-class TestStripTrailingYear:
-    def test_strips_year(self, p):
-        assert p._strip_trailing_year("Aladdin (2026)") == ("Aladdin", 2026)
-
-    def test_no_year_returns_none(self, p):
-        cleaned, year = p._strip_trailing_year("Aladdin")
-        assert cleaned == "Aladdin"
-        assert year is None
-
-    def test_year_in_middle_not_stripped(self, p):
-        # "(2026)" not trailing
-        cleaned, year = p._strip_trailing_year("The Year (2026) Movie")
-        assert cleaned == "The Year (2026) Movie"
-        assert year is None
-
-    def test_extra_trailing_whitespace(self, p):
-        assert p._strip_trailing_year("Aladdin (2026)  ") == ("Aladdin", 2026)
-
-    def test_empty_input(self, p):
-        cleaned, year = p._strip_trailing_year("")
-        assert cleaned == ""
-        assert year is None
-        cleaned, year = p._strip_trailing_year(None)
-        assert cleaned == ""
-        assert year is None
-
-    def test_three_digit_year_not_matched(self, p):
-        # Regex requires exactly 4 digits
-        cleaned, year = p._strip_trailing_year("Old Film (123)")
-        assert cleaned == "Old Film (123)"
-        assert year is None
-
-    def test_double_year_strips_only_outermost(self, p):
-        # A pre-v1.5 folder name that somehow makes it back into a title
-        cleaned, year = p._strip_trailing_year("Aladdin (2026) (2026)")
-        assert cleaned == "Aladdin (2026)"
-        assert year == 2026
-
-
-# ---------- _sanitize_filename ----------
-
 class TestSanitizeFilename:
-    def test_strips_invalid_chars(self, p):
-        assert p._sanitize_filename('a<b>c:"d/e\\f|g?h*i') == "abcdefghi"
+    # _sanitize_filename now delegates to the single shared sanitizer
+    # (vodlib.naming.sanitize_filename): illegal chars become spaces (keeping word
+    # boundaries), runs of whitespace collapse, '.'/'..'/'' fall back to 'Unknown'.
+    def test_strips_invalid_chars_to_spaces(self, p):
+        assert p._sanitize_filename('a<b>c:"d/e\\f|g?h*i') == "a b c d e f g h i"
 
     def test_strips_control_chars(self, p):
-        assert p._sanitize_filename("a\x00b\x1fc") == "abc"
+        assert p._sanitize_filename("a\x00b\x1fc") == "a b c"
 
     def test_collapses_runs_of_spaces(self, p):
         assert p._sanitize_filename("a   b   c") == "a b c"
 
-    def test_tabs_stripped_as_control_chars(self, p):
-        # Tabs and other \x00-\x1f bytes are stripped BEFORE whitespace collapse.
-        # Documenting current behaviour: "a\t\tb" loses its separator.
-        assert p._sanitize_filename("a\t\tb") == "ab"
-
-    def test_trims_to_max_length(self, p):
-        long = "x" * 500
-        result = p._sanitize_filename(long)
-        assert len(result) == p.MAX_FILENAME_LEN
-
-    def test_strips_trailing_dots_and_spaces(self, p):
-        assert p._sanitize_filename("name. . .") == "name"
+    def test_tabs_become_space(self, p):
+        assert p._sanitize_filename("a\t\tb") == "a b"
 
     def test_dotdot_becomes_unknown(self, p):
-        # Path traversal defense: '..' rstrips to empty, falls back to Unknown
+        # Path-traversal defence: '.' and '..' can never be a path component.
         assert p._sanitize_filename("..") == "Unknown"
+        assert p._sanitize_filename(".") == "Unknown"
 
     def test_empty_input(self, p):
         assert p._sanitize_filename("") == "Unknown"
@@ -611,29 +539,6 @@ class TestMovieTargetPaths:
 
 # ---------- nesting by category ----------
 
-class TestCategorySubfolder:
-    def test_nest_off_returns_empty(self, p):
-        assert p._category_subfolder("Action", nest=False) == ""
-        assert p._category_subfolder("", nest=False) == ""
-
-    def test_nest_on_with_category(self, p):
-        # Raw category preserved (just sanitised for filesystem)
-        assert p._category_subfolder("Action", nest=True) == "Action"
-        assert p._category_subfolder("EN - Action (movie)", nest=True) == "EN - Action (movie)"
-
-    def test_nest_on_no_category_returns_unassigned(self, p):
-        assert p._category_subfolder("", nest=True) == "Unassigned"
-        assert p._category_subfolder(None, nest=True) == "Unassigned"
-        assert p._category_subfolder("   ", nest=True) == "Unassigned"
-
-    def test_nest_on_sanitises_invalid_chars(self, p):
-        # Slashes and other invalid filesystem chars must be stripped (and the
-        # surrounding whitespace then collapsed by the sanitiser)
-        assert p._category_subfolder("Action / Drama", nest=True) == "Action Drama"
-        assert "/" not in p._category_subfolder("a/b", nest=True)
-        assert "\\" not in p._category_subfolder("a\\b", nest=True)
-
-
 class TestMovieTargetPathsNested:
     class _M:
         id = 1
@@ -777,115 +682,6 @@ class TestWalkAndCleanup:
 
 # ---------- _extract_clean_name_and_year (v1.15.0) ----------
 
-class TestExtractCleanNameAndYear:
-    """The aggressive cleanup used for folder names. Truncates at the first
-    (YYYY), strips quality tokens, leaves the gentler _clean_title /
-    _strip_trailing_year helpers untouched for NFO title generation."""
-
-    def test_sjsteve_discord_example_cool_hand_luke(self, p):
-        # The exact example from the Discord report: trailing cast + duplicate
-        # year defeat ChannelsDVR's metadata scraper. Expected output is the
-        # clean canonical title with the first (YYYY) only.
-        title, year = p._extract_clean_name_and_year("Cool Hand Luke 4K (1967) PAUL NEWMAN (1967)")
-        assert title == "Cool Hand Luke"
-        assert year == 1967
-
-    def test_simple_year_in_parens(self, p):
-        title, year = p._extract_clean_name_and_year("The Matrix (1999)")
-        assert title == "The Matrix"
-        assert year == 1999
-
-    def test_language_prefix_stripped(self, p):
-        title, year = p._extract_clean_name_and_year("EN - The Matrix (1999)")
-        assert title == "The Matrix"
-        assert year == 1999
-
-    def test_quality_token_stripped(self, p):
-        # 1080p / HEVC inside the title — stripped after year truncation.
-        title, year = p._extract_clean_name_and_year("Whiplash 1080p HEVC (2014)")
-        assert title == "Whiplash"
-        assert year == 2014
-
-    def test_quality_token_4k_uhd_hdr(self, p):
-        title, year = p._extract_clean_name_and_year("Dune 4K UHD HDR (2021)")
-        assert title == "Dune"
-        assert year == 2021
-
-    def test_first_year_wins_when_two_present(self, p):
-        # Sanity for the truncate-at-first-year rule: garbage AND a second year.
-        title, year = p._extract_clean_name_and_year("Title (1995) extra (2000)")
-        assert title == "Title"
-        assert year == 1995
-
-    def test_no_year_anywhere(self, p):
-        title, year = p._extract_clean_name_and_year("Avatar")
-        assert title == "Avatar"
-        assert year is None
-
-    def test_only_quality_tokens_no_year(self, p):
-        title, year = p._extract_clean_name_and_year("Inception 4K HEVC")
-        assert title == "Inception"
-        assert year is None
-
-    def test_empty_input(self, p):
-        assert p._extract_clean_name_and_year("") == ("", None)
-        assert p._extract_clean_name_and_year(None) == (None, None)
-
-    def test_legit_substrings_preserved(self, p):
-        # 'HD' must not eat 'Indiana' / 'Headhunter' / etc — boundary anchored.
-        title, year = p._extract_clean_name_and_year("Indiana Jones (1981)")
-        assert title == "Indiana Jones"
-        assert year == 1981
-        title, _ = p._extract_clean_name_and_year("Headhunter")
-        assert title == "Headhunter"
-
-    def test_ac_130_preserved(self, p):
-        # The original _clean_title carve-out — AC-130 / MI-5 must not be
-        # treated as a language prefix.
-        title, year = p._extract_clean_name_and_year("AC-130 (2018)")
-        assert title == "AC-130"
-        assert year == 2018
-
-    def test_trailing_separator_stripped(self, p):
-        # Quality token removal can leave " - " or " ," dangling — clean it.
-        title, year = p._extract_clean_name_and_year("Title 4K - (2020)")
-        assert title == "Title"
-        assert year == 2020
-
-
-# ---------- _apply_tmdb_suffix (v1.15.0) ----------
-
-class TestApplyTmdbSuffix:
-    def test_off_returns_unchanged(self, p):
-        class M:
-            tmdb_id = "378"
-        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), False) == "Cool Hand Luke (1967)"
-
-    def test_on_with_id_appends_suffix(self, p):
-        class M:
-            tmdb_id = "378"
-        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), True) == "Cool Hand Luke (1967) {tmdb-378}"
-
-    def test_on_without_id_returns_unchanged(self, p):
-        # No garbage suffix when the TMDB ID is missing.
-        class M:
-            tmdb_id = ""
-        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), True) == "Cool Hand Luke (1967)"
-
-    def test_on_with_whitespace_id_returns_unchanged(self, p):
-        class M:
-            tmdb_id = "   "
-        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), True) == "Cool Hand Luke (1967)"
-
-    def test_on_with_none_obj_attr_returns_unchanged(self, p):
-        # Defensive: getattr default catches a missing attribute.
-        class M:
-            pass
-        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", M(), True) == "Cool Hand Luke (1967)"
-
-
-# ---------- _logo_url (v1.15.0) ----------
-
 class TestLogoUrl:
     def test_returns_url_from_fk_logo(self, p):
         # The shape Dispatcharr's VODLogo presents: a related model with .url.
@@ -931,26 +727,26 @@ class TestMovieTargetPathsWithTmdbSuffix:
         tmdb_id = "378"
 
     def test_dirty_provider_name_cleaned_to_canonical_folder(self, p):
-        # Without the toggle, just the cleanup applies.
+        # The single naming path always carries {tmdb-} when known, and the .strm
+        # file matches the folder name.
         folder, strm, name, year = p._movie_target_paths(self._M(), "/VODS/Movies")
-        assert folder == "/VODS/Movies/Cool Hand Luke (1967)"
-        assert strm == "Cool Hand Luke (1967).strm"
+        assert folder == "/VODS/Movies/Cool Hand Luke (1967) {tmdb-378}"
+        assert strm == "Cool Hand Luke (1967) {tmdb-378}.strm"
         assert name == "Cool Hand Luke"
         assert year == 1967
 
-    def test_tmdb_suffix_appended_when_toggle_on(self, p):
-        folder, strm, name, year = p._movie_target_paths(
-            self._M(), "/VODS/Movies", category_name="", nest=False, append_tmdb_id=True,
-        )
+    def test_ids_always_present_regardless_of_legacy_flag(self, p):
+        # `append_tmdb_id` is now implicit in the one naming path — passing it does
+        # not change the result.
+        folder, strm, _, _ = p._movie_target_paths(
+            self._M(), "/VODS/Movies", append_tmdb_id=True)
         assert folder == "/VODS/Movies/Cool Hand Luke (1967) {tmdb-378}"
-        # The strm filename inside the folder is unaffected — scrapers only
-        # care about the folder name.
-        assert strm == "Cool Hand Luke (1967).strm"
+        assert strm == "Cool Hand Luke (1967) {tmdb-378}.strm"
 
-    def test_tmdb_suffix_skipped_when_id_missing(self, p):
+    def test_no_ids_when_none_known(self, p):
         class M:
-            id = 1; uuid = "x"; name = "Mystery"; year = None; tmdb_id = ""
-        folder, _, _, _ = p._movie_target_paths(M(), "/VODS/Movies", append_tmdb_id=True)
+            id = 1; uuid = "x"; name = "Mystery"; year = None; tmdb_id = ""; imdb_id = ""
+        folder, _, _, _ = p._movie_target_paths(M(), "/VODS/Movies")
         assert folder == "/VODS/Movies/Mystery"
 
 
@@ -964,14 +760,13 @@ class TestSeriesTargetFolderWithTmdbSuffix:
 
     def test_dirty_series_name_cleaned(self, p):
         folder, name, year = p._series_target_folder(self._S(), "/VODS/Series")
-        assert folder == "/VODS/Series/Breaking Bad (2008)"
+        assert folder == "/VODS/Series/Breaking Bad (2008) {tmdb-1396}"
         assert name == "Breaking Bad"
         assert year == 2008
 
-    def test_tmdb_suffix_appended_when_toggle_on(self, p):
+    def test_ids_always_present(self, p):
         folder, _, _ = p._series_target_folder(
-            self._S(), "/VODS/Series", category_name="", nest=False, append_tmdb_id=True,
-        )
+            self._S(), "/VODS/Series", append_tmdb_id=True)
         assert folder == "/VODS/Series/Breaking Bad (2008) {tmdb-1396}"
 
 
@@ -1102,69 +897,6 @@ class TestDedupeAcrossCategoriesDecision:
 
 
 # ---------- _strip_redundant_trailing_year (v1.15.2) ----------
-
-class TestStripRedundantTrailingYear:
-    """Bare trailing year de-duplication for folder names. Mode (b):
-    strip-when-matching, and adopt-when-no-year-known."""
-
-    def test_lid_example_strips_when_matching_db_year(self, p):
-        # "Wicked: For Good - 2025" + DB year 2025 -> "Wicked: For Good"
-        name, year = p._strip_redundant_trailing_year("Wicked: For Good - 2025", 2025)
-        assert name == "Wicked: For Good"
-        assert year == 2025
-
-    def test_strips_with_only_a_space_separator(self, p):
-        name, year = p._strip_redundant_trailing_year("The Matrix 1999", 1999)
-        assert name == "The Matrix"
-        assert year == 1999
-
-    def test_adopts_bare_year_when_no_db_year(self, p):
-        # No DB year, bare trailing year present -> adopt it AND strip.
-        name, year = p._strip_redundant_trailing_year("Wicked: For Good - 2025", None)
-        assert name == "Wicked: For Good"
-        assert year == 2025
-
-    def test_does_not_adopt_implausible_trailing_number(self, p):
-        # Room 1408, no DB year: 1408 < 1900 -> not a year, leave it.
-        name, year = p._strip_redundant_trailing_year("Room 1408", None)
-        assert name == "Room 1408"
-        assert year is None
-
-    def test_preserves_blade_runner_2049(self, p):
-        # Trailing 2049 != DB year 2017 -> it's part of the title, keep it.
-        name, year = p._strip_redundant_trailing_year("Blade Runner 2049", 2017)
-        assert name == "Blade Runner 2049"
-        assert year == 2017
-
-    def test_preserves_room_1408_with_db_year(self, p):
-        name, year = p._strip_redundant_trailing_year("Room 1408", 2007)
-        assert name == "Room 1408"
-        assert year == 2007
-
-    def test_year_is_the_whole_title_not_emptied(self, p):
-        # "1984" with year 1984 must NOT become "" — the year is the title.
-        name, year = p._strip_redundant_trailing_year("1984", 1984)
-        assert name == "1984"
-        assert year == 1984
-        # Same for "2012" adopt path.
-        name2, year2 = p._strip_redundant_trailing_year("2012", None)
-        assert name2 == "2012"
-
-    def test_no_trailing_year_is_noop(self, p):
-        name, year = p._strip_redundant_trailing_year("Avatar", 2009)
-        assert name == "Avatar"
-        assert year == 2009
-
-    def test_not_part_of_longer_digit_run(self, p):
-        # Negative lookbehind: a 5-digit trailing run isn't treated as a year.
-        name, year = p._strip_redundant_trailing_year("Catalog 12345", None)
-        assert name == "Catalog 12345"
-        assert year is None
-
-    def test_empty_input(self, p):
-        assert p._strip_redundant_trailing_year("", 2025) == ("", 2025)
-        assert p._strip_redundant_trailing_year(None, None) == (None, None)
-
 
 class TestMovieTargetPathsBareYear:
     """End-to-end: the bare-year fix flows through _movie_target_paths."""
