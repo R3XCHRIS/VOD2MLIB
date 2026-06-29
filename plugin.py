@@ -2025,7 +2025,16 @@ try:
             settings = cfg.settings or {}
         except Exception as e:
             logger.warning("mount healthcheck: could not load live settings (%s)", e)
-        return Plugin()._httpfs_reconcile(settings, logger)
+        try:
+            return Plugin()._httpfs_reconcile(settings, logger)
+        except Exception as e:
+            # Reconcile-infrastructure failure (e.g. the plugin data dir isn't
+            # writable by the Dispatcharr runtime user). Log one concise line per
+            # tick instead of a full traceback every interval, and keep the task
+            # result clean so beat doesn't mark it failed forever.
+            logger.warning("mount healthcheck reconcile failed: %s "
+                           "(is the plugin data dir writable by the Dispatcharr user?)", e)
+            return {"action": "ERROR", "reason": str(e)}
 except Exception as _celery_register_err:
     # Celery may not be importable in some environments. Log to stderr so the
     # cause is visible if the user wonders why scheduled rescans never run.

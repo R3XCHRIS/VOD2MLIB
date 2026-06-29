@@ -225,6 +225,8 @@ To automate it, run the `rclone rc` call from a host-side cron a few minutes aft
 
 **"Unknown action" error in the toast.** Dispatcharr cached an old version of the plugin module. `docker restart dispatcharr` clears it. Toggling enable/disable on the plugin also forces a reload.
 
+**`[MOUNT] Status` shows DOWN, or the mount doesn't come back after a Dispatcharr restart.** The mount is a child process supervised by a celery-beat healthcheck: after a crash or a container restart it is respawned automatically (typically within ~a minute), and it self-heals on any plugin interaction. This requires the plugin's data dir (`/data/plugins/vod2mlib`) to be **writable by the user Dispatcharr runs as**. If it isn't (e.g. a bind mount owned by a different uid, or files left behind by a root `docker exec`), the supervisor logs `mount healthcheck reconcile failed: … Permission denied` each tick and Status stays DOWN. Fix the directory ownership/permissions so the Dispatcharr runtime user can write it, then click `[MOUNT] Enable`. If the child keeps failing to start for another reason, the supervisor stops retrying after a few attempts and Status reports the last error — fix it and click `[MOUNT] Enable` to retry.
+
 **The Run button drops below the action title instead of right-aligning.** That's Dispatcharr's UI flex-wrap when the description spans 2+ lines. We keep descriptions single-line to avoid this; if it happens again, the description is too long for your viewport.
 
 **Cron task registered but didn't fire.** Check `[SCHEDULE] Show status` — `last_run` should populate after the first scheduled tick. If still `never` after the expected time:
