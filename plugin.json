@@ -156,6 +156,53 @@
       "help_text": "When `Nest Series by Category` is ON and a series is tagged with multiple categories upstream, write the series folder + episodes under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Series by Category` is OFF. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — run `[⚠ DANGER] Clean up Series` once, then re-generate, to clean them up."
     },
     {
+      "id": "_section_notifications",
+      "label": "[NOTIFICATIONS]",
+      "type": "info",
+      "description": "Optional webhook posted after Generate Movies/Series, Full rescan, and Clean up actions, summarising what was added, refreshed, skipped, or deleted. Not sent for the read-only Scan action."
+    },
+    {
+      "id": "webhook_url",
+      "label": "Webhook URL",
+      "type": "string",
+      "default": "",
+      "placeholder": "https://discord.com/api/webhooks/... or https://hooks.slack.com/services/...",
+      "help_text": "Leave empty to disable notifications. Paste a Discord or Slack incoming-webhook URL — the format below auto-detects from the URL. Any other URL receives a generic JSON payload, useful for ntfy, Gotify, n8n, or a custom relay."
+    },
+    {
+      "id": "webhook_format",
+      "label": "Webhook Format",
+      "type": "select",
+      "default": "auto",
+      "options": [
+        {"value": "auto", "label": "Auto-detect from URL"},
+        {"value": "discord", "label": "Discord"},
+        {"value": "slack", "label": "Slack"},
+        {"value": "generic", "label": "Generic JSON"}
+      ],
+      "help_text": "Override auto-detection if you're proxying the webhook through something that changes the URL shape (e.g. a relay or tunnel)."
+    },
+    {
+      "id": "webhook_notify_on_no_changes",
+      "label": "Notify Even When Nothing Changed",
+      "type": "boolean",
+      "default": false,
+      "help_text": "OFF (default): skip the webhook when a run adds/refreshes/deletes nothing and hits no errors — keeps nightly no-op cron rescans quiet. ON: send a notification after every run regardless."
+    },
+    {
+      "id": "_section_maintenance",
+      "label": "[MAINTENANCE]",
+      "type": "info",
+      "description": "Housekeeping for content that disappeared upstream. The two [PRUNE] actions below walk the whole library and delete only the .strm/.nfo this plugin generated for movies, series, and episodes that no longer resolve to any active provider — user-added files are always preserved. Turn on the toggle to fold the same prune into every Full rescan (and the nightly cron), so a dropped title stops lingering in your media server without a manual click."
+    },
+    {
+      "id": "prune_orphans_on_rescan",
+      "label": "Prune Orphans on Full Rescan",
+      "type": "boolean",
+      "default": false,
+      "help_text": "OFF (default): Full rescan and the cron only add and refresh — stale .strm files are left in place (classic behaviour). ON: after regenerating, Full rescan also deletes the .strm/.nfo for any movie or episode no longer on an active provider and removes the folders left empty. Only runs inside Full rescan (which walks the entire catalogue); the batched Generate Movies/Series actions never prune. The standalone [PRUNE] buttons work regardless of this toggle."
+    },
+    {
       "id": "_section_schedule",
       "label": "[AUTO-RESCAN SCHEDULE]",
       "type": "info",
@@ -294,6 +341,32 @@
         "required": true,
         "title": "Delete generated series files?",
         "message": "This deletes every .strm and .nfo file this plugin created under your Series root. User-added files in those folders are preserved. Continue?"
+      }
+    },
+    {
+      "id": "prune_movies",
+      "label": "[PRUNE] Orphaned Movies",
+      "description": "Delete .strm/.nfo for movies no longer on any active provider. User files preserved.",
+      "button_label": "Prune",
+      "button_variant": "filled",
+      "button_color": "orange",
+      "confirm": {
+        "required": true,
+        "title": "Prune orphaned movie files?",
+        "message": "Walks your Movies root and deletes only the .strm/.nfo this plugin wrote for movies that no longer resolve to an active Dispatcharr provider — everything still available is kept, and user-added files (posters, subtitles, custom .nfo) are always preserved. Empty folders are removed afterwards. Safe to run anytime: it refuses if it can't resolve your active catalogue, so a provider outage can't wipe the library. Continue?"
+      }
+    },
+    {
+      "id": "prune_series",
+      "label": "[PRUNE] Orphaned Series",
+      "description": "Delete .strm/.nfo for series/episodes no longer on any active provider. User files preserved.",
+      "button_label": "Prune",
+      "button_variant": "filled",
+      "button_color": "orange",
+      "confirm": {
+        "required": true,
+        "title": "Prune orphaned series files?",
+        "message": "Walks your Series root and deletes only the episode .strm/.nfo (and tvshow.nfo) this plugin wrote for series or episodes that no longer resolve to an active Dispatcharr provider. Series whose episode lists were never fetched are left untouched so nothing is deleted on a guess — run a Full rescan first if you want the freshest episode data. User-added files are always preserved and empty folders are removed afterwards. Continue?"
       }
     }
   ]

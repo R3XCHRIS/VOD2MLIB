@@ -14,13 +14,16 @@ This fork:  https://github.com/R3XCHRIS/VOD2MLIB
 """
 import os
 import re
+import json
+import urllib.error
+import urllib.request
 from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
-    
+
     name = "VOD to Media Library"
     version = "1.16.0"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
@@ -46,6 +49,50 @@ class Plugin:
 
     # File suffixes the plugin writes (used by cleanup and skip logic)
     _PLUGIN_FILE_SUFFIXES = ('.strm', '.nfo')
+
+    # Actions that mutate the library (and so are worth a webhook) mapped to a
+    # human title. scan_all_vods is read-only and deliberately excluded, as
+    # are the schedule-management actions (apply/remove/status/test-fire —
+    # the latter only enqueues; the resulting rescan_all fires its own event).
+    _WEBHOOK_ACTION_LABELS = {
+        "generate_movies": "Generate Movies",
+        "generate_series": "Generate Series",
+        "rescan_all": "Full Rescan",
+        "cleanup_movies": "Clean up Movies",
+        "cleanup_series": "Clean up Series",
+        "prune_movies": "Prune orphaned Movies",
+        "prune_series": "Prune orphaned Series",
+    }
+
+    # (result dict key, display label) for webhook summaries, in display order.
+    # Only keys present with a nonzero value in a given action's result end up
+    # in the notification — this list is a superset across all notify-worthy
+    # actions.
+    _WEBHOOK_STAT_LABELS = [
+        ("created_strm", "Movies added"),
+        ("refreshed_strm", "Movies refreshed"),
+        ("created_nfo", "Movie NFOs written"),
+        ("skipped", "Movies skipped (on disk)"),
+        ("series_processed", "Series updated"),
+        ("series_uptodate", "Series up to date"),
+        ("episodes_created", "Episodes added"),
+        ("episodes_refreshed", "Episodes refreshed"),
+        ("nfo_created", "Series NFOs written"),
+        ("deduped", "Duplicates deduped"),
+        ("deleted_strm", ".strm files deleted"),
+        ("deleted_nfo", ".nfo files deleted"),
+        ("removed_dirs", "Folders removed"),
+        ("preserved_dirs", "Folders preserved (user files)"),
+    ]
+
+    # Subset of the above that represents an actual write/delete (as opposed
+    # to informational counts like 'already on disk' or 'already up to date').
+    # Used to decide whether a run was a no-op for webhook_notify_on_no_changes.
+    _WEBHOOK_CHANGE_KEYS = {
+        "created_strm", "refreshed_strm", "created_nfo",
+        "series_processed", "episodes_created", "episodes_refreshed", "nfo_created",
+        "deduped", "deleted_strm", "deleted_nfo", "removed_dirs",
+    }
 
     # Language / provider tag prefixes stripped from titles and category names.
     # Handles the formats providers actually use, each guarded against eating
@@ -248,6 +295,53 @@ class Plugin:
             "help_text": "When `Nest Series by Category` is ON and a series is tagged with multiple categories upstream, write the series folder + episodes under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Series by Category` is OFF. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — run `[⚠ DANGER] Clean up Series` once, then re-generate, to clean them up."
         },
         {
+            "id": "_section_notifications",
+            "label": "[NOTIFICATIONS]",
+            "type": "info",
+            "description": "Optional webhook posted after Generate Movies/Series, Full rescan, and Clean up actions, summarising what was added, refreshed, skipped, or deleted. Not sent for the read-only Scan action.",
+        },
+        {
+            "id": "webhook_url",
+            "label": "Webhook URL",
+            "type": "string",
+            "default": "",
+            "placeholder": "https://discord.com/api/webhooks/... or https://hooks.slack.com/services/...",
+            "help_text": "Leave empty to disable notifications. Paste a Discord or Slack incoming-webhook URL — the format below auto-detects from the URL. Any other URL receives a generic JSON payload, useful for ntfy, Gotify, n8n, or a custom relay."
+        },
+        {
+            "id": "webhook_format",
+            "label": "Webhook Format",
+            "type": "select",
+            "default": "auto",
+            "options": [
+                {"value": "auto", "label": "Auto-detect from URL"},
+                {"value": "discord", "label": "Discord"},
+                {"value": "slack", "label": "Slack"},
+                {"value": "generic", "label": "Generic JSON"}
+            ],
+            "help_text": "Override auto-detection if you're proxying the webhook through something that changes the URL shape (e.g. a relay or tunnel)."
+        },
+        {
+            "id": "webhook_notify_on_no_changes",
+            "label": "Notify Even When Nothing Changed",
+            "type": "boolean",
+            "default": False,
+            "help_text": "OFF (default): skip the webhook when a run adds/refreshes/deletes nothing and hits no errors — keeps nightly no-op cron rescans quiet. ON: send a notification after every run regardless."
+        },
+        {
+            "id": "_section_maintenance",
+            "label": "[MAINTENANCE]",
+            "type": "info",
+            "description": "Housekeeping for content that disappeared upstream. The two [PRUNE] actions below walk the whole library and delete only the .strm/.nfo this plugin generated for movies, series, and episodes that no longer resolve to any active provider — user-added files are always preserved. Turn on the toggle to fold the same prune into every Full rescan (and the nightly cron), so a dropped title stops lingering in your media server without a manual click.",
+        },
+        {
+            "id": "prune_orphans_on_rescan",
+            "label": "Prune Orphans on Full Rescan",
+            "type": "boolean",
+            "default": False,
+            "help_text": "OFF (default): Full rescan and the cron only add and refresh — stale .strm files are left in place (classic behaviour). ON: after regenerating, Full rescan also deletes the .strm/.nfo for any movie or episode no longer on an active provider and removes the folders left empty. Only runs inside Full rescan (which walks the entire catalogue); the batched Generate Movies/Series actions never prune. The standalone [PRUNE] buttons work regardless of this toggle."
+        },
+        {
             "id": "_section_schedule",
             "label": "[AUTO-RESCAN SCHEDULE]",
             "type": "info",
@@ -389,6 +483,32 @@ class Plugin:
                 "message": "This deletes every .strm and .nfo file this plugin created under your Series root. User-added files in those folders are preserved. Continue?",
             },
         },
+        {
+            "id": "prune_movies",
+            "label": "[PRUNE] Orphaned Movies",
+            "description": "Delete .strm/.nfo for movies no longer on any active provider. User files preserved.",
+            "button_label": "Prune",
+            "button_variant": "filled",
+            "button_color": "orange",
+            "confirm": {
+                "required": True,
+                "title": "Prune orphaned movie files?",
+                "message": "Walks your Movies root and deletes only the .strm/.nfo this plugin wrote for movies that no longer resolve to an active Dispatcharr provider — everything still available is kept, and user-added files (posters, subtitles, custom .nfo) are always preserved. Empty folders are removed afterwards. Safe to run anytime: it refuses if it can't resolve your active catalogue, so a provider outage can't wipe the library. Continue?",
+            },
+        },
+        {
+            "id": "prune_series",
+            "label": "[PRUNE] Orphaned Series",
+            "description": "Delete .strm/.nfo for series/episodes no longer on any active provider. User files preserved.",
+            "button_label": "Prune",
+            "button_variant": "filled",
+            "button_color": "orange",
+            "confirm": {
+                "required": True,
+                "title": "Prune orphaned series files?",
+                "message": "Walks your Series root and deletes only the episode .strm/.nfo (and tvshow.nfo) this plugin wrote for series or episodes that no longer resolve to an active Dispatcharr provider. Series whose episode lists were never fetched are left untouched so nothing is deleted on a guess — run a Full rescan first if you want the freshest episode data. User-added files are always preserved and empty folders are removed afterwards. Continue?",
+            },
+        },
     ]
     
     def run(self, action: str, params: dict, context: dict):
@@ -402,27 +522,39 @@ class Plugin:
         logger.info("=" * 60)
         
         if action == "scan_all_vods":
-            return self._scan_all_vods(settings, logger)
+            result = self._scan_all_vods(settings, logger)
         elif action == "generate_movies":
-            return self._generate_movies(settings, logger)
+            result = self._generate_movies(settings, logger)
         elif action == "generate_series":
-            return self._generate_series(settings, logger)
+            result = self._generate_series(settings, logger)
         elif action == "cleanup_movies":
-            return self._cleanup_movies(settings, logger)
+            result = self._cleanup_movies(settings, logger)
         elif action == "cleanup_series":
-            return self._cleanup_series(settings, logger)
+            result = self._cleanup_series(settings, logger)
+        elif action == "prune_movies":
+            result = self._prune_movies(settings, logger)
+        elif action == "prune_series":
+            result = self._prune_series(settings, logger)
         elif action == "rescan_all":
-            return self._rescan_all(settings, logger)
+            result = self._rescan_all(settings, logger)
         elif action == "apply_schedule":
-            return self._apply_schedule(settings, logger)
+            result = self._apply_schedule(settings, logger)
         elif action == "remove_schedule":
-            return self._remove_schedule(settings, logger)
+            result = self._remove_schedule(settings, logger)
         elif action == "schedule_status":
-            return self._schedule_status(settings, logger)
+            result = self._schedule_status(settings, logger)
         elif action == "schedule_test_fire":
-            return self._schedule_test_fire(settings, logger)
+            result = self._schedule_test_fire(settings, logger)
+        else:
+            return {"status": "error", "message": f"Unknown action: {action}"}
 
-        return {"status": "error", "message": f"Unknown action: {action}"}
+        if action in self._WEBHOOK_ACTION_LABELS:
+            try:
+                self._send_webhook(settings, logger, action, result)
+            except Exception as e:
+                logger.warning("Webhook dispatch failed: %s", e)
+
+        return result
     
     def _scan_all_vods(self, settings: Dict[str, Any], logger):
         """Scan and show total movies and series available."""
@@ -1358,6 +1490,128 @@ class Plugin:
             host_masked = '<host>'
         return scheme + host_masked + path
 
+    def _detect_webhook_format(self, url: str) -> str:
+        """Infer Discord/Slack/generic from a webhook URL's host+path shape."""
+        u = (url or "").lower()
+        if "discord.com/api/webhooks" in u or "discordapp.com/api/webhooks" in u:
+            return "discord"
+        if "hooks.slack.com" in u:
+            return "slack"
+        return "generic"
+
+    def _webhook_stats(self, action: str, result: Dict[str, Any]):
+        """Flatten an action's result dict into (stats, errors, total_changed).
+
+        rescan_all nests its movie/series results under 'movies'/'series' keys
+        (see _rescan_all); every other notify-worthy action reports counts at
+        the top level. total_changed only counts real writes/deletes (see
+        _WEBHOOK_CHANGE_KEYS) and is used to decide whether a no-op run should
+        be suppressed.
+        """
+        if action == "rescan_all":
+            counts: Dict[str, int] = {}
+            for sub in (result.get("movies"), result.get("series")):
+                if isinstance(sub, dict):
+                    for k, v in sub.items():
+                        if isinstance(v, int) and not isinstance(v, bool):
+                            counts[k] = counts.get(k, 0) + v
+        else:
+            counts = {
+                k: v for k, v in result.items()
+                if isinstance(v, int) and not isinstance(v, bool)
+            }
+
+        errors = counts.get("errors", 0)
+        stats = [(label, counts[key]) for key, label in self._WEBHOOK_STAT_LABELS if counts.get(key)]
+        total_changed = sum(v for k, v in counts.items() if k in self._WEBHOOK_CHANGE_KEYS)
+        return stats, errors, total_changed
+
+    def _discord_webhook_payload(self, title: str, message: str, stats, errors: int) -> Dict[str, Any]:
+        color = 0xE74C3C if errors else (0x2ECC71 if stats else 0x95A5A6)
+        fields = [{"name": label, "value": str(value), "inline": True} for label, value in stats]
+        if errors:
+            fields.append({"name": "Errors", "value": str(errors), "inline": True})
+        return {"embeds": [{"title": title, "description": message, "color": color, "fields": fields}]}
+
+    def _slack_webhook_payload(self, title: str, message: str, stats, errors: int) -> Dict[str, Any]:
+        lines = [f"*{title}*"]
+        if message:
+            lines.append(message)
+        lines.extend(f"• {label}: {value}" for label, value in stats)
+        if errors:
+            lines.append(f"• Errors: {errors}")
+        return {"text": "\n".join(lines)}
+
+    def _generic_webhook_payload(self, action: str, title: str, message: str, stats, errors: int) -> Dict[str, Any]:
+        return {
+            "plugin": "vod2mlib",
+            "action": action,
+            "title": title,
+            "message": message,
+            "stats": {label: value for label, value in stats},
+            "errors": errors,
+        }
+
+    def _send_webhook(self, settings: Dict[str, Any], logger, action: str, result: Dict[str, Any]) -> None:
+        """POST a run summary to the configured webhook, if any.
+
+        Best-effort and silent on failure (beyond a log line) — a bad or
+        unreachable webhook URL must never fail the underlying Generate /
+        Rescan / Clean up action that already completed successfully.
+        """
+        url = (settings.get("webhook_url") or "").strip()
+        if not url or not isinstance(result, dict) or result.get("status") == "error":
+            return
+
+        stats, errors, total_changed = self._webhook_stats(action, result)
+        if not settings.get("webhook_notify_on_no_changes", False) and total_changed == 0 and not errors:
+            return
+
+        fmt = settings.get("webhook_format") or "auto"
+        if fmt == "auto":
+            fmt = self._detect_webhook_format(url)
+
+        title = f"VOD2MLIB — {self._WEBHOOK_ACTION_LABELS.get(action, action)}"
+        message = result.get("message", "")
+
+        if fmt == "discord":
+            payload = self._discord_webhook_payload(title, message, stats, errors)
+        elif fmt == "slack":
+            payload = self._slack_webhook_payload(title, message, stats, errors)
+        else:
+            payload = self._generic_webhook_payload(action, title, message, stats, errors)
+
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    # Discord/Slack sit behind WAFs (Cloudflare et al.) that
+                    # block urllib's default "Python-urllib/x.y" User-Agent as
+                    # a known bot signature, returning a bare 403 with no other
+                    # indication anything is wrong with the request itself.
+                    "User-Agent": "VOD2MLIB-Webhook/1.0 (+https://github.com/R3XCHRIS/VOD2MLIB)",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status >= 300:
+                    logger.warning("Webhook returned HTTP %s", resp.status)
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            logger.warning(
+                "Webhook delivery failed: HTTP %s %s%s",
+                e.code, e.reason, f" — {detail}" if detail else "",
+            )
+        except Exception as e:
+            logger.warning("Webhook delivery failed: %s", e)
+
     def _cleanup_movies(self, settings: Dict[str, Any], logger):
         """Delete plugin-generated .strm and .nfo files under the movies root.
 
@@ -1432,7 +1686,365 @@ class Plugin:
         if r["preserved_dirs"]:
             msg += f", preserved {r['preserved_dirs']} (user files)"
         return {"status": "ok", "message": msg, **r}
-    
+
+    # ---------- orphan pruning (differential cleanup) ----------
+    #
+    # Unlike the DANGER Clean up actions (which delete every generated file so
+    # you can start fresh), pruning removes ONLY the .strm/.nfo whose source no
+    # longer resolves to an active provider — i.e. content the provider dropped.
+    # It rebuilds the exact set of paths a fresh Generate would write right now
+    # (the "keep set", reusing the same path helpers so it can never drift from
+    # what generation produces) and deletes any plugin file under the root that
+    # isn't in it. See _prune_movies / _prune_series for the guards that stop a
+    # provider outage or DB import failure from ever wiping the library.
+
+    def _collect_expected_movie_files(self, settings: Dict[str, Any], logger):
+        """Build the keep set of realpaths a fresh movie Generate would write now.
+
+        Mirrors _generate_movies' query and per-relation path computation exactly
+        (active-provider filter, category filter, cross-category dedupe, nesting,
+        tmdb suffix) so the set matches reality. batch_size is deliberately
+        ignored — a prune must see the WHOLE catalogue before deleting anything.
+        Both the .strm and its sidecar .nfo are added for every kept movie
+        regardless of the current Generate NFO toggle, so a valid .nfo written by
+        an earlier NFO-on run is never mistaken for an orphan.
+
+        Returns (keep_realpaths, ok, movie_count). ok=False means the catalogue
+        could not be read (import/DB error) and the caller MUST NOT prune.
+        """
+        root_folder = settings.get("root_folder", "/VODS/Movies")
+        nest_by_cat = bool(settings.get("nest_movies_by_category", False))
+        dedupe_across_cats = bool(settings.get("dedupe_movies_across_categories", False))
+        append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
+        category_filter = (settings.get("category_filter") or "").strip()
+
+        try:
+            from apps.vod.models import M3UMovieRelation
+        except ImportError as e:
+            logger.error("Prune: failed to import models: %s", e)
+            return set(), False, 0
+
+        keep = set()
+        count = 0
+        try:
+            query = (
+                M3UMovieRelation.objects
+                .select_related('movie', 'm3u_account', 'category')
+                .filter(m3u_account__is_active=True)
+            )
+            query = self._apply_category_filter(query, category_filter)
+            if dedupe_across_cats:
+                query = query.order_by('category__name', 'id')
+
+            seen_movie_uuids = set() if dedupe_across_cats else None
+            for relation in query.iterator():
+                movie = relation.movie
+                if seen_movie_uuids is not None:
+                    if movie.uuid in seen_movie_uuids:
+                        continue
+                    seen_movie_uuids.add(movie.uuid)
+                cat_name = relation.category.name if relation.category else ""
+                movie_folder, strm_filename, _name, _year = self._movie_target_paths(
+                    movie, root_folder, cat_name, nest_by_cat, append_tmdb_id,
+                )
+                strm_path = os.path.join(movie_folder, strm_filename)
+                nfo_path = os.path.join(movie_folder, strm_filename.replace('.strm', '.nfo'))
+                keep.add(os.path.realpath(strm_path))
+                keep.add(os.path.realpath(nfo_path))
+                count += 1
+        except Exception as e:
+            logger.error("Prune: movie catalogue query failed: %s", e)
+            return set(), False, 0
+
+        return keep, True, count
+
+    def _collect_expected_series_files(self, settings: Dict[str, Any], logger):
+        """Build the keep set of realpaths a fresh series Generate would write now.
+
+        Mirrors _generate_series + _process_single_series path computation
+        (active-provider filter, category filter, dedupe, nesting, tmdb suffix,
+        Season NN folders, the episode filename scheme, tvshow.nfo and per-episode
+        .nfo). batch_size is ignored — the whole catalogue is walked.
+
+        Episodes are read from whatever M3UEpisodeRelation rows already exist for
+        the active account; this does NOT force a provider refetch (that would be
+        slow and hammer providers on a manual prune). The consequence: a series
+        whose episode list has never been fetched has an empty known-episode set,
+        and pruning its episodes on that basis would be wrong — so its folder
+        realpath is returned in `protected` and the caller skips deleting anything
+        beneath it. A Full rescan refetches every series first, so the
+        prune-on-rescan path sees complete episode data and protects nothing.
+
+        Returns (keep_realpaths, protected_prefixes, ok, series_count).
+        """
+        series_root = settings.get("series_root_folder", "/VODS/Series")
+        nest_by_cat = bool(settings.get("nest_series_by_category", False))
+        dedupe_across_cats = bool(settings.get("dedupe_series_across_categories", False))
+        append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
+        category_filter = (settings.get("category_filter") or "").strip()
+
+        try:
+            from apps.vod.models import M3USeriesRelation, M3UEpisodeRelation
+        except ImportError as e:
+            logger.error("Prune: failed to import models: %s", e)
+            return set(), set(), False, 0
+
+        keep = set()
+        protected = set()
+        count = 0
+        try:
+            query = (
+                M3USeriesRelation.objects
+                .select_related('series', 'm3u_account', 'category')
+                .filter(m3u_account__is_active=True)
+            )
+            query = self._apply_category_filter(query, category_filter)
+            if dedupe_across_cats:
+                query = query.order_by('category__name', 'id')
+
+            seen_series_uuids = set() if dedupe_across_cats else None
+            for series_rel in query.iterator():
+                series = series_rel.series
+                if seen_series_uuids is not None:
+                    if series.uuid in seen_series_uuids:
+                        continue
+                    seen_series_uuids.add(series.uuid)
+                cat_name = series_rel.category.name if series_rel.category else ""
+                series_folder, series_name, _year = self._series_target_folder(
+                    series, series_root, cat_name, nest_by_cat, append_tmdb_id,
+                )
+                series_folder_real = os.path.realpath(series_folder)
+                # tvshow.nfo is written once per series and must survive as long
+                # as the series itself does.
+                keep.add(os.path.realpath(os.path.join(series_folder, "tvshow.nfo")))
+                count += 1
+
+                episodes = list(
+                    M3UEpisodeRelation.objects.filter(
+                        m3u_account=series_rel.m3u_account,
+                        episode__series=series,
+                    ).select_related('episode')
+                )
+                custom_props = series_rel.custom_properties or {}
+                if not episodes and not custom_props.get('episodes_fetched', False):
+                    # Episode list never fetched for this active series — we can't
+                    # enumerate its episodes, so protect its whole subtree from
+                    # episode-level pruning rather than delete on a guess.
+                    protected.add(series_folder_real)
+                    continue
+
+                for episode_rel in episodes:
+                    episode = episode_rel.episode
+                    season_num = episode.season_number or 0
+                    episode_num = episode.episode_number or 0
+                    season_folder = os.path.join(series_folder, f"Season {season_num:02d}")
+                    episode_title = episode.name or ""
+                    if episode_title:
+                        filename = f"{series_name} - S{season_num:02d}E{episode_num:02d} - {self._clean_title(episode_title)}"
+                    else:
+                        filename = f"{series_name} - S{season_num:02d}E{episode_num:02d}"
+                    filename = self._sanitize_filename(filename)
+                    keep.add(os.path.realpath(os.path.join(season_folder, f"{filename}.strm")))
+                    keep.add(os.path.realpath(os.path.join(season_folder, f"{filename}.nfo")))
+        except Exception as e:
+            logger.error("Prune: series catalogue query failed: %s", e)
+            return set(), set(), False, 0
+
+        return keep, protected, True, count
+
+    def _dir_has_plugin_files(self, root: str) -> bool:
+        """True if any .strm/.nfo this plugin writes exists anywhere under root.
+
+        Used by the prune guardrail to distinguish 'empty catalogue + empty disk'
+        (a safe no-op) from 'empty catalogue + populated disk' (refuse to prune).
+        """
+        if not os.path.isdir(root):
+            return False
+        for _dirpath, _dirs, filenames in os.walk(root):
+            if any(n.endswith(self._PLUGIN_FILE_SUFFIXES) for n in filenames):
+                return True
+        return False
+
+    def _prune_orphans_under(self, root: str, keep: set, protected: set, logger):
+        """Delete plugin .strm/.nfo under root whose realpath isn't in `keep`.
+
+        `protected` is a set of directory realpaths whose subtree must be left
+        entirely alone (see _collect_expected_series_files). After deleting
+        orphans, empty directories are removed bottom-up exactly like
+        _walk_and_cleanup_plugin_files — a directory holding a kept, protected,
+        or user-added file is preserved, and the root itself is never removed.
+
+        Returns the same result shape the cleanup path uses, plus a
+        `protected_files` count, so the webhook summary picks it up unchanged.
+        """
+        result = {
+            "deleted_strm": 0,
+            "deleted_nfo": 0,
+            "removed_dirs": 0,
+            "preserved_dirs": 0,
+            "protected_files": 0,
+            "errors": 0,
+            "scanned_dirs": 0,
+        }
+        if not os.path.isdir(root):
+            return result
+
+        protected = protected or set()
+
+        def _is_protected(path_real: str) -> bool:
+            for pref in protected:
+                if path_real == pref or path_real.startswith(pref + os.sep):
+                    return True
+            return False
+
+        # Pass 1: top-down — delete plugin files that are neither kept nor under
+        # a protected subtree.
+        for dirpath, _, filenames in os.walk(root):
+            result["scanned_dirs"] += 1
+            if _is_protected(os.path.realpath(dirpath)):
+                for name in filenames:
+                    if name.endswith(self._PLUGIN_FILE_SUFFIXES):
+                        result["protected_files"] += 1
+                continue
+            for name in filenames:
+                if not name.endswith(self._PLUGIN_FILE_SUFFIXES):
+                    continue
+                path = os.path.join(dirpath, name)
+                if os.path.realpath(path) in keep:
+                    continue
+                try:
+                    os.remove(path)
+                    if name.endswith('.strm'):
+                        result["deleted_strm"] += 1
+                    else:
+                        result["deleted_nfo"] += 1
+                except OSError as e:
+                    logger.error("Failed to delete %s: %s", path, e)
+                    result["errors"] += 1
+
+        # Pass 2: bottom-up — rmdir any directory that is now empty. Protected
+        # and user-populated dirs still hold files, so _try_rmdir leaves them.
+        root_real = os.path.realpath(root)
+        for dirpath, _, _ in os.walk(root, topdown=False):
+            if os.path.realpath(dirpath) == root_real:
+                continue
+            if self._try_rmdir(dirpath):
+                result["removed_dirs"] += 1
+            else:
+                result["preserved_dirs"] += 1
+        return result
+
+    def _prune_movies(self, settings: Dict[str, Any], logger):
+        """Prune movie .strm/.nfo whose movie is no longer on an active provider.
+
+        Guardrail: if the active catalogue can't be resolved, or resolves to zero
+        movies while generated files still exist on disk, we refuse and return an
+        error instead of deleting — a provider outage or DB import failure must
+        never be able to wipe the whole library. Use the DANGER Clean up Movies
+        action if a full wipe is actually intended.
+        """
+        root_folder = settings.get("root_folder", "/VODS/Movies")
+
+        logger.info("=" * 60)
+        logger.info("VOD2MLIB v%s — prune_movies", self.version)
+        logger.info("Root: %s", root_folder)
+        logger.info("=" * 60)
+        logger.info("")
+
+        if not os.path.exists(root_folder):
+            logger.info("Root folder doesn't exist. Nothing to prune.")
+            return {"status": "ok", "message": "Root folder doesn't exist", "deleted_strm": 0, "deleted_nfo": 0, "removed_dirs": 0, "preserved_dirs": 0, "errors": 0}
+
+        keep, ok, count = self._collect_expected_movie_files(settings, logger)
+        if not ok:
+            msg = "Could not read the movie catalogue from Dispatcharr — refusing to prune."
+            logger.error(msg)
+            return {"status": "error", "message": msg}
+        if count == 0 and self._dir_has_plugin_files(root_folder):
+            msg = ("Resolved 0 active movies but generated files exist on disk — refusing to prune "
+                   "(a provider outage or misconfig could otherwise delete everything). Check your "
+                   "Dispatcharr URL and active providers, or use [DANGER] Clean up Movies for a full wipe.")
+            logger.error(msg)
+            return {"status": "error", "message": msg}
+
+        logger.info("Resolved %d active movies; pruning orphaned files...", count)
+        r = self._prune_orphans_under(root_folder, keep, set(), logger)
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("PRUNE SUMMARY")
+        logger.info("  Active movies:   %d", count)
+        logger.info("  Dirs scanned:    %d", r["scanned_dirs"])
+        logger.info("  Dirs removed:    %d", r["removed_dirs"])
+        logger.info("  Dirs preserved:  %d  (user-added files inside)", r["preserved_dirs"])
+        logger.info("  .strm deleted:   %d", r["deleted_strm"])
+        logger.info("  .nfo deleted:    %d", r["deleted_nfo"])
+        logger.info("  Errors:          %d", r["errors"])
+        logger.info("=" * 60)
+
+        if r["deleted_strm"] == 0 and r["deleted_nfo"] == 0:
+            msg = f"No orphaned movie files — {count} active movies all present"
+        else:
+            msg = f"Pruned {r['deleted_strm']} orphaned .strm + {r['deleted_nfo']} .nfo, removed {r['removed_dirs']} folders"
+        return {"status": "ok", "message": msg, **r}
+
+    def _prune_series(self, settings: Dict[str, Any], logger):
+        """Prune series/episode .strm/.nfo no longer on an active provider.
+
+        Same guardrail as _prune_movies. Series whose episode lists were never
+        fetched are protected (not pruned) — run a Full rescan first, or enable
+        Prune Orphans on Full Rescan, for complete episode-level pruning.
+        """
+        series_root = settings.get("series_root_folder", "/VODS/Series")
+
+        logger.info("=" * 60)
+        logger.info("VOD2MLIB v%s — prune_series", self.version)
+        logger.info("Root: %s", series_root)
+        logger.info("=" * 60)
+        logger.info("")
+
+        if not os.path.exists(series_root):
+            logger.info("Series root doesn't exist. Nothing to prune.")
+            return {"status": "ok", "message": "Series root doesn't exist", "deleted_strm": 0, "deleted_nfo": 0, "removed_dirs": 0, "preserved_dirs": 0, "errors": 0}
+
+        keep, protected, ok, count = self._collect_expected_series_files(settings, logger)
+        if not ok:
+            msg = "Could not read the series catalogue from Dispatcharr — refusing to prune."
+            logger.error(msg)
+            return {"status": "error", "message": msg}
+        if count == 0 and self._dir_has_plugin_files(series_root):
+            msg = ("Resolved 0 active series but generated files exist on disk — refusing to prune "
+                   "(a provider outage or misconfig could otherwise delete everything). Check your "
+                   "Dispatcharr URL and active providers, or use [DANGER] Clean up Series for a full wipe.")
+            logger.error(msg)
+            return {"status": "error", "message": msg}
+
+        if protected:
+            logger.info("%d active series have no fetched episode list — their files are protected from pruning.", len(protected))
+        logger.info("Resolved %d active series; pruning orphaned files...", count)
+        r = self._prune_orphans_under(series_root, keep, protected, logger)
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("PRUNE SUMMARY")
+        logger.info("  Active series:   %d", count)
+        logger.info("  Dirs scanned:    %d", r["scanned_dirs"])
+        logger.info("  Dirs removed:    %d", r["removed_dirs"])
+        logger.info("  Dirs preserved:  %d  (user-added files inside)", r["preserved_dirs"])
+        logger.info("  Files protected: %d  (series without fetched episodes)", r["protected_files"])
+        logger.info("  .strm deleted:   %d", r["deleted_strm"])
+        logger.info("  .nfo deleted:    %d", r["deleted_nfo"])
+        logger.info("  Errors:          %d", r["errors"])
+        logger.info("=" * 60)
+
+        if r["deleted_strm"] == 0 and r["deleted_nfo"] == 0:
+            msg = f"No orphaned series files — {count} active series all present"
+        else:
+            msg = f"Pruned {r['deleted_strm']} orphaned .strm + {r['deleted_nfo']} .nfo, removed {r['removed_dirs']} folders"
+        if r.get("protected_files"):
+            msg += f" ({r['protected_files']} protected)"
+        return {"status": "ok", "message": msg, **r}
+
     def _clean_title(self, title: str) -> str:
         """Remove language prefixes like 'EN - ', 'FR - ' from titles.
 
@@ -1785,6 +2397,34 @@ class Plugin:
         series_settings = {**settings, "refresh_existing": True}
         series = self._generate_series(series_settings, logger)
 
+        # Optional differential prune, folded into the same pass. Only here (not
+        # in the batched Generate actions) because a prune must see the whole
+        # catalogue, and rescan has just walked and refreshed all of it — so the
+        # episode data is complete and nothing gets protected on a guess.
+        prune_movies_res = None
+        prune_series_res = None
+        if settings.get("prune_orphans_on_rescan", False):
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("Rescan: prune orphaned movies")
+            logger.info("=" * 60)
+            prune_movies_res = self._prune_movies(settings, logger)
+
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("Rescan: prune orphaned series")
+            logger.info("=" * 60)
+            prune_series_res = self._prune_series(settings, logger)
+
+            # Fold prune deletions into the movie/series result dicts so the
+            # webhook summary (which sums those nested dicts for rescan_all)
+            # reports them with no webhook-side special-casing.
+            for src, dst in ((prune_movies_res, movies), (prune_series_res, series)):
+                if isinstance(src, dict) and isinstance(dst, dict):
+                    for k in ("deleted_strm", "deleted_nfo", "removed_dirs", "preserved_dirs", "errors"):
+                        if isinstance(src.get(k), int):
+                            dst[k] = dst.get(k, 0) + src[k]
+
         m = movies if isinstance(movies, dict) else {}
         s = series if isinstance(series, dict) else {}
 
@@ -1813,6 +2453,10 @@ class Plugin:
             f"Rescan complete. Movies: {movie_strm} new{movie_extra}. "
             f"Series: {ep_new} new episodes across {sc_new} series{series_extra}."
         )
+        pruned_strm = sum(pr.get("deleted_strm", 0) for pr in (prune_movies_res, prune_series_res) if isinstance(pr, dict))
+        pruned_nfo = sum(pr.get("deleted_nfo", 0) for pr in (prune_movies_res, prune_series_res) if isinstance(pr, dict))
+        if pruned_strm or pruned_nfo:
+            message += f" Pruned {pruned_strm} orphaned .strm + {pruned_nfo} .nfo."
         if total_errors:
             message += f" {total_errors} errors — see logs."
 
@@ -1822,6 +2466,8 @@ class Plugin:
             "scan": scan,
             "movies": movies,
             "series": series,
+            "prune_movies": prune_movies_res,
+            "prune_series": prune_series_res,
         }
 
     def _validate_timezone(self, tz_str: str):

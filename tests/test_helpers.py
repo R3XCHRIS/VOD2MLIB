@@ -9,7 +9,11 @@ import sys
 # Make the repo root importable so `import plugin` resolves to plugin.py.
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import io
+import json
 import logging
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -24,14 +28,25 @@ class CapturingLogger:
         self.errors = []
         self.infos = []
 
+    @staticmethod
+    def _render(args):
+        if not args:
+            return ""
+        if len(args) > 1:
+            try:
+                return args[0] % args[1:]
+            except Exception:
+                pass
+        return args[0]
+
     def warning(self, *args, **kwargs):
-        self.warnings.append(args[0] if args else "")
+        self.warnings.append(self._render(args))
 
     def error(self, *args, **kwargs):
-        self.errors.append(args[0] if args else "")
+        self.errors.append(self._render(args))
 
     def info(self, *args, **kwargs):
-        self.infos.append(args[0] if args else "")
+        self.infos.append(self._render(args))
 
 
 @pytest.fixture
@@ -1318,3 +1333,403 @@ class TestParseCategoryFilter:
 
     def test_drops_empty_segments(self, p):
         assert p._parse_category_filter("[EN],,, [FR] ,") == ["[EN]", "[FR]"]
+
+
+# ---------- Webhook notifications (v1.17.0) ----------
+
+class TestDetectWebhookFormat:
+    def test_discord_url(self, p):
+        assert p._detect_webhook_format("https://discord.com/api/webhooks/123/abc") == "discord"
+
+    def test_discordapp_legacy_host(self, p):
+        assert p._detect_webhook_format("https://discordapp.com/api/webhooks/123/abc") == "discord"
+
+    def test_slack_url(self, p):
+        assert p._detect_webhook_format("https://hooks.slack.com/services/T00/B00/xyz") == "slack"
+
+    def test_unknown_host_is_generic(self, p):
+        assert p._detect_webhook_format("https://example.com/hook") == "generic"
+
+    def test_empty_url_is_generic(self, p):
+        assert p._detect_webhook_format("") == "generic"
+
+
+class TestWebhookStats:
+    def test_generate_movies_result(self, p):
+        result = {
+            "status": "ok", "message": "ok", "total_in_db": 100, "scanned": 100,
+            "created_strm": 5, "refreshed_strm": 0, "created_nfo": 5,
+            "skipped": 95, "deduped": 0, "errors": 0,
+        }
+        stats, errors, total_changed = p._webhook_stats("generate_movies", result)
+        assert ("Movies added", 5) in stats
+        assert ("Movie NFOs written", 5) in stats
+        assert ("Movies skipped (on disk)", 95) in stats
+        # zero-valued stats are omitted
+        assert not any(label == "Movies refreshed" for label, _ in stats)
+        assert errors == 0
+        # 'skipped' (already on disk) is informational, not a change, and is
+        # excluded from the no-op gate — otherwise a fully-cached rerun would
+        # still "count" as a change because it re-skipped 95 files.
+        assert total_changed == 5 + 5
+
+    def test_cleanup_result(self, p):
+        result = {
+            "status": "ok", "message": "ok",
+            "deleted_strm": 12, "deleted_nfo": 12, "removed_dirs": 3,
+            "preserved_dirs": 1, "errors": 0,
+        }
+        stats, errors, total_changed = p._webhook_stats("cleanup_movies", result)
+        assert ("Folders removed", 3) in stats
+        assert ("Folders preserved (user files)", 1) in stats
+        assert errors == 0
+        # preserved_dirs is informational (nothing was deleted there)
+        assert total_changed == 12 + 12 + 3
+
+    def test_rescan_all_merges_nested_movies_and_series(self, p):
+        result = {
+            "status": "ok", "message": "ok",
+            "movies": {"created_strm": 3, "refreshed_strm": 2, "skipped": 1, "errors": 1},
+            "series": {"episodes_created": 4, "series_processed": 2, "errors": 0},
+        }
+        stats, errors, total_changed = p._webhook_stats("rescan_all", result)
+        assert ("Movies added", 3) in stats
+        assert ("Movies refreshed", 2) in stats
+        assert ("Episodes added", 4) in stats
+        assert ("Series updated", 2) in stats
+        assert errors == 1
+        # movies' 'skipped': 1 is informational, excluded from the gate
+        assert total_changed == 3 + 2 + 4 + 2
+
+    def test_all_zero_gives_no_stats_and_no_errors(self, p):
+        result = {"status": "ok", "message": "nothing to do", "created_strm": 0, "skipped": 0, "errors": 0}
+        stats, errors, total_changed = p._webhook_stats("generate_movies", result)
+        assert stats == []
+        assert errors == 0
+        assert total_changed == 0
+
+    def test_fully_cached_rerun_is_a_no_op_despite_large_scan_counts(self, p):
+        # A nightly cron rerun where every movie is already on disk still
+        # reports a large 'total_in_db'/'scanned' — those must NOT make the
+        # run look like it "changed" something, or webhook_notify_on_no_changes
+        # would never actually suppress anything.
+        result = {
+            "status": "ok", "message": "already done", "total_in_db": 5000, "scanned": 5000,
+            "created_strm": 0, "refreshed_strm": 0, "created_nfo": 0, "skipped": 5000, "errors": 0,
+        }
+        stats, errors, total_changed = p._webhook_stats("generate_movies", result)
+        assert total_changed == 0
+        assert errors == 0
+
+
+class TestWebhookPayloads:
+    def test_discord_payload_shape(self, p):
+        payload = p._discord_webhook_payload("Title", "msg", [("Movies added", 3)], 0)
+        embed = payload["embeds"][0]
+        assert embed["title"] == "Title"
+        assert embed["description"] == "msg"
+        assert embed["fields"] == [{"name": "Movies added", "value": "3", "inline": True}]
+        assert embed["color"] != 0xE74C3C  # not error-red when errors == 0
+
+    def test_discord_payload_uses_red_on_errors(self, p):
+        payload = p._discord_webhook_payload("Title", "msg", [], 2)
+        assert payload["embeds"][0]["color"] == 0xE74C3C
+        assert {"name": "Errors", "value": "2", "inline": True} in payload["embeds"][0]["fields"]
+
+    def test_slack_payload_is_plain_text(self, p):
+        payload = p._slack_webhook_payload("Title", "msg", [("Movies added", 3)], 0)
+        assert "Title" in payload["text"]
+        assert "msg" in payload["text"]
+        assert "Movies added: 3" in payload["text"]
+
+    def test_generic_payload_shape(self, p):
+        payload = p._generic_webhook_payload("generate_movies", "Title", "msg", [("Movies added", 3)], 0)
+        assert payload["action"] == "generate_movies"
+        assert payload["stats"] == {"Movies added": 3}
+        assert payload["errors"] == 0
+
+
+class TestSendWebhook:
+    def test_no_url_skips_network_call(self, p, monkeypatch):
+        called = []
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: called.append(1))
+        p._send_webhook({"webhook_url": ""}, CapturingLogger(), "generate_movies", {"status": "ok", "created_strm": 5})
+        assert called == []
+
+    def test_error_result_skips_network_call(self, p, monkeypatch):
+        called = []
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: called.append(1))
+        p._send_webhook(
+            {"webhook_url": "https://example.com/hook"}, CapturingLogger(),
+            "generate_movies", {"status": "error", "message": "boom"},
+        )
+        assert called == []
+
+    def test_no_changes_skips_by_default(self, p, monkeypatch):
+        called = []
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: called.append(1))
+        p._send_webhook(
+            {"webhook_url": "https://example.com/hook"}, CapturingLogger(),
+            "generate_movies", {"status": "ok", "created_strm": 0, "skipped": 0, "errors": 0},
+        )
+        assert called == []
+
+    def test_no_changes_sent_when_opted_in(self, p, monkeypatch):
+        class FakeResp:
+            status = 204
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        captured = {}
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return FakeResp()
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        p._send_webhook(
+            {"webhook_url": "https://example.com/hook", "webhook_notify_on_no_changes": True},
+            CapturingLogger(), "generate_movies", {"status": "ok", "created_strm": 0, "skipped": 0, "errors": 0},
+        )
+        assert captured["url"] == "https://example.com/hook"
+        assert captured["body"]["action"] == "generate_movies"
+
+    def test_posts_discord_payload_for_discord_url(self, p, monkeypatch):
+        class FakeResp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        captured = {}
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            captured["content_type"] = req.get_header("Content-type")
+            return FakeResp()
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        p._send_webhook(
+            {"webhook_url": "https://discord.com/api/webhooks/1/abc"}, CapturingLogger(),
+            "generate_movies", {"status": "ok", "message": "Wrote 5 new .strm files", "created_strm": 5, "errors": 0},
+        )
+        assert "embeds" in captured["body"]
+        assert captured["content_type"] == "application/json"
+
+    def test_webhook_failure_is_logged_not_raised(self, p, monkeypatch):
+        def raising_urlopen(*a, **k):
+            raise OSError("network unreachable")
+        monkeypatch.setattr(urllib.request, "urlopen", raising_urlopen)
+        logger = CapturingLogger()
+        p._send_webhook(
+            {"webhook_url": "https://example.com/hook"}, logger,
+            "generate_movies", {"status": "ok", "created_strm": 5, "errors": 0},
+        )
+        assert any("Webhook delivery failed" in w for w in logger.warnings)
+
+    def test_http_error_body_surfaced_in_log(self, p, monkeypatch):
+        # Discord/Slack sit behind WAFs that return a bare 403 with no other
+        # signal — surfacing code + reason + response body is the difference
+        # between "something's wrong" and "here's exactly why".
+        def raising_urlopen(*a, **k):
+            raise urllib.error.HTTPError(
+                "https://discord.com/api/webhooks/1/abc", 403, "Forbidden", None,
+                io.BytesIO(b"Cloudflare blocked this request"),
+            )
+        monkeypatch.setattr(urllib.request, "urlopen", raising_urlopen)
+        logger = CapturingLogger()
+        p._send_webhook(
+            {"webhook_url": "https://discord.com/api/webhooks/1/abc"}, logger,
+            "generate_movies", {"status": "ok", "created_strm": 5, "errors": 0},
+        )
+        assert len(logger.warnings) == 1
+        assert "403" in logger.warnings[0]
+        assert "Forbidden" in logger.warnings[0]
+        assert "Cloudflare blocked this request" in logger.warnings[0]
+
+    def test_sets_custom_user_agent(self, p, monkeypatch):
+        # urllib's default "Python-urllib/x.y" User-Agent is a known bot
+        # signature that Cloudflare (in front of discord.com) blocks with a
+        # bare 403 — this is the actual fix, not just an error-message nicety.
+        class FakeResp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        captured = {}
+        def fake_urlopen(req, timeout=None):
+            captured["user_agent"] = req.get_header("User-agent")
+            return FakeResp()
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        p._send_webhook(
+            {"webhook_url": "https://discord.com/api/webhooks/1/abc"}, CapturingLogger(),
+            "generate_movies", {"status": "ok", "created_strm": 5, "errors": 0},
+        )
+        assert captured["user_agent"]
+        assert "python-urllib" not in captured["user_agent"].lower()
+
+
+# ---------- _dir_has_plugin_files (orphan-prune guardrail) ----------
+
+class TestDirHasPluginFiles:
+    def test_empty_dir_is_false(self, p, tmp_path):
+        assert p._dir_has_plugin_files(str(tmp_path)) is False
+
+    def test_nonexistent_is_false(self, p, tmp_path):
+        assert p._dir_has_plugin_files(str(tmp_path / "nope")) is False
+
+    def test_finds_nested_strm(self, p, tmp_path):
+        d = tmp_path / "Movie (2020)"
+        d.mkdir()
+        (d / "Movie (2020).strm").write_text("x")
+        assert p._dir_has_plugin_files(str(tmp_path)) is True
+
+    def test_finds_nested_nfo(self, p, tmp_path):
+        d = tmp_path / "Movie (2020)"
+        d.mkdir()
+        (d / "Movie (2020).nfo").write_text("<movie/>")
+        assert p._dir_has_plugin_files(str(tmp_path)) is True
+
+    def test_user_files_only_is_false(self, p, tmp_path):
+        d = tmp_path / "Movie (2020)"
+        d.mkdir()
+        (d / "poster.jpg").write_text("x")
+        (d / "Movie (2020).en.srt").write_text("subs")
+        assert p._dir_has_plugin_files(str(tmp_path)) is False
+
+
+# ---------- _prune_orphans_under (differential cleanup) ----------
+
+class TestPruneOrphansUnder:
+    """Tests _prune_orphans_under against real temp dirs (no DB).
+
+    The keep-set is a set of realpaths, built here by hand exactly as the
+    collectors would. Only files NOT in the set (and not under a protected
+    subtree) should be removed; user files survive and empty dirs are cleaned
+    bottom-up. Sanitisation lives in the collectors, so these tests are
+    sanitisation-agnostic on purpose — they compare realpaths directly.
+    """
+
+    def _mk(self, path, text="http://x"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return os.path.realpath(str(path))
+
+    def test_orphan_deleted_kept_preserved(self, p, tmp_path):
+        log = CapturingLogger()
+        keep_strm = self._mk(tmp_path / "Kept (2020)" / "Kept (2020).strm")
+        keep_nfo = self._mk(tmp_path / "Kept (2020)" / "Kept (2020).nfo", "<movie/>")
+        # Orphaned movie folder — neither file in the keep set.
+        self._mk(tmp_path / "Gone (2019)" / "Gone (2019).strm")
+        self._mk(tmp_path / "Gone (2019)" / "Gone (2019).nfo", "<movie/>")
+
+        r = p._prune_orphans_under(str(tmp_path), {keep_strm, keep_nfo}, set(), log)
+
+        assert r["deleted_strm"] == 1
+        assert r["deleted_nfo"] == 1
+        assert r["removed_dirs"] == 1  # the Gone folder
+        assert (tmp_path / "Kept (2020)" / "Kept (2020).strm").exists()
+        assert (tmp_path / "Kept (2020)" / "Kept (2020).nfo").exists()
+        assert not (tmp_path / "Gone (2019)").exists()
+        assert tmp_path.exists()  # root preserved
+
+    def test_kept_nfo_survives(self, p, tmp_path):
+        # Collectors always add both the .strm and its sidecar .nfo, so a valid
+        # NFO next to a kept movie must never be treated as an orphan.
+        log = CapturingLogger()
+        strm = self._mk(tmp_path / "Kept (2020)" / "Kept (2020).strm")
+        nfo = self._mk(tmp_path / "Kept (2020)" / "Kept (2020).nfo", "<movie/>")
+        r = p._prune_orphans_under(str(tmp_path), {strm, nfo}, set(), log)
+        assert r["deleted_nfo"] == 0
+        assert (tmp_path / "Kept (2020)" / "Kept (2020).nfo").exists()
+
+    def test_user_files_preserved(self, p, tmp_path):
+        log = CapturingLogger()
+        # Orphaned .strm sharing a folder with a user-added poster.
+        self._mk(tmp_path / "Gone (2019)" / "Gone (2019).strm")
+        poster = tmp_path / "Gone (2019)" / "poster.jpg"
+        poster.write_text("img")
+        r = p._prune_orphans_under(str(tmp_path), set(), set(), log)
+        assert r["deleted_strm"] == 1
+        assert r["removed_dirs"] == 0  # folder kept — poster still inside
+        assert r["preserved_dirs"] >= 1
+        assert poster.exists()
+
+    def test_protected_subtree_untouched(self, p, tmp_path):
+        log = CapturingLogger()
+        protected_dir = tmp_path / "MysterySeries (2021)"
+        # Episode not in keep set, but under a protected series folder.
+        self._mk(protected_dir / "Season 01" / "MysterySeries - S01E01.strm")
+        r = p._prune_orphans_under(
+            str(tmp_path), set(), {os.path.realpath(str(protected_dir))}, log,
+        )
+        assert r["deleted_strm"] == 0
+        assert r["protected_files"] == 1
+        assert (protected_dir / "Season 01" / "MysterySeries - S01E01.strm").exists()
+
+    def test_protected_prefix_does_not_match_sibling(self, p, tmp_path):
+        # A protected 'Show' folder must not accidentally protect 'Show 2'.
+        log = CapturingLogger()
+        protected_dir = tmp_path / "Show"
+        self._mk(protected_dir / "keep.strm")
+        self._mk(tmp_path / "Show 2" / "orphan.strm")
+        r = p._prune_orphans_under(
+            str(tmp_path), set(), {os.path.realpath(str(protected_dir))}, log,
+        )
+        assert r["deleted_strm"] == 1  # only Show 2's orphan
+        assert (protected_dir / "keep.strm").exists()
+        assert not (tmp_path / "Show 2").exists()
+
+    def test_series_episode_prune_keeps_current_removes_dropped(self, p, tmp_path):
+        log = CapturingLogger()
+        series = tmp_path / "Show (2020)"
+        keep_ep = self._mk(series / "Season 01" / "Show - S01E01.strm")
+        keep_epnfo = self._mk(series / "Season 01" / "Show - S01E01.nfo", "<ep/>")
+        keep_tv = self._mk(series / "tvshow.nfo", "<tvshow/>")
+        # Dropped episode — no longer upstream.
+        self._mk(series / "Season 01" / "Show - S01E99.strm")
+        keep = {keep_ep, keep_epnfo, keep_tv}
+        r = p._prune_orphans_under(str(tmp_path), keep, set(), log)
+        assert r["deleted_strm"] == 1
+        assert (series / "Season 01" / "Show - S01E01.strm").exists()
+        assert (series / "tvshow.nfo").exists()
+        assert not (series / "Season 01" / "Show - S01E99.strm").exists()
+
+    def test_empty_season_folder_removed(self, p, tmp_path):
+        log = CapturingLogger()
+        series = tmp_path / "Show (2020)"
+        self._mk(series / "tvshow.nfo", "<tvshow/>")
+        # A whole season went away.
+        self._mk(series / "Season 05" / "Show - S05E01.strm")
+        keep = {os.path.realpath(str(series / "tvshow.nfo"))}
+        r = p._prune_orphans_under(str(tmp_path), keep, set(), log)
+        assert r["deleted_strm"] == 1
+        assert not (series / "Season 05").exists()
+        assert (series / "tvshow.nfo").exists()  # series folder itself preserved
+
+    def test_nonexistent_root_no_error(self, p, tmp_path):
+        log = CapturingLogger()
+        r = p._prune_orphans_under(str(tmp_path / "nope"), set(), set(), log)
+        assert r["errors"] == 0
+        assert r["deleted_strm"] == 0
+
+    def test_root_never_removed_even_when_emptied(self, p, tmp_path):
+        log = CapturingLogger()
+        self._mk(tmp_path / "Gone (2019)" / "Gone (2019).strm")
+        r = p._prune_orphans_under(str(tmp_path), set(), set(), log)
+        assert tmp_path.exists()
+        assert r["removed_dirs"] == 1  # only the Gone folder, not the root
+
+
+# ---------- prune action wiring ----------
+
+class TestPruneActionsWebhookRegistered:
+    def test_prune_actions_are_notify_worthy(self, p):
+        assert "prune_movies" in p._WEBHOOK_ACTION_LABELS
+        assert "prune_series" in p._WEBHOOK_ACTION_LABELS
+
+    def test_prune_actions_not_schedule_targets(self, p):
+        # Prune isn't offered in the schedule dropdown (like cleanup); the
+        # prune-on-rescan toggle covers scheduled pruning instead.
+        targets = p._valid_schedule_targets()
+        assert "prune_movies" not in targets
+        assert "prune_series" not in targets
+
+    def test_prune_stat_keys_are_in_webhook_labels(self, p):
+        # The counts prune emits must be renderable by the webhook summary.
+        labelled = {key for key, _label in p._WEBHOOK_STAT_LABELS}
+        for key in ("deleted_strm", "deleted_nfo", "removed_dirs", "preserved_dirs"):
+            assert key in labelled
