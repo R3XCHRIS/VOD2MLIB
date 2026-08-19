@@ -1414,3 +1414,37 @@ class TestTmdbTagFormat:
             append_tmdb_id=True, tmdb_tag_format="jellyfin",
         )
         assert folder == "/VODS/Series/Breaking Bad (2008) [tmdbid-1396]"
+
+
+# ---------- category exclude + prefix matching (v1.17.0, issue #8) ----------
+
+class TestMatchesCategoryPrefixes:
+    def test_no_prefixes_never_matches(self, p):
+        assert p._matches_category_prefixes("Action", []) is False
+
+    def test_case_insensitive_startswith(self, p):
+        assert p._matches_category_prefixes("FOR ADULTS (movie)", ["for adults"]) is True
+        assert p._matches_category_prefixes("for adults", ["FOR ADULTS"]) is True
+
+    def test_only_matches_at_the_start(self, p):
+        # "EN" appears inside, but not as a prefix -> no match.
+        assert p._matches_category_prefixes("KIDS EN Cartoons", ["EN"]) is False
+
+    def test_any_of_several_prefixes(self, p):
+        assert p._matches_category_prefixes("[FR] Cinema", ["[EN]", "[FR]"]) is True
+
+    def test_missing_or_blank_category_never_matches(self, p):
+        # Mirrors the DB behaviour: NULL category can't satisfy istartswith.
+        assert p._matches_category_prefixes(None, ["EN"]) is False
+        assert p._matches_category_prefixes("", ["EN"]) is False
+        assert p._matches_category_prefixes("   ", ["EN"]) is False
+
+    def test_prefix_whitespace_is_tolerated(self, p):
+        assert p._matches_category_prefixes("Action", ["  action "]) is True
+
+    def test_logand99_scenario(self, p):
+        # Issue #8: the user filtered on "|EN|" (a TITLE prefix their provider
+        # uses) while the category was "FOR ADULTS (movie)" — so nothing
+        # matched. The exclude-list is the right tool for their goal.
+        assert p._matches_category_prefixes("FOR ADULTS (movie)", ["|EN|"]) is False
+        assert p._matches_category_prefixes("FOR ADULTS (movie)", ["FOR ADULTS"]) is True

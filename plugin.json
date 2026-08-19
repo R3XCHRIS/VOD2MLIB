@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.16.1",
+  "version": "1.17.0",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -116,7 +116,14 @@
       "label": "Category Filter (include only)",
       "type": "string",
       "default": "",
-      "help_text": "Only generate content whose M3U category name STARTS WITH one of these comma-separated prefixes — e.g. `[EN],[FR]` or `EN`. Case-insensitive. Leave empty to generate all (active) content. Ideal for large multi-language catalogues where you only want one or two languages: it filters at the database-query level, so unwanted folders are never created (no generate-then-clean-up waste). Applies to BOTH Movies and Series. When a filter is set, content with no category — or a category that doesn't match — is skipped. Category names are visible in Dispatcharr's VODs UI."
+      "help_text": "Only generate content whose M3U CATEGORY name STARTS WITH one of these comma-separated prefixes — e.g. `[EN],[FR]` or `EN`. Case-insensitive. Leave empty to generate all (active) content. Ideal for large multi-language catalogues where you only want one or two languages: it filters at the database-query level, so unwanted folders are never created (no generate-then-clean-up waste). Applies to BOTH Movies and Series. When a filter is set, content with no category — or a category that doesn't match — is skipped. ⚠ This matches the CATEGORY name, NOT the movie/series title — many providers put a language tag in the title (`|EN| The Matrix`) while the category is something else entirely (`FOR ADULTS`). Run `[LIBRARY] Catalogue snapshot` to print your real category names and see exactly which ones your filter matches."
+    },
+    {
+      "id": "category_exclude",
+      "label": "Category Exclude (block list)",
+      "type": "string",
+      "default": "",
+      "help_text": "Skip content whose M3U CATEGORY name starts with any of these comma-separated prefixes — e.g. `FOR ADULTS,XXX`. Case-insensitive. Applied AFTER the include filter, so you can use both together. This is usually what you want for 'everything EXCEPT adult content': leave `Category Filter` empty and put the unwanted categories here, rather than trying to list every category you do want. Content with no category is never excluded. Run `[LIBRARY] Catalogue snapshot` to see your exact category names. ⚠ Already-generated folders are not removed when you add an exclude — run `[⚠ DANGER] Clean up` once, then re-generate."
     },
     {
       "id": "_section_series",

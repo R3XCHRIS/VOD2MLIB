@@ -1,11 +1,10 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.16.1 — only rewrite .strm files whose URL actually changed, and
-          preserve mtime when they do, so media servers stop re-indexing
-          the whole library on every rescan (#11); selectable TMDB folder
-          tag format — [tmdbid-N] for Jellyfin/Emby vs {tmdb-N} for
-          Plex/ChannelsDVR (#9).
+v1.17.0 — Category Exclude (block list) to skip unwanted categories
+          such as adult content; Scan now prints your real category
+          names and marks which ones your filter matches, and Generate
+          says so when a filter excluded everything (#8).
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -23,7 +22,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.16.1"
+    version = "1.17.0"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -35,6 +34,8 @@ class Plugin:
     LOG_EVERY = 50
     LOG_FIRST_N = 10
     MAX_FILENAME_LEN = 200
+    # Cap the category list printed by Scan — catalogues can have hundreds.
+    SCAN_CATEGORY_LIMIT = 40
 
     # Schedule task identity (django-celery-beat row name + Celery task name)
     SCHEDULE_TASK_NAME = "vod2mlib.auto_rescan"
@@ -209,7 +210,14 @@ class Plugin:
             "label": "Category Filter (include only)",
             "type": "string",
             "default": "",
-            "help_text": "Only generate content whose M3U category name STARTS WITH one of these comma-separated prefixes — e.g. `[EN],[FR]` or `EN`. Case-insensitive. Leave empty to generate all (active) content. Ideal for large multi-language catalogues where you only want one or two languages: it filters at the database-query level, so unwanted folders are never created (no generate-then-clean-up waste). Applies to BOTH Movies and Series. When a filter is set, content with no category — or a category that doesn't match — is skipped. Category names are visible in Dispatcharr's VODs UI."
+            "help_text": "Only generate content whose M3U CATEGORY name STARTS WITH one of these comma-separated prefixes — e.g. `[EN],[FR]` or `EN`. Case-insensitive. Leave empty to generate all (active) content. Ideal for large multi-language catalogues where you only want one or two languages: it filters at the database-query level, so unwanted folders are never created (no generate-then-clean-up waste). Applies to BOTH Movies and Series. When a filter is set, content with no category — or a category that doesn't match — is skipped. ⚠ This matches the CATEGORY name, NOT the movie/series title — many providers put a language tag in the title (`|EN| The Matrix`) while the category is something else entirely (`FOR ADULTS`). Run `[LIBRARY] Catalogue snapshot` to print your real category names and see exactly which ones your filter matches."
+        },
+        {
+            "id": "category_exclude",
+            "label": "Category Exclude (block list)",
+            "type": "string",
+            "default": "",
+            "help_text": "Skip content whose M3U CATEGORY name starts with any of these comma-separated prefixes — e.g. `FOR ADULTS,XXX`. Case-insensitive. Applied AFTER the include filter, so you can use both together. This is usually what you want for 'everything EXCEPT adult content': leave `Category Filter` empty and put the unwanted categories here, rather than trying to list every category you do want. Content with no category is never excluded. Run `[LIBRARY] Catalogue snapshot` to see your exact category names. ⚠ Already-generated folders are not removed when you add an exclude — run `[⚠ DANGER] Clean up` once, then re-generate."
         },
         {
             "id": "_section_series",
@@ -443,6 +451,7 @@ class Plugin:
         
         try:
             from apps.vod.models import Movie, Series, M3UMovieRelation, M3USeriesRelation
+            from django.db.models import Count
         except ImportError as e:
             logger.error("Failed to import models: %s", e)
             return {"status": "error", "message": f"Import error: {e}"}
@@ -478,6 +487,54 @@ class Plugin:
             if orphan_series:
                 logger.info("        %d orphaned — no active provider (won't generate)", orphan_series)
             logger.info("=" * 60)
+
+            # Category breakdown — the exact names to type into Category Filter
+            # / Category Exclude. People guess at names their provider shows in
+            # titles rather than the category the DB actually stores (#8), so
+            # print them, and mark which ones the current filter matches.
+            cat_filter_prefixes = self._parse_category_filter(settings.get("category_filter"))
+            cat_exclude_prefixes = self._parse_category_filter(settings.get("category_exclude"))
+            counts = {}
+            for model, idx in ((M3UMovieRelation, 0), (M3USeriesRelation, 1)):
+                for row in (model.objects
+                            .filter(m3u_account__is_active=True)
+                            .values("category__name")
+                            .annotate(n=Count("id"))):
+                    entry = counts.setdefault(row["category__name"], [0, 0])
+                    entry[idx] += row["n"]
+
+            if counts:
+                logger.info("")
+                logger.info("CATEGORIES (%d) — use these names in Category Filter / Exclude:", len(counts))
+                if cat_filter_prefixes or cat_exclude_prefixes:
+                    logger.info("  ✓ = included by your filter   ✗ = dropped by your exclude")
+                ordered = sorted(counts.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))
+                shown = 0
+                matched = 0
+                for name, (mv, sr) in ordered:
+                    included = (
+                        self._matches_category_prefixes(name, cat_filter_prefixes)
+                        if cat_filter_prefixes else True
+                    )
+                    if included and self._matches_category_prefixes(name, cat_exclude_prefixes):
+                        included = False
+                    if included:
+                        matched += 1
+                    if shown < self.SCAN_CATEGORY_LIMIT:
+                        mark = " " if not (cat_filter_prefixes or cat_exclude_prefixes) else ("✓" if included else "✗")
+                        logger.info("  %s %6d  %r", mark, mv + sr, name if name else "(no category)")
+                        shown += 1
+                if len(ordered) > shown:
+                    logger.info("     ... and %d more", len(ordered) - shown)
+                if cat_filter_prefixes or cat_exclude_prefixes:
+                    logger.info("")
+                    logger.info("  → %d of %d categories will generate.", matched, len(ordered))
+                    if matched == 0:
+                        logger.warning("  ⚠ NOTHING matches — Generate will produce no files.")
+                        logger.warning("    Your filter %s doesn't match any category name above.", cat_filter_prefixes)
+                        logger.warning("    Note the filter matches the CATEGORY name, not the movie title.")
+                logger.info("=" * 60)
+
             logger.info("")
             logger.info("Use 'Generate Movie .strm Files' for movies")
             logger.info("Use 'Generate Series .strm Files' for series")
@@ -589,6 +646,39 @@ class Plugin:
         of non-empty prefixes. Pure/testable."""
         return [pfx.strip() for pfx in (category_filter or "").split(",") if pfx.strip()]
 
+    def _matches_category_prefixes(self, category_name, prefixes) -> bool:
+        """True when `category_name` starts with any of `prefixes`
+        (case-insensitive). Mirrors the DB-side `category__name__istartswith`
+        so the Scan diagnostic and the actual query agree.
+
+        Content with no category never matches — which is why an include-only
+        filter also drops uncategorised content.
+        """
+        if not prefixes:
+            return False
+        name = (category_name or "").strip().lower()
+        if not name:
+            return False
+        return any(name.startswith(p.strip().lower()) for p in prefixes if p.strip())
+
+    def _apply_category_exclude(self, query, category_exclude):
+        """Drop relations whose category name starts with any of the
+        comma-separated prefixes (case-insensitive).
+
+        Applied *after* the include filter. Content with no category is NOT
+        excluded — only categories that explicitly match are dropped — so
+        `category_exclude` is a safe way to say "everything except X" without
+        silently losing uncategorised titles (issue #8).
+        """
+        prefixes = self._parse_category_filter(category_exclude)
+        if not prefixes:
+            return query
+        from django.db.models import Q
+        q = Q()
+        for pfx in prefixes:
+            q |= Q(category__name__istartswith=pfx)
+        return query.exclude(q)
+
     def _apply_category_filter(self, query, category_filter):
         """Restrict an M3U relation queryset to categories whose name starts
         with any of the comma-separated prefixes (case-insensitive).
@@ -667,6 +757,7 @@ class Plugin:
         tmdb_tag_format = (settings.get("tmdb_tag_format") or "plex").strip().lower()
         omit_stream_id = bool(settings.get("omit_stream_id", False))
         category_filter = (settings.get("category_filter") or "").strip()
+        category_exclude = (settings.get("category_exclude") or "").strip()
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -683,6 +774,7 @@ class Plugin:
             "Dedupe across cats": "Yes" if dedupe_across_cats else "No",
             "Append TMDB ID": ("Yes (%s)" % tmdb_tag_format) if append_tmdb_id else "No",
             "Category filter": category_filter or "(all)",
+            "Category exclude": category_exclude or "(none)",
         })
 
         try:
@@ -701,6 +793,7 @@ class Plugin:
                 .filter(m3u_account__is_active=True)
             )
             query = self._apply_category_filter(query, category_filter)
+            query = self._apply_category_exclude(query, category_exclude)
             if dedupe_across_cats:
                 # Deterministic "first category wins" requires a stable sort.
                 # Alphabetical by category name, then relation id as a tiebreaker.
@@ -709,6 +802,17 @@ class Plugin:
                 query = query.order_by('category__name', 'id')
             total_count = query.count()
             if total_count == 0:
+                # Don't just say "nothing found" — if a filter is set it's
+                # almost certainly the cause, and users mistake the category
+                # name for the title prefix their provider shows (#8).
+                if category_filter or category_exclude:
+                    msg = (
+                        "No movies matched your Category Filter/Exclude — nothing generated. "
+                        "Run '[LIBRARY] Catalogue snapshot' to see the real category names "
+                        "(the filter matches the CATEGORY name, not the movie title)."
+                    )
+                    logger.warning(msg)
+                    return {"status": "ok", "message": msg, "processed": 0, "filtered_out": True}
                 return {"status": "ok", "message": "No movies found to process", "processed": 0}
             target_batch = total_count if batch_size == "all" else int(batch_size)
             logger.info("Total relations: %d. Target batch: %s", total_count, "all" if batch_size == "all" else target_batch)
@@ -906,6 +1010,7 @@ class Plugin:
         tmdb_tag_format = (settings.get("tmdb_tag_format") or "plex").strip().lower()
         omit_stream_id = bool(settings.get("omit_stream_id", False))
         category_filter = (settings.get("category_filter") or "").strip()
+        category_exclude = (settings.get("category_exclude") or "").strip()
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -921,6 +1026,7 @@ class Plugin:
             "Nest by category": "Yes" if nest_by_cat else "No",
             "Dedupe across cats": "Yes" if dedupe_across_cats else "No",
             "Category filter": category_filter or "(all)",
+            "Category exclude": category_exclude or "(none)",
             "Workers": self.MAX_WORKERS,
         })
 
@@ -939,6 +1045,7 @@ class Plugin:
                 .filter(m3u_account__is_active=True)
             )
             query = self._apply_category_filter(query, category_filter)
+            query = self._apply_category_exclude(query, category_exclude)
             if dedupe_across_cats:
                 # See _generate_movies for rationale — deterministic
                 # alphabetical-by-category-name ordering so "first category wins"
@@ -954,6 +1061,14 @@ class Plugin:
                 logger.info("Target batch size: %d (of %d total)", target_batch, total_count)
 
             if total_count == 0:
+                if category_filter or category_exclude:
+                    msg = (
+                        "No series matched your Category Filter/Exclude — nothing generated. "
+                        "Run '[LIBRARY] Catalogue snapshot' to see the real category names "
+                        "(the filter matches the CATEGORY name, not the series title)."
+                    )
+                    logger.warning(msg)
+                    return {"status": "ok", "message": msg, "filtered_out": True}
                 return {"status": "ok", "message": "No series found"}
         except Exception as e:
             logger.error("Query failed: %s", e)

@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.17.0 — Category Exclude, and Scan tells you what your filter actually matches
+
+Follow-up to [#8](https://github.com/R3XCHRIS/VOD2MLIB/issues/8) (thanks **@logand99**), where a Category Filter appeared to do nothing.
+
+The root of it: the filter matches the **category name**, but many providers put their language/content tag in the **title** (`|EN| The Matrix`) while the category is something else entirely (`FOR ADULTS`). Filtering on `|EN|` therefore matched no category — and the plugin gave no hint that was why. Three changes:
+
+- **New `Category Exclude (block list)` setting.** Comma-separated category-name prefixes to skip, applied *after* the include filter. This is the right tool for "everything except adult content": leave `Category Filter` empty and put `FOR ADULTS` here, instead of trying to enumerate every category you *do* want. Content with no category is never excluded, so uncategorised titles aren't silently lost.
+
+- **`[LIBRARY] Catalogue snapshot` now prints your real category names**, with movie+series counts, sorted by size. If a filter or exclude is set, each is marked ✓ (will generate) or ✗ (dropped), followed by `→ N of M categories will generate.` If nothing matches, it says so loudly — including the reminder that the filter matches the category, not the title. This turns "why is my filter not working?" into a single click.
+
+- **Generate no longer reports a filtered-out run as an empty library.** It used to say `No movies found to process`, which reads like the catalogue is empty; when a filter/exclude is set it now says the filter matched nothing and points at the snapshot action.
+
+No behaviour change for anyone not using the filters. 7 new unit tests (201 total, was 194).
+
 ## v1.16.1 — stop media servers re-indexing on every rescan; Jellyfin-format TMDB tags
 
 Two bug fixes, both reported from the field.
