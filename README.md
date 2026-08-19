@@ -7,7 +7,7 @@
 <p align="center">A Dispatcharr plugin that turns your VOD catalogue into a folder of <code>.strm</code> files (with optional NFO metadata) that media servers — Jellyfin, Emby, Kodi, ChannelsDVR — can index and play.</p>
 
 <p align="center">
-  <i>v1.16.0 — slug <code>vod2mlib</code></i>
+  <i>v1.16.1 — slug <code>vod2mlib</code></i>
 </p>
 
 > **Note on scheduled rescans.** The cron task routes via Dispatcharr's `dvr` Celery worker as a workaround for an upstream plugin-task-registration issue affecting the default prefork worker pool ([Dispatcharr#1244](https://github.com/Dispatcharr/Dispatcharr/issues/1244)). The routing is transparent — no user action required for new installs. If you originally set up your schedule on **v1.14.1 or earlier**, click `[SCHEDULE] Apply / Update` once after upgrading so the stored task picks up the new routing.
@@ -123,7 +123,8 @@ The Settings tab is grouped into four sections:
 |  | Generate Movie NFO Files | Toggle Kodi/Jellyfin metadata generation |
 |  | Nest Movies by Category | Wrap each movie folder inside a subfolder named by its M3U category (off by default; movies without a category go to `Unassigned/`) |
 |  | Dedupe Movies Across Categories | When nesting is ON and a movie is tagged with multiple categories upstream, write under the first category only (alphabetical) instead of duplicating. No effect when nesting is OFF. Off by default (preserves 4K-vs-HD variant-stream behaviour). ⚠ Doesn't remove existing duplicate folders — `[⚠ DANGER] Clean up` + re-generate to migrate. |
-|  | Append TMDB ID to folder names | Append `{tmdb-NNN}` to Movie *and* Series folder names when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex/CDVR honour this for forced exact metadata matches. Off by default. ⚠ Doesn't rename existing folders in place — writes new names alongside the old ones; `[⚠ DANGER] Clean up` + re-generate to migrate cleanly. |
+|  | Append TMDB ID to folder names | Append a TMDB id tag to Movie *and* Series folder names when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Media servers honour this as a forced exact metadata match. Off by default. ⚠ Doesn't rename existing folders in place — writes new names alongside the old ones; `[⚠ DANGER] Clean up` + re-generate to migrate cleanly. |
+|  | TMDB Folder Tag Format | Which tag convention to write: **Plex / ChannelsDVR** `{tmdb-123}` (default) or **Jellyfin / Emby** `[tmdbid-123]`. Each server ignores the other's format — Jellyfin/Emby users should switch this. Only applies when the setting above is ON. |
 |  | Don't pin .strm to a specific stream | Omit `?stream_id=` from `.strm` URLs so Dispatcharr can fail over across providers. Off by default; only useful with a Dispatcharr build that has VOD failover ([#1398](https://github.com/Dispatcharr/Dispatcharr/pull/1398)). |
 |  | Category Filter (include only) | Comma-separated category-name prefixes (e.g. `[EN],[FR]`, case-insensitive). Only generate content whose category starts with one of them — filters at query level so unwanted folders are never created. Applies to Movies *and* Series. Empty = all. |
 | **Series** | Batch Size (Series) | How many series to process per click |

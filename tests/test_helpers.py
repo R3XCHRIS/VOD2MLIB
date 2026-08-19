@@ -1318,3 +1318,99 @@ class TestParseCategoryFilter:
 
     def test_drops_empty_segments(self, p):
         assert p._parse_category_filter("[EN],,, [FR] ,") == ["[EN]", "[FR]"]
+
+
+# ---------- _write_if_different_preserve_times (v1.16.1, issue #11) ----------
+
+class TestWriteIfDifferentPreserveTimes:
+    """Media servers key "has this changed?" off mtime, so a no-op rewrite made
+    Emby/Jellyfin re-index the whole library every rescan. Tests adapted from
+    the patch @bruor supplied on issue #11."""
+
+    def test_creates_new_file_when_missing(self, p, tmp_path):
+        target = tmp_path / "subdir" / "test.strm"
+        res = p._write_if_different_preserve_times(str(target), "http://example.com/a.strm")
+        assert res is True
+        assert target.read_text(encoding="utf-8") == "http://example.com/a.strm"
+
+    def test_skips_write_and_preserves_mtime_when_identical(self, p, tmp_path):
+        target = tmp_path / "test.strm"
+        content = "http://example.com/a.strm"
+        target.write_text(content, encoding="utf-8")
+        past = os.stat(str(target)).st_mtime - 3600
+        os.utime(str(target), (past, past))
+
+        assert p._write_if_different_preserve_times(str(target), content) is False
+        assert os.stat(str(target)).st_mtime == past
+
+    def test_ignores_trailing_whitespace_differences(self, p, tmp_path):
+        target = tmp_path / "test.strm"
+        target.write_text("http://example.com/a.strm\n\n", encoding="utf-8")
+        past = os.stat(str(target)).st_mtime - 3600
+        os.utime(str(target), (past, past))
+
+        assert p._write_if_different_preserve_times(str(target), "http://example.com/a.strm") is False
+        assert os.stat(str(target)).st_mtime == past
+
+    def test_updates_content_but_restores_mtime_when_changed(self, p, tmp_path):
+        target = tmp_path / "test.strm"
+        target.write_text("http://example.com/OLD.strm", encoding="utf-8")
+        past = os.stat(str(target)).st_mtime - 3600
+        os.utime(str(target), (past, past))
+
+        new = "http://example.com/NEW.strm"
+        assert p._write_if_different_preserve_times(str(target), new) is True
+        assert target.read_text(encoding="utf-8") == new
+        # URL updated, but the media server sees no mtime change -> no re-index.
+        assert os.stat(str(target)).st_mtime == past
+
+
+# ---------- TMDB folder tag format (v1.16.1, issue #9) ----------
+
+class TestTmdbTagFormat:
+    class _M:
+        tmdb_id = "378"
+
+    def test_defaults_to_plex_braces(self, p):
+        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", self._M(), True) == \
+            "Cool Hand Luke (1967) {tmdb-378}"
+
+    def test_explicit_plex(self, p):
+        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", self._M(), True, "plex") == \
+            "Cool Hand Luke (1967) {tmdb-378}"
+
+    def test_jellyfin_bracket_tmdbid(self, p):
+        assert p._apply_tmdb_suffix("Cool Hand Luke (1967)", self._M(), True, "jellyfin") == \
+            "Cool Hand Luke (1967) [tmdbid-378]"
+
+    def test_format_is_case_insensitive_and_trimmed(self, p):
+        assert p._apply_tmdb_suffix("X (2000)", self._M(), True, "  JellyFin ") == "X (2000) [tmdbid-378]"
+
+    def test_unknown_format_falls_back_to_plex(self, p):
+        assert p._apply_tmdb_suffix("X (2000)", self._M(), True, "kodi") == "X (2000) {tmdb-378}"
+
+    def test_toggle_off_ignores_format(self, p):
+        assert p._apply_tmdb_suffix("X (2000)", self._M(), False, "jellyfin") == "X (2000)"
+
+    def test_missing_tmdb_id_adds_nothing(self, p):
+        class NoId:
+            tmdb_id = ""
+        assert p._apply_tmdb_suffix("X (2000)", NoId(), True, "jellyfin") == "X (2000)"
+
+    def test_movie_target_path_uses_jellyfin_format(self, p):
+        class M:
+            id = 1; uuid = "u"; name = "Cool Hand Luke (1967)"; year = 1967; tmdb_id = "378"
+        folder, _, _, _ = p._movie_target_paths(
+            M(), "/VODS/Movies", category_name="", nest=False,
+            append_tmdb_id=True, tmdb_tag_format="jellyfin",
+        )
+        assert folder == "/VODS/Movies/Cool Hand Luke (1967) [tmdbid-378]"
+
+    def test_series_target_folder_uses_jellyfin_format(self, p):
+        class S:
+            id = 1; uuid = "u"; name = "Breaking Bad (2008)"; year = 2008; tmdb_id = "1396"
+        folder, _, _ = p._series_target_folder(
+            S(), "/VODS/Series", category_name="", nest=False,
+            append_tmdb_id=True, tmdb_tag_format="jellyfin",
+        )
+        assert folder == "/VODS/Series/Breaking Bad (2008) [tmdbid-1396]"

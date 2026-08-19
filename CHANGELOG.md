@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.16.1 — stop media servers re-indexing on every rescan; Jellyfin-format TMDB tags
+
+Two bug fixes, both reported from the field.
+
+- **`.strm` files are no longer rewritten when nothing changed, and keep their mtime when they do** ([#11](https://github.com/R3XCHRIS/VOD2MLIB/issues/11), reported **with a patch** by **@bruor**). Since v1.13.0 the refresh paths rewrote every `.strm` so a changed Dispatcharr URL would propagate. But rewriting bumps the file's mtime, and media servers use mtime to decide "has this changed?" — so every nightly rescan made Emby (and Jellyfin) re-index the *entire* library despite not a byte differing.
+
+  Now the plugin compares contents first: identical files are left completely untouched, and when a URL genuinely does change the file is written and its **original mtime restored**. The new URL is still honoured — players read the `.strm` at playback time, not from the index — but the media server has no reason to re-scan.
+
+  Two nice side effects: a no-change rescan is now dramatically cheaper (no writes at all), and the run summary reports `.strm refreshed` (URL actually changed) separately from `.strm unchanged`, so you can see at a glance whether a rescan did anything.
+
+- **TMDB folder tags can now use the Jellyfin/Emby convention** ([#9](https://github.com/R3XCHRIS/VOD2MLIB/issues/9), thanks **@vayan**). `Append TMDB ID to folder names` only ever wrote Plex/ChannelsDVR-style `{tmdb-123}`, which Jellyfin and Emby ignore — they expect `[tmdbid-123]`. Since most of this plugin's users are on Jellyfin/Emby (Plex can't play `.strm` at all), that made the setting a no-op for the majority.
+
+  New **`TMDB Folder Tag Format`** setting picks the convention: `Plex / ChannelsDVR — {tmdb-123}` (default) or `Jellyfin / Emby — [tmdbid-123]`. Default stays Plex so existing libraries don't get renamed; **Jellyfin/Emby users should switch it**. ⚠ Changing the format writes new folder names alongside the old ones — `[⚠ DANGER] Clean up` + re-generate to migrate cleanly.
+
+No settings migration; both defaults preserve existing behaviour. 13 new unit tests (194 total, was 181).
+
 ## v1.16.0 — language-prefix formats, category filter, optional stream_id omission
 
 Three community-requested features, all opt-in / backwards-compatible.

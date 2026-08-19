@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.16.0",
+  "version": "1.16.1",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -91,7 +91,18 @@
       "label": "Append TMDB ID to folder names",
       "type": "boolean",
       "default": false,
-      "help_text": "Append `{tmdb-NNN}` to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex's Personal Media agent and ChannelsDVR's local-media scraper both honour this convention for forced exact matches. ⚠ MIGRATION: the plugin does NOT rename existing folders in place — turning this on (or off) for an already-generated library writes the new folder names ALONGSIDE the old ones, creating duplicates. To switch cleanly, run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate; or accept the duplicates until the old folders age out."
+      "help_text": "Append a TMDB id tag to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Media servers honour this as a forced exact match, which is the safest defence against name collisions and bad metadata scrapes. Pick the convention your server expects with `TMDB Folder Tag Format` below. ⚠ MIGRATION: the plugin does NOT rename existing folders in place — turning this on (or off) for an already-generated library writes the new folder names ALONGSIDE the old ones, creating duplicates. To switch cleanly, run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate; or accept the duplicates until the old folders age out."
+    },
+    {
+      "id": "tmdb_tag_format",
+      "label": "TMDB Folder Tag Format",
+      "type": "select",
+      "default": "plex",
+      "options": [
+        {"value": "plex", "label": "Plex / ChannelsDVR — {tmdb-123}"},
+        {"value": "jellyfin", "label": "Jellyfin / Emby — [tmdbid-123]"}
+      ],
+      "help_text": "Which convention to use for the TMDB folder tag — media servers disagree, and each ignores the other's format. `Plex / ChannelsDVR` writes `Cool Hand Luke (1967) {tmdb-378}`; `Jellyfin / Emby` writes `Cool Hand Luke (1967) [tmdbid-378]`. Only has an effect when `Append TMDB ID to folder names` is ON. Defaults to Plex for backwards compatibility with libraries generated before v1.16.1 — if you use Jellyfin or Emby, switch this to `jellyfin` or the tag is silently ignored by your server. ⚠ MIGRATION: changing the format renames every folder, and the plugin does NOT rename in place — the new names are written ALONGSIDE the old ones. Run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate."
     },
     {
       "id": "omit_stream_id",

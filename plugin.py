@@ -1,10 +1,11 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.16.0 — language-prefix stripping for pipe / space / bullet formats
-          (EN|, EN, ▪NL▪); new Category Filter (include-only) to limit
-          generation to chosen languages/categories; option to omit
-          ?stream_id= from .strm URLs for provider failover (#6, #3, #5).
+v1.16.1 — only rewrite .strm files whose URL actually changed, and
+          preserve mtime when they do, so media servers stop re-indexing
+          the whole library on every rescan (#11); selectable TMDB folder
+          tag format — [tmdbid-N] for Jellyfin/Emby vs {tmdb-N} for
+          Plex/ChannelsDVR (#9).
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -22,7 +23,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.16.0"
+    version = "1.16.1"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -183,7 +184,18 @@ class Plugin:
             "label": "Append TMDB ID to folder names",
             "type": "boolean",
             "default": False,
-            "help_text": "Append `{tmdb-NNN}` to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Plex's Personal Media agent and ChannelsDVR's local-media scraper both honour this convention for forced exact matches, which is the safest defence against name collisions and bad metadata scrapes. ⚠ MIGRATION: the plugin does NOT rename existing folders in place — turning this on (or off) for an already-generated library writes the new folder names ALONGSIDE the old ones, creating duplicates. To switch cleanly, run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate; or accept the duplicates until the old folders age out."
+            "help_text": "Append a TMDB id tag to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Media servers honour this as a forced exact match, which is the safest defence against name collisions and bad metadata scrapes. Pick the convention your server expects with `TMDB Folder Tag Format` below. ⚠ MIGRATION: the plugin does NOT rename existing folders in place — turning this on (or off) for an already-generated library writes the new folder names ALONGSIDE the old ones, creating duplicates. To switch cleanly, run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate; or accept the duplicates until the old folders age out."
+        },
+        {
+            "id": "tmdb_tag_format",
+            "label": "TMDB Folder Tag Format",
+            "type": "select",
+            "default": "plex",
+            "options": [
+                {"value": "plex", "label": "Plex / ChannelsDVR — {tmdb-123}"},
+                {"value": "jellyfin", "label": "Jellyfin / Emby — [tmdbid-123]"}
+            ],
+            "help_text": "Which convention to use for the TMDB folder tag — media servers disagree, and each ignores the other's format. `Plex / ChannelsDVR` writes `Cool Hand Luke (1967) {tmdb-378}`; `Jellyfin / Emby` writes `Cool Hand Luke (1967) [tmdbid-378]`. Only has an effect when `Append TMDB ID to folder names` is ON. Defaults to Plex for backwards compatibility with libraries generated before v1.16.1 — if you use Jellyfin or Emby, switch this to `jellyfin` or the tag is silently ignored by your server. ⚠ MIGRATION: changing the format renames every folder, and the plugin does NOT rename in place — the new names are written ALONGSIDE the old ones. Run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate."
         },
         {
             "id": "omit_stream_id",
@@ -501,7 +513,7 @@ class Plugin:
             return "Unassigned"
         return self._sanitize_filename(cat)
 
-    def _movie_target_paths(self, movie, root_folder: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False):
+    def _movie_target_paths(self, movie, root_folder: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False, tmdb_tag_format: str = "plex"):
         """Compute the (folder_path, strm_filename, clean_name, year) for a movie.
 
         When nest=True the folder is wrapped in a category subfolder named
@@ -523,7 +535,7 @@ class Plugin:
         else:
             base_name = safe
             strm_filename = f"{safe}.strm"
-        folder_name = self._apply_tmdb_suffix(base_name, movie, append_tmdb_id)
+        folder_name = self._apply_tmdb_suffix(base_name, movie, append_tmdb_id, tmdb_tag_format)
         cat_segment = self._category_subfolder(category_name, nest)
         if cat_segment:
             folder_path = os.path.join(root_folder, cat_segment, folder_name)
@@ -609,21 +621,28 @@ class Plugin:
             return base
         return f"{base}?stream_id={stream_id}"
 
-    def _apply_tmdb_suffix(self, base_name: str, obj, append_tmdb_id: bool) -> str:
-        """Append `{tmdb-NNN}` to a folder base name when the toggle is on and
+    def _apply_tmdb_suffix(self, base_name: str, obj, append_tmdb_id: bool, tag_format: str = "plex") -> str:
+        """Append a TMDB id tag to a folder base name when the toggle is on and
         the object exposes a tmdb_id. Returns unchanged otherwise.
 
-        Plex's [Personal Media Movies] agent treats `{tmdb-N}` / `{imdb-ttN}`
-        as a forced-match override. ChannelsDVR's local-media scraper does the
-        same. Off by default since flipping the toggle changes existing folder
-        names — users would need to clean up the old folders or accept the new
-        ones living alongside.
+        The two media-server ecosystems use different conventions, and each
+        ignores the other's (issue #9):
+
+          * `plex`     -> `Title (Year) {tmdb-123}`   — Plex's Personal Media
+            agent and ChannelsDVR's local-media scraper.
+          * `jellyfin` -> `Title (Year) [tmdbid-123]` — Jellyfin and Emby.
+
+        Defaults to `plex` because that's what pre-v1.16.1 releases emitted;
+        changing an existing library's tag format renames every folder, so the
+        switch has to be opt-in (see the setting's migration note).
         """
         if not append_tmdb_id:
             return base_name
         tmdb_id = (getattr(obj, "tmdb_id", "") or "").strip()
         if not tmdb_id:
             return base_name
+        if (tag_format or "plex").strip().lower() == "jellyfin":
+            return f"{base_name} [tmdbid-{tmdb_id}]"
         return f"{base_name} {{tmdb-{tmdb_id}}}"
 
     def _generate_movies(self, settings: Dict[str, Any], logger, refresh_urls: bool = False):
@@ -645,6 +664,7 @@ class Plugin:
         nest_by_cat = bool(settings.get("nest_movies_by_category", False))
         dedupe_across_cats = bool(settings.get("dedupe_movies_across_categories", False))
         append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
+        tmdb_tag_format = (settings.get("tmdb_tag_format") or "plex").strip().lower()
         omit_stream_id = bool(settings.get("omit_stream_id", False))
         category_filter = (settings.get("category_filter") or "").strip()
 
@@ -661,7 +681,7 @@ class Plugin:
             "Refresh Existing": "Yes" if refresh_existing else "No",
             "Nest by category": "Yes" if nest_by_cat else "No",
             "Dedupe across cats": "Yes" if dedupe_across_cats else "No",
-            "Append TMDB ID": "Yes" if append_tmdb_id else "No",
+            "Append TMDB ID": ("Yes (%s)" % tmdb_tag_format) if append_tmdb_id else "No",
             "Category filter": category_filter or "(all)",
         })
 
@@ -703,6 +723,7 @@ class Plugin:
 
         created_strm = 0
         refreshed_strm = 0
+        unchanged_strm = 0
         created_nfo = 0
         skipped = 0
         deduped = 0
@@ -728,7 +749,7 @@ class Plugin:
                 seen_movie_uuids.add(movie.uuid)
             cat_name = relation.category.name if relation.category else ""
             movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
-                movie, root_folder, cat_name, nest_by_cat, append_tmdb_id,
+                movie, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
             )
             strm_path = os.path.join(movie_folder, strm_filename)
             is_existing = os.path.exists(strm_path)
@@ -749,9 +770,10 @@ class Plugin:
 
             try:
                 os.makedirs(movie_folder, exist_ok=True)
-                with open(strm_path, 'w', encoding='utf-8') as f:
-                    f.write(proxy_url)
-                if is_existing:
+                changed = self._write_if_different_preserve_times(strm_path, proxy_url)
+                if not changed:
+                    unchanged_strm += 1
+                elif is_existing:
                     refreshed_strm += 1
                 else:
                     created_strm += 1
@@ -768,14 +790,20 @@ class Plugin:
                         wrote_nfo = True
 
                 if log_this:
-                    logger.info("  ✓ wrote .strm%s", " + .nfo" if wrote_nfo else "")
+                    if changed:
+                        logger.info("  ✓ wrote .strm%s", " + .nfo" if wrote_nfo else "")
+                    else:
+                        logger.info("  · .strm already current (mtime preserved)%s", " + wrote .nfo" if wrote_nfo else "")
             except OSError as e:
                 logger.error("  ✗ %s: %s", movie_name, e)
                 errors += 1
 
             if batch_size != "all":
+                # In refresh mode an already-current file still counts as
+                # "processed" for pacing, so the batch limit behaves as it did
+                # before no-op writes were skipped (#11).
                 limit_hit = (
-                    (refreshed_strm + created_strm) >= target_batch
+                    (refreshed_strm + created_strm + unchanged_strm) >= target_batch
                     if refresh_existing
                     else created_strm >= target_batch
                 )
@@ -797,7 +825,8 @@ class Plugin:
             logger.info("  Deduped (multi-cat): %d", deduped)
         logger.info("  .strm created:   %d", created_strm)
         if refresh_existing:
-            logger.info("  .strm refreshed: %d", refreshed_strm)
+            logger.info("  .strm refreshed: %d  (URL changed)", refreshed_strm)
+            logger.info("  .strm unchanged: %d  (skipped, mtime preserved)", unchanged_strm)
         if generate_nfo:
             logger.info("  .nfo created:    %d", created_nfo)
         logger.info("  Errors:          %d", errors)
@@ -806,6 +835,8 @@ class Plugin:
         summary_msg = f"Wrote {created_strm} new .strm files"
         if refresh_existing and refreshed_strm:
             summary_msg += f", refreshed {refreshed_strm}"
+        if refresh_existing and unchanged_strm:
+            summary_msg += f", {unchanged_strm} already current"
         if generate_nfo and created_nfo:
             summary_msg += f" + {created_nfo} .nfo"
         if skipped:
@@ -820,13 +851,14 @@ class Plugin:
             "scanned": scanned,
             "created_strm": created_strm,
             "refreshed_strm": refreshed_strm,
+            "unchanged_strm": unchanged_strm,
             "created_nfo": created_nfo if generate_nfo else 0,
             "skipped": skipped,
             "deduped": deduped,
             "errors": errors,
         }
     
-    def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False):
+    def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False, tmdb_tag_format: str = "plex"):
         """Compute the target folder for a series. Returns (folder_path, clean_name, year).
 
         When nest=True the folder is wrapped in a category subfolder named
@@ -843,7 +875,7 @@ class Plugin:
         clean_name, year = self._strip_redundant_trailing_year(clean_name, year)
         safe = self._sanitize_filename(clean_name)
         base_name = f"{safe} ({year})" if year else safe
-        folder_name = self._apply_tmdb_suffix(base_name, series, append_tmdb_id)
+        folder_name = self._apply_tmdb_suffix(base_name, series, append_tmdb_id, tmdb_tag_format)
         cat_segment = self._category_subfolder(category_name, nest)
         if cat_segment:
             return os.path.join(series_root, cat_segment, folder_name), clean_name, year
@@ -871,6 +903,7 @@ class Plugin:
         nest_by_cat = bool(settings.get("nest_series_by_category", False))
         dedupe_across_cats = bool(settings.get("dedupe_series_across_categories", False))
         append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
+        tmdb_tag_format = (settings.get("tmdb_tag_format") or "plex").strip().lower()
         omit_stream_id = bool(settings.get("omit_stream_id", False))
         category_filter = (settings.get("category_filter") or "").strip()
 
@@ -951,7 +984,7 @@ class Plugin:
             if not refresh_existing:
                 cat_name = series_rel.category.name if series_rel.category else ""
                 folder, _, _ = self._series_target_folder(
-                    series_rel.series, series_root, cat_name, nest_by_cat, append_tmdb_id,
+                    series_rel.series, series_root, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
                 )
                 if self._series_already_processed(folder):
                     continue
@@ -1004,6 +1037,7 @@ class Plugin:
                     nest_by_cat,
                     append_tmdb_id,
                     omit_stream_id,
+                    tmdb_tag_format,
                 ): series_rel
                 for series_rel in to_process
             }
@@ -1076,7 +1110,7 @@ class Plugin:
             "failures": failures,
         }
 
-    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False):
+    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False, tmdb_tag_format="plex"):
         """Process a single series. Idempotent: writes only missing episode files.
 
         With refresh_existing=False, callers should pre-filter already-done
@@ -1093,7 +1127,7 @@ class Plugin:
         series = series_rel.series
         cat_name = series_rel.category.name if series_rel.category else ""
         series_folder, series_name, _year = self._series_target_folder(
-            series, series_root, cat_name, nest_by_cat, append_tmdb_id,
+            series, series_root, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
         )
 
         try:
@@ -1133,6 +1167,7 @@ class Plugin:
 
             new_episodes = 0
             refreshed_episodes = 0
+            unchanged_episodes = 0
             new_nfo = 0
 
             if generate_nfo:
@@ -1169,9 +1204,12 @@ class Plugin:
                 proxy_url = self._build_proxy_url(
                     dispatcharr_url, "episode", episode.uuid, episode_rel.stream_id, omit_stream_id,
                 )
-                with open(strm_path, 'w', encoding='utf-8') as f:
-                    f.write(proxy_url)
-                if is_existing:
+                # Only write when the URL actually changed, preserving mtime so
+                # media servers don't re-index the whole library (#11).
+                changed = self._write_if_different_preserve_times(strm_path, proxy_url)
+                if not changed:
+                    unchanged_episodes += 1
+                elif is_existing:
                     refreshed_episodes += 1
                 else:
                     new_episodes += 1
@@ -1190,6 +1228,7 @@ class Plugin:
                     "series_name": series_name,
                     "episodes": 0,
                     "refreshed": 0,
+                    "unchanged": unchanged_episodes,
                     "nfo_files": new_nfo,
                     "message": f"{series_name} - up-to-date ({episode_count} episodes on disk)",
                 }
@@ -1207,6 +1246,7 @@ class Plugin:
                 "series_name": series_name,
                 "episodes": new_episodes,
                 "refreshed": refreshed_episodes,
+                "unchanged": unchanged_episodes,
                 "nfo_files": new_nfo,
                 "message": msg,
             }
@@ -1754,6 +1794,57 @@ class Plugin:
         name = name.rstrip('. ')
 
         return name or "Unknown"
+
+    def _write_if_different_preserve_times(self, path: str, new_contents: str) -> bool:
+        """Write a .strm only when its contents actually change, preserving the
+        original mtime when updating an existing file.
+
+        Returns True if the file was created or updated, False if it was left
+        untouched.
+
+        Why: since v1.13.0 the refresh paths rewrite every .strm so a changed
+        Dispatcharr URL propagates. Rewriting bumps the mtime, and media
+        servers key their "has this file changed?" check on mtime — so every
+        nightly rescan made Emby/Jellyfin re-index the entire library even
+        though not a byte differed. Skipping no-op writes fixes that (and makes
+        a no-change rescan dramatically cheaper); restoring the original mtime
+        covers the genuine-URL-change case, where the new URL still needs to be
+        picked up but the media server has no reason to re-scan — players read
+        the .strm at playback time, not from the index.
+
+        Reported with a patch by @bruor (issue #11).
+        """
+        dir_path = os.path.dirname(path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+
+        if not os.path.exists(path):
+            # Genuinely new file — a fresh mtime is correct here.
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(new_contents)
+            return True
+
+        orig_mtime = os.stat(path).st_mtime
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                current = f.read()
+        except OSError:
+            current = None
+
+        # Tolerate trailing-whitespace differences so files written by older
+        # versions (or hand-edited) don't count as changed.
+        if current is not None and current.strip() == new_contents.strip():
+            return False
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_contents)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Restore the original mtime so the media server doesn't re-index.
+        os.utime(path, (os.stat(path).st_atime, orig_mtime))
+        return True
 
     def _rescan_all(self, settings: Dict[str, Any], logger):
         """Combined scan + generate movies + generate series. Used by the cron schedule.
