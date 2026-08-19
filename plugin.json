@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.17.0",
+  "version": "1.18.0",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -73,6 +73,13 @@
       "help_text": "Create .nfo metadata files alongside each movie .strm."
     },
     {
+      "id": "nfo_omit_title",
+      "label": "Omit <title> from NFO files",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Leave the `<title>` element OUT of generated movie and tvshow NFO files. Jellyfin (and Emby) treat a `<title>` in the NFO as authoritative and will NOT override it from TMDB — so if your provider prefixes titles with tags like `4K-A+`, `EN-TOP` or `AMZ`, that junk becomes the displayed name. With this ON the plugin still writes the NFO (IDs, plot, genres, rating, poster) but omits the title, letting your media server take the clean title from TMDB via the `<tmdbid>` we already emit. OFF by default (unchanged behaviour). Note v1.18.0 also cleans provider junk out of the title, so try that first — this is the belt-and-braces option. Episode NFOs always keep their title (media servers match episodes by season/episode number)."
+    },
+    {
       "id": "nest_movies_by_category",
       "label": "Nest Movies by Category",
       "type": "boolean",
@@ -141,9 +148,12 @@
         {"value": "5", "label": "5 series"},
         {"value": "10", "label": "10 series"},
         {"value": "25", "label": "25 series"},
-        {"value": "all", "label": "All series (slow!)"}
+        {"value": "50", "label": "50 series"},
+        {"value": "100", "label": "100 series"},
+        {"value": "250", "label": "250 series"},
+        {"value": "all", "label": "All series (may time out — use the schedule)"}
       ],
-      "help_text": "Number of series to process. Episodes are auto-fetched per series."
+      "help_text": "Number of series to process per click (episodes are auto-fetched for each, so series are much slower than movies). ⚠ This button runs synchronously and your reverse proxy will usually cut it off after ~60s with a 504 — the run keeps going server-side, but you lose the result. For a big catalogue don't use 'All' here: set the cron to 'Full rescan' and click [SCHEDULE] Apply / Update. Scheduled runs execute on the Celery worker with no HTTP timeout."
     },
     {
       "id": "generate_series_nfo",

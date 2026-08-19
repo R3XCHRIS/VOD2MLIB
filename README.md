@@ -7,7 +7,7 @@
 <p align="center">A Dispatcharr plugin that turns your VOD catalogue into a folder of <code>.strm</code> files (with optional NFO metadata) that media servers — Jellyfin, Emby, Kodi, ChannelsDVR — can index and play.</p>
 
 <p align="center">
-  <i>v1.17.0 — slug <code>vod2mlib</code></i>
+  <i>v1.18.0 — slug <code>vod2mlib</code></i>
 </p>
 
 > **Note on scheduled rescans.** The cron task routes via Dispatcharr's `dvr` Celery worker as a workaround for an upstream plugin-task-registration issue affecting the default prefork worker pool ([Dispatcharr#1244](https://github.com/Dispatcharr/Dispatcharr/issues/1244)). The routing is transparent — no user action required for new installs. If you originally set up your schedule on **v1.14.1 or earlier**, click `[SCHEDULE] Apply / Update` once after upgrading so the stored task picks up the new routing.
@@ -121,6 +121,7 @@ The Settings tab is grouped into four sections:
 |  | Dispatcharr URL | Externally-reachable URL of Dispatcharr (NOT `localhost`). Baked into every `.strm`. |
 | **Movies** | Batch Size | How many movies to process per click |
 |  | Generate Movie NFO Files | Toggle Kodi/Jellyfin metadata generation |
+|  | Omit `<title>` from NFO files | Leave the title out of movie/tvshow NFOs so Jellyfin/Emby take it from TMDB instead. Useful when your provider prefixes titles (`4K-A+`, `EN-TOP`, `AMZ`) — Jellyfin treats an NFO `<title>` as authoritative and won't override it. Off by default. |
 |  | Nest Movies by Category | Wrap each movie folder inside a subfolder named by its M3U category (off by default; movies without a category go to `Unassigned/`) |
 |  | Dedupe Movies Across Categories | When nesting is ON and a movie is tagged with multiple categories upstream, write under the first category only (alphabetical) instead of duplicating. No effect when nesting is OFF. Off by default (preserves 4K-vs-HD variant-stream behaviour). ⚠ Doesn't remove existing duplicate folders — `[⚠ DANGER] Clean up` + re-generate to migrate. |
 |  | Append TMDB ID to folder names | Append a TMDB id tag to Movie *and* Series folder names when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Media servers honour this as a forced exact metadata match. Off by default. ⚠ Doesn't rename existing folders in place — writes new names alongside the old ones; `[⚠ DANGER] Clean up` + re-generate to migrate cleanly. |
@@ -191,6 +192,10 @@ services:
 ```
 
 Closed [Dispatcharr#973](https://github.com/Dispatcharr/Dispatcharr/pull/973) would be the complementary write-side root fix (preserves UUIDs across refresh instead of just tolerating the orphaning); it's stalled and needs reviving. This note will be removed once a tagged Dispatcharr release contains the fix.
+
+**Jellyfin/Emby downloads tens of GB of images after adding a VOD library.** Not a plugin issue, but it catches people out: media servers fetch artwork for *every* item, and a 30k-title VOD library can pull 70 GB+. Before scanning a large VOD library, turn image downloading down or off for that library — in Jellyfin: Dashboard → Libraries → (your VOD library) → Manage Library, uncheck the image fetchers you don't need (backdrops/thumbs are the big ones). If you've already been hit, delete the cached images and re-scan with the fetchers off.
+
+**Want to curate rather than import everything?** [VodLink](https://github.com/Freyguy1975) (by Freyguy1975, from the Dispatcharr Discord) reads this plugin's `.strm` + `.nfo` output and lets you hand-pick which movies/series get into a curated folder your media server points at — genres and ratings come from the NFOs this plugin writes, so keep `Generate NFO Files` ON if you use it. For coarser filtering, `Category Filter` / `Category Exclude` (above) work at generation time.
 
 **"All profiles at capacity" error when playing on TiviMate / Android.** Not a `.strm` issue — this is a known Dispatcharr connection-counting bug ([Dispatcharr #451](https://github.com/Dispatcharr/Dispatcharr/issues/451)). TiviMate (and similar Android players) makes multiple simultaneous Range requests to probe a file before playback; Dispatcharr counts each request as a separate provider connection, blowing through `max_streams=1` before playback even starts. The community plugin [`dispatcharr_vod_fix`](https://github.com/cedric-marcoux/dispatcharr_vod_fix) patches Dispatcharr's request handling to track slots by (client IP + content UUID) so multiple Range requests share one slot. Install it alongside this plugin if your Android clients can't play VOD content.
 

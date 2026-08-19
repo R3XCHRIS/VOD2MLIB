@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.18.0 — NFO titles your media server can actually match
+
+Everything here came out of the Dispatcharr Discord thread. No breaking changes; nothing needs re-generating.
+
+- **Provider tags are stripped from NFO titles.** Titles like `4K-A+ Blade Runner 2049`, `|EN| The Matrix` or `[4K] Dune (2025)` were written into `<title>` verbatim, and since Jellyfin/Emby treat an NFO title as authoritative, the item stayed mis-titled no matter what TMDB said. Leading provider tags (`A+`, `4K-A+`, `|EN|`, `[4K]`), edge quality tokens and trailing years are now removed.
+
+  Every step is anchored to the start or end of the title, deliberately gentler than the folder-name cleanup, and the result was checked against a live 6,877-title catalogue: 0 titles emptied, and the only non-year changes were correct ones. Names that look like junk but aren't all survive — `Love+War`, `Genera+ion`, `NTSF:SD:SUV::`, `WWII in HD`, `Chicago P.D.`, `Marvel's Agents of S.H.I.E.L.D.`, `[REC] 2`, `Blade Runner 2049`, `Bali 2002`.
+
+- **New `Omit <title> from NFO files` setting** (off by default). If your provider's naming is too mangled for any cleanup to rescue, turn this on: movie and tvshow NFOs are written without a `<title>` element at all, so Jellyfin/Emby fall back to matching on the folder name and take the title from TMDB. Episode NFOs always keep their title — an episode has nothing else to identify it by.
+
+- **Duplicate episodes are collapsed** (reported by **rammboslice**). When the same episode is reachable through more than one M3U relation, the plugin was writing a `.strm` per relation; with `Omit stream_id from URLs` on, those files resolve to identical URLs — so you'd get `S01E05`, `S01E05 (2)`, and so on, all playing the same thing. Episodes are now deduplicated by episode UUID before writing, keeping the first relation in a stable order, and the run log says `collapsed N duplicate episode relation(s)` when it happens.
+
+- **Bigger series batch sizes** — 50, 100 and 250 join the existing options, for people running large libraries who don't want to click Generate a dozen times. The help text now warns that anything past ~25 risks the UI 504 (the job keeps running server-side regardless) and points at the schedule as the better answer for a full library.
+
+- **Missing TMDB IDs are now reported.** With `Append TMDB ID to folder names` on, items lacking a TMDB ID in Dispatcharr were silently written without a tag, which looks like the setting is broken. The summary now counts them: `N item(s) had no TMDB ID`.
+
+23 new unit tests (224 total, was 201).
+
 ## v1.17.0 — Category Exclude, and Scan tells you what your filter actually matches
 
 Follow-up to [#8](https://github.com/R3XCHRIS/VOD2MLIB/issues/8) (thanks **@logand99**), where a Category Filter appeared to do nothing.

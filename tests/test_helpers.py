@@ -1448,3 +1448,147 @@ class TestMatchesCategoryPrefixes:
         # matched. The exclude-list is the right tool for their goal.
         assert p._matches_category_prefixes("FOR ADULTS (movie)", ["|EN|"]) is False
         assert p._matches_category_prefixes("FOR ADULTS (movie)", ["FOR ADULTS"]) is True
+
+
+# ---------- NFO title cleanup + omission (v1.18.0, matrix26) ----------
+
+class TestCleanNfoTitle:
+    def test_strips_plus_provider_tag(self, p):
+        assert p._clean_nfo_title("4K-A+ The Matrix") == "The Matrix"
+        assert p._clean_nfo_title("A+ Some Film") == "Some Film"
+
+    def test_strips_quality_tokens_like_folder_names(self, p):
+        # Previously NFO titles only got the language-prefix strip, so these survived.
+        assert p._clean_nfo_title("Whiplash 1080p HEVC") == "Whiplash"
+        assert p._clean_nfo_title("Dune 4K UHD HDR") == "Dune"
+
+    def test_strips_language_prefixes(self, p):
+        assert p._clean_nfo_title("EN - Inception") == "Inception"
+        assert p._clean_nfo_title("EN| Alita: Battle Angel") == "Alita: Battle Angel"
+
+    def test_drops_year_from_title(self, p):
+        assert p._clean_nfo_title("The Matrix (1999)") == "The Matrix"
+        # A bare trailing year is only dropped when it IS the known year.
+        assert p._clean_nfo_title("Wicked: For Good - 2025", 2025) == "Wicked: For Good"
+
+    def test_real_titles_containing_a_plus_survive(self, p):
+        # Found by sweeping the live catalogue: the plus-tag regex used to
+        # eat these down to "War" and "ion".
+        assert p._clean_nfo_title("Love+War (2025)", 2025) == "Love+War"
+        assert p._clean_nfo_title("Genera+ion") == "Genera+ion"
+
+    def test_interior_quality_tokens_are_left_alone(self, p):
+        # "NTSF:SD:SUV::" is a real show — the interior SD is part of it.
+        assert p._clean_nfo_title("NTSF:SD:SUV::") == "NTSF:SD:SUV::"
+        # ...but edge tokens still go.
+        assert p._clean_nfo_title("FHD The Matrix") == "The Matrix"
+        assert p._clean_nfo_title("The Matrix 1080p") == "The Matrix"
+        assert p._clean_nfo_title("The Matrix 4K") == "The Matrix"
+
+    def test_trailing_quality_token_that_is_part_of_the_name(self, p):
+        # "WWII in HD" is a real series; stripping HD leaves a dangling "in".
+        assert p._clean_nfo_title("WWII in HD") == "WWII in HD"
+
+    def test_trailing_punctuation_in_real_names_is_preserved(self, p):
+        for name in ("Chicago P.D.", "Magnum P.I.", "Lockwood & Co.",
+                     "Marvel's Agents of S.H.I.E.L.D.", "Drugs, Inc.",
+                     "Doogie Howser, M.D.", "I Am..."):
+            assert p._clean_nfo_title(name) == name
+
+    def test_year_in_title_is_not_confused_with_release_year(self, p):
+        assert p._clean_nfo_title("Bali 2002", 2022) == "Bali 2002"
+        assert p._clean_nfo_title("Breakdown 1975 (2025)", 2025) == "Breakdown 1975"
+        assert p._clean_nfo_title("1923") == "1923"
+
+    def test_repeated_trailing_year_is_stripped(self, p):
+        assert p._clean_nfo_title("A Costa Rican Wedding (2025) (2025)", 2025) == "A Costa Rican Wedding"
+        assert p._clean_nfo_title("180 (2026) (2026)", 2026) == "180"
+
+    def test_strips_leading_delimited_tags(self, p):
+        assert p._clean_nfo_title("|EN| The Matrix") == "The Matrix"
+        assert p._clean_nfo_title("[4K] The Matrix") == "The Matrix"
+        assert p._clean_nfo_title("(MULTI) Dune") == "Dune"
+        assert p._clean_nfo_title("|EN| [4K] Sicario") == "Sicario"
+
+    def test_keeps_titles_that_are_themselves_bracketed(self, p):
+        # "[REC]" and "[REC] 2" must not be gutted down to "" or "2".
+        assert p._clean_nfo_title("[REC]") == "[REC]"
+        assert p._clean_nfo_title("[REC] 2") == "[REC] 2"
+
+    def test_bare_trailing_year_kept_when_it_is_part_of_the_title(self, p):
+        # Blade Runner 2049 released in 2017 — 2049 is the title, not the year.
+        assert p._clean_nfo_title("Blade Runner 2049", 2017) == "Blade Runner 2049"
+        # And with no year known we never guess.
+        assert p._clean_nfo_title("Blade Runner 2049") == "Blade Runner 2049"
+
+    def test_preserves_real_titles_with_hyphens_and_digits(self, p):
+        # The danger zone: these must NOT be treated as provider tags.
+        for title in ("X-Men First Class", "AC-130", "MI-5", "Blade Runner 2049", "Se7en"):
+            assert p._clean_nfo_title(title) == title
+
+    def test_never_returns_empty(self, p):
+        # A title made entirely of quality tokens must still yield something.
+        assert p._clean_nfo_title("4K") != ""
+
+    def test_empty_input(self, p):
+        assert p._clean_nfo_title("") == ""
+        assert p._clean_nfo_title(None) is None
+
+
+class TestNfoOmitTitle:
+    class _M:
+        name = "4K-A+ The Matrix (1999)"
+        year = 1999
+        description = ""
+        rating = ""
+        tmdb_id = "603"
+        imdb_id = ""
+        genre = ""
+        logo = None
+
+    class _S:
+        name = "EN| Breaking Bad"
+        year = 2008
+        description = ""
+        rating = ""
+        tmdb_id = "1396"
+        imdb_id = ""
+        genre = ""
+        logo = None
+
+    def test_movie_title_present_and_cleaned_by_default(self, p):
+        nfo = p._generate_nfo(self._M(), category_name="")
+        assert "<title>The Matrix</title>" in nfo
+
+    def test_movie_title_omitted_when_opted_in(self, p):
+        nfo = p._generate_nfo(self._M(), category_name="", omit_title=True)
+        assert "<title>" not in nfo
+        # everything else still emitted, so the server can still force-match
+        assert "<tmdbid>603</tmdbid>" in nfo
+
+    def test_tvshow_title_present_and_cleaned_by_default(self, p):
+        nfo = p._generate_tvshow_nfo(self._S(), category_name="")
+        assert "<title>Breaking Bad</title>" in nfo
+
+    def test_tvshow_title_omitted_when_opted_in(self, p):
+        nfo = p._generate_tvshow_nfo(self._S(), category_name="", omit_title=True)
+        assert "<title>" not in nfo
+        assert "<tmdbid>1396</tmdbid>" in nfo
+
+
+# ---------- provider-tag regex safety (v1.18.0) ----------
+
+class TestProviderPlusTagRegex:
+    def test_matches_plus_tags(self, p):
+        assert p._PROVIDER_PLUS_TAG_RE.sub("", "4K-A+ Title") == "Title"
+        assert p._PROVIDER_PLUS_TAG_RE.sub("", "A+ Title") == "Title"
+
+    def test_does_not_match_letter_hyphen_letter(self, p):
+        # X-Men / EN-TOP style: too dangerous to strip, left for the
+        # omit-title option instead.
+        assert p._PROVIDER_PLUS_TAG_RE.sub("", "X-Men First Class") == "X-Men First Class"
+        assert p._PROVIDER_PLUS_TAG_RE.sub("", "EN-TOP Movie") == "EN-TOP Movie"
+
+    def test_does_not_match_letter_hyphen_digits(self, p):
+        assert p._PROVIDER_PLUS_TAG_RE.sub("", "AC-130") == "AC-130"
+        assert p._PROVIDER_PLUS_TAG_RE.sub("", "MI-5") == "MI-5"

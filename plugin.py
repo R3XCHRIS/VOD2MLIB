@@ -1,10 +1,10 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.17.0 — Category Exclude (block list) to skip unwanted categories
-          such as adult content; Scan now prints your real category
-          names and marks which ones your filter matches, and Generate
-          says so when a filter excluded everything (#8).
+v1.18.0 — cleaner NFO titles (provider tags/quality tokens stripped)
+          plus an option to omit <title> entirely so Jellyfin uses TMDB;
+          collapse duplicate episode relations to one .strm; bigger
+          series batch sizes; warn when a TMDB ID is missing.
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -22,7 +22,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.17.0"
+    version = "1.18.0"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -61,6 +61,17 @@ class Plugin:
     #   * "▪NL▪ Title"  — bullet-wrapped code, e.g. ▪NL▪ / ▪MULTIG▪ (any 2-8
     #     letters between marker symbols).
     _BULLET_CHARS = r'▪▫■□●○•·◦‣⁃︎️'
+    # Provider quality/edition tags that lead a title, e.g. '4K-A+ Title',
+    # 'A+ Title'. Only tokens containing '+' are stripped here: a leading '+'
+    # token is never part of a real title, whereas letter-hyphen-letter forms
+    # very much are ('X-Men', 'AC-130', 'MI-5'), so those are left alone.
+    # Reported by @matrix26 (provider tags like 4K-A+, EN-TOP, AMZ).
+    # Provider plus-tags: "A+ ", "4K-A+ ", "VIP+ ". Uppercase-only and a
+    # MANDATORY trailing space, so real titles that merely contain a "+"
+    # survive — "Love+War" and "Genera+ion" are both real films.
+    _PROVIDER_PLUS_TAG_RE = re.compile(r'^[A-Z0-9]{1,6}(?:[-_][A-Z0-9]{1,6})*\+\s+')
+    _LEADING_DELIM_TAG_RE = re.compile(r'^(?:[\[\(\|]\s*[A-Za-z0-9][A-Za-z0-9 +\-]{0,9}\s*[\]\)\|]\s*)+')
+    _EMPTY_DELIM_RE = re.compile(r'[\[\(]\s*[\]\)]')
     _LANGUAGE_PREFIX_RE = re.compile(
         r'^(?:'
         r'[A-Z]{2,3}\s+-\s*'                              # EN - Title
@@ -88,11 +99,24 @@ class Plugin:
     # Quality / encoding tokens commonly stuffed into provider VOD titles.
     # Stripped from folder names so media-server scrapers see a clean title.
     # Word-boundary anchored so legitimate substrings ("Whiplash" etc.) survive.
-    _QUALITY_TOKEN_RE = re.compile(
-        r'\b(4K|UHD|FHD|HD|SD|HDR(?:10\+?)?|HEVC|H\.?26[45]|x26[45]|'
-        r'1080p|720p|2160p|480p|BluRay|BDRip|DVDRip|WEB-?DL|HDTV|REMUX)\b',
-        re.IGNORECASE,
+    _QUALITY_TOKEN_ALT = (
+        r'4K|UHD|FHD|HD|SD|HDR(?:10\+?)?|HEVC|H\.?26[45]|x26[45]|'
+        r'1080p|720p|2160p|480p|BluRay|BDRip|DVDRip|WEB-?DL|HDTV|REMUX'
     )
+    _QUALITY_TOKEN_RE = re.compile(r'\b(' + _QUALITY_TOKEN_ALT + r')\b', re.IGNORECASE)
+
+    # Edge-anchored variants for NFO titles. Folder names can afford to strip
+    # these anywhere; a <title> cannot — "NTSF:SD:SUV::" is a real show, and
+    # removing its interior "SD" corrupts the name.
+    _LEADING_QUALITY_RE = re.compile(
+        r'^(?:(?:' + _QUALITY_TOKEN_ALT + r')\b[\s\-_:|]*)+', re.IGNORECASE)
+    _TRAILING_QUALITY_RE = re.compile(
+        r'(?:[\s\-_:|]*\b(?:' + _QUALITY_TOKEN_ALT + r'))+\s*$', re.IGNORECASE)
+    # If removing a trailing quality token leaves the title dangling on a
+    # connector, the token was part of the name: "WWII in HD" is a real
+    # series, and "WWII in" is not a title anyone meant to write.
+    _DANGLING_TAIL_RE = re.compile(
+        r'\b(?:a|an|the|in|on|at|of|to|for|and|or|with|from|is|my)$', re.IGNORECASE)
 
     # Year-bucket category names like "2026 Movies", "1990s Series",
     # "2020 TV Shows" — these are navigation buckets from the IPTV provider's
@@ -167,6 +191,13 @@ class Plugin:
             "help_text": "Create .nfo metadata files for movies"
         },
         {
+            "id": "nfo_omit_title",
+            "label": "Omit <title> from NFO files",
+            "type": "boolean",
+            "default": False,
+            "help_text": "Leave the `<title>` element OUT of generated movie and tvshow NFO files. Jellyfin (and Emby) treat a `<title>` in the NFO as authoritative and will NOT override it from TMDB — so if your provider prefixes titles with tags like `4K-A+`, `EN-TOP` or `AMZ`, that junk becomes the displayed name. With this ON the plugin still writes the NFO (IDs, plot, genres, rating, poster) but omits the title, letting your media server take the clean title from TMDB via the `<tmdbid>` we already emit. OFF by default (unchanged behaviour). Note v1.18.0 also cleans provider junk out of the title, so try that first — this is the belt-and-braces option. Episode NFOs always keep their title (media servers match episodes by season/episode number)."
+        },
+        {
             "id": "nest_movies_by_category",
             "label": "Nest Movies by Category",
             "type": "boolean",
@@ -235,9 +266,12 @@ class Plugin:
                 {"value": "5", "label": "5 series"},
                 {"value": "10", "label": "10 series"},
                 {"value": "25", "label": "25 series"},
-                {"value": "all", "label": "All series (slow!)"}
+                {"value": "50", "label": "50 series"},
+                {"value": "100", "label": "100 series"},
+                {"value": "250", "label": "250 series"},
+                {"value": "all", "label": "All series (may time out — use the schedule)"}
             ],
-            "help_text": "Series to process (episodes auto-fetched for each)"
+            "help_text": "Series to process per click (episodes are auto-fetched for each, so series are much slower than movies). ⚠ This button runs synchronously and your reverse proxy will usually cut it off after ~60s with a 504 — the run keeps going server-side, but you lose the result. For a big catalogue don't use 'All' here: set the cron to 'Full rescan' and click [SCHEDULE] Apply / Update. Scheduled runs execute on the Celery worker with no HTTP timeout."
         },
         {
             "id": "generate_series_nfo",
@@ -758,6 +792,7 @@ class Plugin:
         omit_stream_id = bool(settings.get("omit_stream_id", False))
         category_filter = (settings.get("category_filter") or "").strip()
         category_exclude = (settings.get("category_exclude") or "").strip()
+        nfo_omit_title = bool(settings.get("nfo_omit_title", False))
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -828,6 +863,7 @@ class Plugin:
         created_strm = 0
         refreshed_strm = 0
         unchanged_strm = 0
+        missing_tmdb_id = 0
         created_nfo = 0
         skipped = 0
         deduped = 0
@@ -852,6 +888,10 @@ class Plugin:
                     continue
                 seen_movie_uuids.add(movie.uuid)
             cat_name = relation.category.name if relation.category else ""
+            # Track titles the TMDB tag can't be applied to, so "I ticked the
+            # box and nothing changed" isn't silent (reported by @drahmed86).
+            if append_tmdb_id and not (getattr(movie, "tmdb_id", "") or "").strip():
+                missing_tmdb_id += 1
             movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
                 movie, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
             )
@@ -889,7 +929,7 @@ class Plugin:
                     if not os.path.exists(nfo_path):
                         category_name = relation.category.name if relation.category else ""
                         with open(nfo_path, 'w', encoding='utf-8') as f:
-                            f.write(self._generate_nfo(movie, category_name))
+                            f.write(self._generate_nfo(movie, category_name, nfo_omit_title))
                         created_nfo += 1
                         wrote_nfo = True
 
@@ -934,6 +974,12 @@ class Plugin:
         if generate_nfo:
             logger.info("  .nfo created:    %d", created_nfo)
         logger.info("  Errors:          %d", errors)
+        if append_tmdb_id and missing_tmdb_id:
+            logger.warning(
+                "  ⚠ %d title(s) had no TMDB ID, so no {tmdb-…} tag was added to those "
+                "folders — your provider didn't supply one. This is not a plugin error.",
+                missing_tmdb_id,
+            )
         logger.info("=" * 60)
 
         summary_msg = f"Wrote {created_strm} new .strm files"
@@ -956,6 +1002,7 @@ class Plugin:
             "created_strm": created_strm,
             "refreshed_strm": refreshed_strm,
             "unchanged_strm": unchanged_strm,
+            "missing_tmdb_id": missing_tmdb_id,
             "created_nfo": created_nfo if generate_nfo else 0,
             "skipped": skipped,
             "deduped": deduped,
@@ -1011,6 +1058,7 @@ class Plugin:
         omit_stream_id = bool(settings.get("omit_stream_id", False))
         category_filter = (settings.get("category_filter") or "").strip()
         category_exclude = (settings.get("category_exclude") or "").strip()
+        nfo_omit_title = bool(settings.get("nfo_omit_title", False))
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -1153,6 +1201,7 @@ class Plugin:
                     append_tmdb_id,
                     omit_stream_id,
                     tmdb_tag_format,
+                    nfo_omit_title,
                 ): series_rel
                 for series_rel in to_process
             }
@@ -1225,7 +1274,7 @@ class Plugin:
             "failures": failures,
         }
 
-    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False, tmdb_tag_format="plex"):
+    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False, tmdb_tag_format="plex", nfo_omit_title=False):
         """Process a single series. Idempotent: writes only missing episode files.
 
         With refresh_existing=False, callers should pre-filter already-done
@@ -1258,14 +1307,40 @@ class Plugin:
                 except Exception as fetch_err:
                     logger.warning("refresh_series_episodes failed for %s: %s", series_name, fetch_err)
 
-            episodes = list(
+            # `id` is a deterministic tiebreaker: without it the winner among
+            # duplicate relations for one episode varies run to run, so the
+            # same .strm would flip between provider URLs on every rescan.
+            episode_rels = list(
                 M3UEpisodeRelation.objects.filter(
                     m3u_account=series_rel.m3u_account,
                     episode__series=series,
                 )
                 .select_related('episode')
-                .order_by('episode__season_number', 'episode__episode_number')
+                .order_by('episode__season_number', 'episode__episode_number', 'id')
             )
+
+            # One Episode can be reached by several relations. Every relation
+            # resolves to the same filename (the name comes from the Episode),
+            # so writing each one just rewrites the same path — and when
+            # `omit_stream_id` is on the URLs are byte-identical too, since the
+            # URL then depends only on the episode UUID. Keep the first
+            # relation per episode. Reported by @rammboslice.
+            episodes = []
+            seen_episode_uuids = set()
+            duplicate_rels = 0
+            for rel in episode_rels:
+                uuid = getattr(rel.episode, "uuid", None)
+                if uuid is not None:
+                    if uuid in seen_episode_uuids:
+                        duplicate_rels += 1
+                        continue
+                    seen_episode_uuids.add(uuid)
+                episodes.append(rel)
+            if duplicate_rels:
+                logger.info(
+                    "%s - collapsed %d duplicate episode relation(s) to one file each",
+                    series_name, duplicate_rels,
+                )
             episode_count = len(episodes)
             
             if episode_count == 0:
@@ -1289,7 +1364,7 @@ class Plugin:
                 tvshow_nfo_path = os.path.join(series_folder, "tvshow.nfo")
                 if not os.path.isfile(tvshow_nfo_path):
                     category_name = series_rel.category.name if series_rel.category else ""
-                    tvshow_content = self._generate_tvshow_nfo(series, category_name)
+                    tvshow_content = self._generate_tvshow_nfo(series, category_name, nfo_omit_title)
                     with open(tvshow_nfo_path, 'w', encoding='utf-8') as f:
                         f.write(tvshow_content)
                     new_nfo += 1
@@ -1718,10 +1793,55 @@ class Plugin:
         candidates = self._extract_genres(category_name)
         return [g for g in candidates if not self._is_year_bucket_genre(g)]
 
-    def _generate_tvshow_nfo(self, series, category_name: str) -> str:
+    def _clean_nfo_title(self, raw_title: str, year=None) -> str:
+        """Title for an NFO `<title>` element.
+
+        NFO titles used to get only the language-prefix strip, so provider
+        junk that folder names had cleaned away ("4K-A+ ...", quality tokens,
+        a trailing bare year) survived into the element. Jellyfin treats a
+        `<title>` in the NFO as authoritative and will not override it from
+        TMDB, so that junk became the displayed title (reported by @matrix26).
+
+        Deliberately gentler than `_extract_clean_name_and_year`, which is
+        tuned for folder names: every step here is anchored to the start or
+        end of the string. Interior surgery corrupts real names — checked
+        against a live 3.4k-title catalogue, where the aggressive pass ate
+        the "SD" out of "NTSF:SD:SUV::" and the trailing dot off "Chicago
+        P.D." and "Marvel's Agents of S.H.I.E.L.D.".
+        """
+        if not raw_title:
+            return raw_title
+        title = self._LANGUAGE_PREFIX_RE.sub("", raw_title).strip()
+        title = self._PROVIDER_PLUS_TAG_RE.sub("", title).strip()
+        # Leading delimiter-wrapped tags: "|EN| ", "[4K] ", "(MULTI) ".
+        # Guarded so titles that ARE a bracketed tag survive — "[REC] 2"
+        # would otherwise be reduced to "2".
+        without_tags = self._LEADING_DELIM_TAG_RE.sub("", title).strip()
+        if any(ch.isalpha() for ch in without_tags):
+            title = without_tags
+        title = self._LEADING_QUALITY_RE.sub("", title)
+        detailed = self._TRAILING_QUALITY_RE.sub("", title).strip()
+        if detailed and not self._DANGLING_TAIL_RE.search(detailed):
+            title = detailed
+        # Trailing "(YYYY)", possibly repeated: "A Costa Rican Wedding (2025) (2025)".
+        prev = None
+        while prev != title:
+            prev = title
+            title, _ = self._strip_trailing_year(title)
+            title = title.strip()
+        # A bare trailing year is only stripped when it matches the known
+        # year — otherwise "Blade Runner 2049" and "Bali 2002" lose theirs.
+        if year:
+            title, _ = self._strip_redundant_trailing_year(title, year)
+        # A stripped token can leave "[] Title" behind.
+        title = self._EMPTY_DELIM_RE.sub(" ", title)
+        title = re.sub(r"\s{2,}", " ", title).strip(" -_")
+        return title or self._clean_title(raw_title)
+
+    def _generate_tvshow_nfo(self, series, category_name: str, omit_title: bool = False) -> str:
         """Generate tvshow.nfo XML content for a series."""
         raw_title = series.name or "Unknown"
-        title = self._clean_title(raw_title)
+        title = self._clean_nfo_title(raw_title, getattr(series, "year", None))
         title, title_year = self._strip_trailing_year(title)
         year = series.year or title_year or ""
         plot = series.description or ""
@@ -1733,7 +1853,8 @@ class Plugin:
 
         xml_lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
         xml_lines.append('<tvshow>')
-        xml_lines.append(f'    <title>{self._xml_escape(title)}</title>')
+        if not omit_title:
+            xml_lines.append(f'    <title>{self._xml_escape(title)}</title>')
 
         if year:
             xml_lines.append(f'    <year>{year}</year>')
@@ -1769,7 +1890,7 @@ class Plugin:
     def _generate_episode_nfo(self, episode) -> str:
         """Generate episode.nfo XML content for an episode."""
         raw_title = episode.name or ""
-        title = self._clean_title(raw_title) if raw_title else "Episode"
+        title = self._clean_nfo_title(raw_title) if raw_title else "Episode"
         title, _ = self._strip_trailing_year(title)
         season_num = episode.season_number or 0
         episode_num = episode.episode_number or 0
@@ -1811,10 +1932,10 @@ class Plugin:
 
         return '\n'.join(xml_lines)
     
-    def _generate_nfo(self, movie, category_name: str) -> str:
+    def _generate_nfo(self, movie, category_name: str, omit_title: bool = False) -> str:
         """Generate NFO XML content for a movie."""
         raw_title = movie.name or "Unknown"
-        title = self._clean_title(raw_title)
+        title = self._clean_nfo_title(raw_title, getattr(movie, "year", None))
         title, title_year = self._strip_trailing_year(title)
         year = movie.year or title_year or ""
         plot = movie.description or ""
@@ -1827,7 +1948,8 @@ class Plugin:
         # Build XML
         xml_lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
         xml_lines.append('<movie>')
-        xml_lines.append(f'    <title>{self._xml_escape(title)}</title>')
+        if not omit_title:
+            xml_lines.append(f'    <title>{self._xml_escape(title)}</title>')
         
         if year:
             xml_lines.append(f'    <year>{year}</year>')
