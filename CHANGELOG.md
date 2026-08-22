@@ -2,7 +2,9 @@
 
 ## v1.18.0 — NFO titles your media server can actually match
 
-Everything here came out of the Dispatcharr Discord thread. No breaking changes; nothing needs re-generating.
+Everything here came out of the Dispatcharr Discord thread. No breaking changes, and no folder names change.
+
+⚠ **The NFO title cleanup only applies to `.nfo` files the plugin writes fresh.** It never overwrites an existing NFO — that's deliberate, so your own edits are never clobbered — so an already-generated library keeps its old titles. To pull the fix through: delete the `.nfo` files (`find /your/VODS -name '*.nfo' -delete`) and re-run Generate. For series, turn `Refresh Existing Series` ON first, or episodes that already have a `.strm` are skipped before the NFO step.
 
 - **Provider tags are stripped from NFO titles.** Titles like `4K-A+ Blade Runner 2049`, `|EN| The Matrix` or `[4K] Dune (2025)` were written into `<title>` verbatim, and since Jellyfin/Emby treat an NFO title as authoritative, the item stayed mis-titled no matter what TMDB said. Leading provider tags (`A+`, `4K-A+`, `|EN|`, `[4K]`), edge quality tokens and trailing years are now removed.
 
