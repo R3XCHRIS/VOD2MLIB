@@ -769,6 +769,151 @@ class Plugin:
             return f"{base_name} [tmdbid-{tmdb_id}]"
         return f"{base_name} {{tmdb-{tmdb_id}}}"
 
+    # ------------------------------------------------------------------
+    # Version grouping (DUB/LEG + resolution -> Jellyfin/Emby "Versions")
+    # ------------------------------------------------------------------
+    _AUDIO_TAG_RE = re.compile(r'\[(?:d|l)\]|\((?:d|l)\)|\b(dublado|dub|legendado|leg)\b', re.IGNORECASE)
+    _BULLET_VARIANT_RE = re.compile(r'▪[A-Za-z]{1,8}▪', re.IGNORECASE)
+
+    def _detect_variant(self, name, proxy_url, logger, ffprobe_path="ffprobe"):
+        """DUB vs LEG for a movie relation.
+
+        Priority: explicit title tag ([DUB]/[LEG]/dublado/legendado/▪XX▪) wins.
+        Else ffprobe the proxy and read the audio stream language
+        (por -> DUB; eng/und/jpn/spa -> LEG). Fallback: und -> DUB.
+        """
+        low = (name or "").lower()
+        tag = self._AUDIO_TAG_RE.search(low)
+        if tag:
+            tok = tag.group(0).lower()
+            if 'leg' in tok or tok in ('[l]', '(l)', 'l'):
+                return "LEG"
+            if 'dub' in tok or tok in ('[d]', '(d)', 'd'):
+                return "DUB"
+        bul = self._BULLET_VARIANT_RE.search(name or "")
+        if bul:
+            b = bul.group(0).lower().strip('▪').strip()
+            if 'leg' in b:
+                return "LEG"
+            if 'dub' in b:
+                return "DUB"
+        try:
+            import subprocess, json as _json
+            r = subprocess.run(
+                [ffprobe_path, "-v", "error", "-user_agent", "Mozilla/5.0",
+                 "-analyzeduration", "4000000", "-probesize", "2000000", "-timeout", "15000000",
+                 "-i", proxy_url,
+                 "-show_entries", "stream=codec_type,language:stream_tags=language", "-of", "json"],
+                capture_output=True, text=True, timeout=40)
+            j = _json.loads(r.stdout)
+            langs = [(s.get('tags', {}).get('language') or s.get('language') or 'und')
+                     for s in j.get('streams', []) if s.get('codec_type') == 'audio']
+            if any(l == 'por' for l in langs):
+                return "DUB"
+            if langs and all(l in ('eng', 'und', 'jpn', 'spa') for l in langs):
+                return "LEG"
+        except Exception as e:
+            logger.debug("ffprobe variant detect failed for %s: %s", name, e)
+        return "DUB"
+
+    def _detect_resolution(self, proxy_url, logger, ffprobe_path="ffprobe"):
+        """Resolution label from ffprobe width: 4K / 1080p / 720p / <w>p."""
+        try:
+            import subprocess, json as _json
+            r = subprocess.run(
+                [ffprobe_path, "-v", "error", "-user_agent", "Mozilla/5.0",
+                 "-analyzeduration", "4000000", "-probesize", "2000000", "-timeout", "15000000",
+                 "-i", proxy_url, "-show_entries", "stream=width,codec_type", "-of", "json"],
+                capture_output=True, text=True, timeout=40)
+            j = _json.loads(r.stdout)
+            v = [s for s in j.get('streams', []) if s.get('codec_type') == 'video']
+            if not v:
+                return "SD"
+            w = v[0].get('width') or 0
+            if w >= 3840:
+                return "4K"
+            if w >= 1920:
+                return "1080p"
+            if w >= 1280:
+                return "720p"
+            return f"{w}p" if w else "SD"
+        except Exception as e:
+            logger.debug("ffprobe resolution detect failed: %s", e)
+            return "SD"
+
+    def _apply_version_format(self, strm_filename, version_format, variant, res):
+        """Append the version suffix template to a .strm filename.
+
+        version_format may use {variant} and {res}. Empty => unchanged.
+        """
+        if not version_format:
+            return strm_filename
+        suffix = version_format.replace("{variant}", variant).replace("{res}", res)
+        if ".strm" in strm_filename:
+            base, _ = strm_filename.rsplit(".strm", 1)
+            return f"{base}{suffix}.strm"
+        return f"{strm_filename}{suffix}"
+
+    def _accum_movie_counts(self, lc, created, refreshed, unchanged, skipped, errors, missing_tmdb):
+        lc["created"] += created
+        lc["refreshed"] += refreshed
+        lc["unchanged"] += unchanged
+        lc["skipped"] += skipped
+        lc["errors"] += errors
+        lc["missing_tmdb"] += missing_tmdb
+
+    def _flush_pending_movie(self, pend, root_folder, nest_by_cat, append_tmdb_id,
+                             tmdb_tag_format, generate_nfo, nfo_omit_title,
+                             version_format, omit_stream_id, refresh_existing, logger):
+        """Write .strm (and .nfo) for one grouped movie.
+
+        pend = {"movie":, "cat_name":, "groups": {(variant,res): (relation, proxy_url)}}
+        Returns tuple of counters (created, refreshed, unchanged, skipped, errors, missing_tmdb).
+        """
+        movie = pend["movie"]
+        cat_name = pend["cat_name"]
+        groups = pend["groups"]
+        created = refreshed = unchanged = skipped = errors = missing_tmdb = 0
+
+        if append_tmdb_id and not (getattr(movie, "tmdb_id", "") or "").strip():
+            missing_tmdb += 1
+
+        movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
+            movie, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
+        )
+        try:
+            os.makedirs(movie_folder, exist_ok=True)
+        except OSError as e:
+            logger.error("  \u2717 %s: %s", movie_name, e)
+            return 0, 0, 0, 0, 1, missing_tmdb
+
+        for (variant, res), (relation, proxy_url) in groups.items():
+            fname = self._apply_version_format(strm_filename, version_format, variant or "", res or "")
+            strm_path = os.path.join(movie_folder, fname)
+            is_existing = os.path.exists(strm_path)
+            if is_existing and not refresh_existing:
+                skipped += 1
+                continue
+            try:
+                changed = self._write_if_different_preserve_times(strm_path, proxy_url)
+                if not changed:
+                    unchanged += 1
+                elif is_existing:
+                    refreshed += 1
+                else:
+                    created += 1
+                if generate_nfo:
+                    nfo_filename = fname.replace('.strm', '.nfo')
+                    nfo_path = os.path.join(movie_folder, nfo_filename)
+                    if not os.path.exists(nfo_path):
+                        category_name = relation.category.name if relation.category else ""
+                        with open(nfo_path, 'w', encoding='utf-8') as f:
+                            f.write(self._generate_nfo(movie, category_name, nfo_omit_title))
+            except OSError as e:
+                logger.error("  \u2717 %s: %s", movie_name, e)
+                errors += 1
+        return created, refreshed, unchanged, skipped, errors, missing_tmdb
+
     def _generate_movies(self, settings: Dict[str, Any], logger, refresh_urls: bool = False):
         """Generate movie .strm files according to batch size.
 
@@ -811,6 +956,9 @@ class Plugin:
             "Category filter": category_filter or "(all)",
             "Category exclude": category_exclude or "(none)",
         })
+
+        version_format = (settings.get("version_format") or "").strip()
+        ffprobe_path = (settings.get("ffprobe_path") or "ffprobe").strip() or "ffprobe"
 
         try:
             from apps.vod.models import M3UMovieRelation
@@ -869,6 +1017,9 @@ class Plugin:
         deduped = 0
         errors = 0
         scanned = 0
+        pending_movies = {}
+        last_movie_uuid = None
+        local_counts = {"created": 0, "refreshed": 0, "unchanged": 0, "skipped": 0, "errors": 0, "missing_tmdb": 0}
 
         # seen-set is only used when dedupe is on; kept as None otherwise so the
         # membership check short-circuits cheaply for everyone else.
@@ -887,78 +1038,54 @@ class Plugin:
                     deduped += 1
                     continue
                 seen_movie_uuids.add(movie.uuid)
+
             cat_name = relation.category.name if relation.category else ""
-            # Track titles the TMDB tag can't be applied to, so "I ticked the
-            # box and nothing changed" isn't silent (reported by @drahmed86).
-            if append_tmdb_id and not (getattr(movie, "tmdb_id", "") or "").strip():
-                missing_tmdb_id += 1
-            movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
-                movie, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
-            )
-            strm_path = os.path.join(movie_folder, strm_filename)
-            is_existing = os.path.exists(strm_path)
-
-            if is_existing and not refresh_existing:
-                skipped += 1
-                continue
-
             proxy_url = self._build_proxy_url(
                 dispatcharr_url, "movie", movie.uuid, relation.stream_id, omit_stream_id,
             )
-            written = created_strm + refreshed_strm
-            log_this = (written + 1) % self.LOG_EVERY == 1 or written < self.LOG_FIRST_N
-            verb = "refreshed" if is_existing else "created"
-            if log_this:
-                logger.info("")
-                logger.info("[%d %s / %d scanned] %s (%s)", written + 1, verb, scanned, movie_name, year or "—")
+            # version grouping: detect variant/res per relation
+            if version_format:
+                variant = self._detect_variant(movie.name or "", proxy_url, logger, ffprobe_path)
+                res = self._detect_resolution(proxy_url, logger, ffprobe_path)
+            else:
+                variant, res = None, None
 
-            try:
-                os.makedirs(movie_folder, exist_ok=True)
-                changed = self._write_if_different_preserve_times(strm_path, proxy_url)
-                if not changed:
-                    unchanged_strm += 1
-                elif is_existing:
-                    refreshed_strm += 1
-                else:
-                    created_strm += 1
+            # group by movie, then (variant,res)
+            grp = pending_movies.setdefault(movie.uuid, {
+                "movie": movie, "cat_name": cat_name, "groups": {}})
+            grp["cat_name"] = cat_name
+            key = (variant, res)
+            # keep first relation per (variant,res) — provider priority could be added later
+            if key not in grp["groups"]:
+                grp["groups"][key] = (relation, proxy_url)
 
-                wrote_nfo = False
-                if generate_nfo:
-                    nfo_filename = strm_filename.replace('.strm', '.nfo')
-                    nfo_path = os.path.join(movie_folder, nfo_filename)
-                    if not os.path.exists(nfo_path):
-                        category_name = relation.category.name if relation.category else ""
-                        with open(nfo_path, 'w', encoding='utf-8') as f:
-                            f.write(self._generate_nfo(movie, category_name, nfo_omit_title))
-                        created_nfo += 1
-                        wrote_nfo = True
-
-                if log_this:
-                    if changed:
-                        logger.info("  ✓ wrote .strm%s", " + .nfo" if wrote_nfo else "")
-                    else:
-                        logger.info("  · .strm already current (mtime preserved)%s", " + wrote .nfo" if wrote_nfo else "")
-            except OSError as e:
-                logger.error("  ✗ %s: %s", movie_name, e)
-                errors += 1
-
-            if batch_size != "all":
-                # In refresh mode an already-current file still counts as
-                # "processed" for pacing, so the batch limit behaves as it did
-                # before no-op writes were skipped (#11).
-                limit_hit = (
-                    (refreshed_strm + created_strm + unchanged_strm) >= target_batch
-                    if refresh_existing
-                    else created_strm >= target_batch
-                )
-                if limit_hit:
-                    logger.info("")
-                    if refresh_existing:
-                        logger.info("Batch complete: %d new + %d refreshed .strm (scanned %d).", created_strm, refreshed_strm, scanned)
-                    else:
-                        logger.info("Batch complete: %d new .strm written (scanned %d, %d already done).", created_strm, scanned, skipped)
+            # flush previous movie when uuid changes
+            if last_movie_uuid is not None and movie.uuid != last_movie_uuid:
+                c, r, u, s, e, mt = self._flush_pending_movie(
+                    pending_movies.pop(last_movie_uuid), root_folder, nest_by_cat, append_tmdb_id,
+                    tmdb_tag_format, generate_nfo, nfo_omit_title, version_format, omit_stream_id,
+                    refresh_existing, logger)
+                self._accum_movie_counts(local_counts, c, r, u, s, e, mt)
+                if batch_size != "all" and (local_counts["created"] + local_counts["refreshed"]) >= target_batch:
+                    logger.info("Batch complete (grouped): %d new + %d refreshed .strm.", local_counts["created"], local_counts["refreshed"])
                     break
+            last_movie_uuid = movie.uuid
+        else:
+            # loop exhausted: flush the last pending movie
+            if last_movie_uuid is not None and last_movie_uuid in pending_movies:
+                c, r, u, s, e, mt = self._flush_pending_movie(
+                    pending_movies.pop(last_movie_uuid), root_folder, nest_by_cat, append_tmdb_id,
+                    tmdb_tag_format, generate_nfo, nfo_omit_title, version_format, omit_stream_id,
+                    refresh_existing, logger)
+                self._accum_movie_counts(local_counts, c, r, u, s, e, mt)
 
+        # publish grouped counters into the SUMMARY variables
+        created_strm = local_counts["created"]
+        refreshed_strm = local_counts["refreshed"]
+        unchanged_strm = local_counts["unchanged"]
+        skipped = local_counts["skipped"]
+        errors = local_counts["errors"]
+        missing_tmdb_id = local_counts["missing_tmdb"]
         logger.info("")
         logger.info("=" * 60)
         logger.info("SUMMARY:")
