@@ -54,3 +54,4 @@ coverage.xml
 
 # Local Discord/PR message drafts — not part of the plugin, never published
 drafts/
+test_salverosa.py
