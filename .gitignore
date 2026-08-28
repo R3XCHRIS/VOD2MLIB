@@ -55,3 +55,7 @@ coverage.xml
 # Local Discord/PR message drafts — not part of the plugin, never published
 drafts/
 test_salverosa.py
+# Validation scripts that hit the LIVE Dispatcharr catalogue with our real
+# movie list (SalveRosa/15h17/...). Smoke-test only, never go to a PR.
+tests/validate*_real.py
+tests/*_real.py
