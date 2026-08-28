@@ -14,6 +14,7 @@ This fork:  https://github.com/R3XCHRIS/VOD2MLIB
 """
 import os
 import re
+import json
 from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -796,6 +797,47 @@ class Plugin:
     _AUDIO_TAG_RE = re.compile(r'\[(?:DUB|LEG|[LD])\]|\((?:DUB|LEG|[LD])\)|\b(dublado|dub|legendado|leg)\b', re.IGNORECASE)
     _BULLET_TAG_RE = re.compile(r'▪[A-Za-z]{1,8}▪', re.IGNORECASE)
 
+    # --- Detection cache ---------------------------------------------------
+    # ffprobe is the slow part (3-15s per relation). We cache each relation's
+    # detected (variant, res) keyed by (movie_uuid, stream_id) so a re-run (or a
+    # partial run that was stopped mid-way) reuses prior probes instead of
+    # re-probing 570k relations. Cache lives on disk next to the plugin and is
+    # written atomically.
+    _DETECT_CACHE_FILE = "/data/plugins/vod2mlib/.detect_cache.json"
+
+    def _load_detect_cache(self):
+        try:
+            with open(self._DETECT_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def _save_detect_cache(self, cache):
+        tmp = self._DETECT_CACHE_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            os.replace(tmp, self._DETECT_CACHE_FILE)
+        except OSError as e:
+            # Non-fatal: a missed cache write just means a future re-probe.
+            pass
+
+    def _detect_variant_cached(self, cache, rel_id, name, proxy_url, logger, ffprobe_path):
+        key = str(rel_id)
+        if key in cache and "variant" in cache[key]:
+            return cache[key]["variant"]
+        v = self._detect_variant(name, proxy_url, logger, ffprobe_path)
+        cache.setdefault(key, {})["variant"] = v
+        return v
+
+    def _detect_resolution_cached(self, cache, rel_id, proxy_url, logger, ffprobe_path):
+        key = str(rel_id)
+        if key in cache and "res" in cache[key]:
+            return cache[key]["res"]
+        r = self._detect_resolution(proxy_url, logger, ffprobe_path)
+        cache.setdefault(key, {})["res"] = r
+        return r
+
     def _clean_variant_name(self, name):
         """Grouping KEY for version grouping (norm2 + quality tokens stripped).
 
@@ -826,6 +868,10 @@ class Plugin:
         cleaned = self._AUDIO_TAG_RE.sub("", name)
         cleaned = self._BULLET_TAG_RE.sub("", cleaned)
         cleaned = self._QUALITY_TOKEN_RE.sub("", cleaned)
+        # Drop brackets/parens left empty after tag removal ("SalveRosa [] (2025)"
+        # -> "SalveRosa (2025)"), so the on-disk folder keeps a clean title.
+        cleaned = re.sub(r'\[\s*\]', '', cleaned)
+        cleaned = re.sub(r'\(\s*\)', '', cleaned)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         cleaned = cleaned.rstrip(' -').strip()
         return cleaned
@@ -996,6 +1042,118 @@ class Plugin:
                 errors += 1
         return created, refreshed, unchanged, skipped, errors, missing_tmdb
 
+    def _generate_movies_from_relations(self, relations_iter, settings, logger,
+                                       dispatcharr_url, root_folder, batch_size,
+                                       target_batch, version_format, ffprobe_path,
+                                       nest_by_cat, append_tmdb_id, tmdb_tag_format,
+                                       generate_nfo, nfo_omit_title, omit_stream_id,
+                                       refresh_existing, dedupe_across_cats,
+                                       detect_cache):
+        """Django-free core of the movie generation loop.
+
+        Walks `relations_iter` (an iterator of M3UMovieRelation-like objects),
+        groups relations by clean title + (variant, res), and flushes one or
+        more .strm files per group. Returns a dict with the merged counters and
+        the (possibly updated) detection cache.
+
+        Kept free of any Django import so it can be unit-tested without a live
+        Dispatcharr database. All DB/wiring (query construction, active-account
+        filtering, category filter, the `apps.vod.models` import) stays in
+        `_generate_movies`, which calls this with `query.iterator()`.
+
+        The grouping is lazy: pending groups accumulate in `pending_movies`
+        until either (a) the batch_size limit is reached (then ALL pending
+        groups are flushed before breaking) or (b) the iterator is exhausted
+        (then ALL pending groups are flushed). The exhaustion branch MUST flush
+        every group — a previous bug only flushed the last one, silently
+        dropping every other movie on a full run.
+        """
+        local_counts = {"created": 0, "refreshed": 0, "unchanged": 0,
+                        "skipped": 0, "errors": 0, "missing_tmdb": 0}
+        pending_movies = {}
+        scanned = 0
+        deduped = 0
+
+        # seen-set is only used when dedupe is on; kept as None otherwise so the
+        # membership check short-circuits cheaply for everyone else.
+        seen_movie_uuids = set() if dedupe_across_cats else None
+
+        def _flush_all():
+            flushed = 0
+            for _cb in list(pending_movies.keys()):
+                c, r, u, s, e, mt = self._flush_pending_movie(
+                    pending_movies.pop(_cb), root_folder, nest_by_cat, append_tmdb_id,
+                    tmdb_tag_format, generate_nfo, nfo_omit_title, version_format,
+                    omit_stream_id, refresh_existing, logger)
+                self._accum_movie_counts(local_counts, c, r, u, s, e, mt)
+                flushed += 1
+            return flushed
+
+        logger.info("Processing movies:")
+        logger.info("-" * 60)
+
+        for relation in relations_iter:
+            scanned += 1
+            movie = relation.movie
+            if seen_movie_uuids is not None:
+                if movie.uuid in seen_movie_uuids:
+                    # Same movie already written under an earlier-alphabetical
+                    # category. Skip — counts under `deduped` not `skipped`.
+                    deduped += 1
+                    continue
+                seen_movie_uuids.add(movie.uuid)
+
+            cat_name = relation.category.name if relation.category else ""
+            proxy_url = self._build_proxy_url(
+                dispatcharr_url, "movie", movie.uuid, relation.stream_id, omit_stream_id,
+            )
+            # version grouping: detect variant/res per relation.
+            # Group KEY is the clean base name (tag [DUB]/[LEG]/dublado/legendado
+            # stripped) so a DUB movie and its LEG twin (separate Dispatcharr Movies)
+            # land in the SAME folder and collapse into Jellyfin/Emby Versions.
+            clean_base = self._clean_variant_name(movie.name or "")
+            # Detect ONLY what the template asks for (conditional ffprobe):
+            # {variant} => audio DUB/LEG; {res} => resolution. A user who only
+            # wants resolution grouping (e.g. non-BR, no DUB/LEG) pays no audio
+            # probe; a BR user who wants DUB/LEG pays both. Keeps the two
+            # features independent while sharing one template.
+            if version_format:
+                variant = self._detect_variant_cached(detect_cache, relation.id, movie.name or "", proxy_url, logger, ffprobe_path) if "{variant}" in version_format else None
+                res = self._detect_resolution_cached(detect_cache, relation.id, proxy_url, logger, ffprobe_path) if "{res}" in version_format else None
+            else:
+                variant, res = None, None
+
+            # group by clean base name, then (variant,res)
+            grp = pending_movies.setdefault(clean_base, {
+                "movie": movie, "cat_name": cat_name, "clean_base": clean_base, "groups": {}})
+            grp["cat_name"] = cat_name
+            grp["clean_base"] = clean_base
+            key = (variant, res)
+            # keep first relation per (variant,res) — provider priority could be added later
+            if key not in grp["groups"]:
+                grp["groups"][key] = (relation, proxy_url)
+
+            # Stop after target_batch distinct (grouped) movies have been collected,
+            # so a small batch_size yields a small, fast test run instead of scanning
+            # hundreds of relations. Flush EVERY pending group before breaking.
+            if batch_size != "all" and len(pending_movies) >= target_batch:
+                logger.info("Batch limit reached (%d movies); flushing %d pending.", target_batch, len(pending_movies))
+                _flush_all()
+                break
+        else:
+            # Iterator exhausted: flush EVERY pending group (the bug was flushing
+            # only the last one here, dropping all but one movie on a full run).
+            if pending_movies:
+                logger.info("Flushing %d remaining pending movie group(s).", len(pending_movies))
+                _flush_all()
+
+        return {
+            "counts": local_counts,
+            "detect_cache": detect_cache,
+            "scanned": scanned,
+            "deduped": deduped,
+        }
+
     def _generate_movies(self, settings: Dict[str, Any], logger, refresh_urls: bool = False):
         """Generate movie .strm files according to batch size.
 
@@ -1041,6 +1199,10 @@ class Plugin:
 
         version_format = (settings.get("version_format") or "").strip()
         ffprobe_path = (settings.get("ffprobe_path") or "ffprobe").strip() or "ffprobe"
+
+        # Load the detection cache so re-runs / interrupted runs reuse prior
+        # ffprobe results instead of re-probing every relation.
+        detect_cache = self._load_detect_cache()
 
         try:
             from apps.vod.models import M3UMovieRelation
@@ -1099,75 +1261,39 @@ class Plugin:
         deduped = 0
         errors = 0
         scanned = 0
-        pending_movies = {}
-        last_clean_base = None
-        local_counts = {"created": 0, "refreshed": 0, "unchanged": 0, "skipped": 0, "errors": 0, "missing_tmdb": 0}
 
-        # seen-set is only used when dedupe is on; kept as None otherwise so the
-        # membership check short-circuits cheaply for everyone else.
-        seen_movie_uuids = set() if dedupe_across_cats else None
+        # Delegate the grouping + flush loop to the Django-free core so it can
+        # be unit-tested without a live Dispatcharr DB. It returns the merged
+        # counters and (as a side effect) saves the detection cache.
+        loop_result = self._generate_movies_from_relations(
+            query.iterator(), settings, logger,
+            dispatcharr_url=dispatcharr_url,
+            root_folder=root_folder,
+            batch_size=batch_size,
+            target_batch=target_batch,
+            version_format=version_format,
+            ffprobe_path=ffprobe_path,
+            nest_by_cat=nest_by_cat,
+            append_tmdb_id=append_tmdb_id,
+            tmdb_tag_format=tmdb_tag_format,
+            generate_nfo=generate_nfo,
+            nfo_omit_title=nfo_omit_title,
+            omit_stream_id=omit_stream_id,
+            refresh_existing=refresh_existing,
+            dedupe_across_cats=dedupe_across_cats,
+            detect_cache=detect_cache,
+        )
+        local_counts = loop_result["counts"]
+        saved_cache = loop_result.get("detect_cache", detect_cache)
+        scanned = loop_result.get("scanned", 0)
 
-        logger.info("Processing movies:")
-        logger.info("-" * 60)
-
-        for relation in query.iterator():
-            scanned += 1
-            movie = relation.movie
-            if seen_movie_uuids is not None:
-                if movie.uuid in seen_movie_uuids:
-                    # Same movie already written under an earlier-alphabetical
-                    # category. Skip — counts under `deduped` not `skipped`.
-                    deduped += 1
-                    continue
-                seen_movie_uuids.add(movie.uuid)
-
-            cat_name = relation.category.name if relation.category else ""
-            proxy_url = self._build_proxy_url(
-                dispatcharr_url, "movie", movie.uuid, relation.stream_id, omit_stream_id,
-            )
-            # version grouping: detect variant/res per relation.
-            # Group KEY is the clean base name (tag [DUB]/[LEG]/dublado/legendado
-            # stripped) so a DUB movie and its LEG twin (separate Dispatcharr Movies)
-            # land in the SAME folder and collapse into Jellyfin/Emby Versions.
-            clean_base = self._clean_variant_name(movie.name or "")
-            # Detect ONLY what the template asks for (conditional ffprobe):
-            # {variant} => audio DUB/LEG; {res} => resolution. A user who only
-            # wants resolution grouping (e.g. non-BR, no DUB/LEG) pays no audio
-            # probe; a BR user who wants DUB/LEG pays both. Keeps the two
-            # features independent while sharing one template.
-            if version_format:
-                variant = self._detect_variant(movie.name or "", proxy_url, logger, ffprobe_path) if "{variant}" in version_format else None
-                res = self._detect_resolution(proxy_url, logger, ffprobe_path) if "{res}" in version_format else None
-            else:
-                variant, res = None, None
-
-            # group by clean base name, then (variant,res)
-            grp = pending_movies.setdefault(clean_base, {
-                "movie": movie, "cat_name": cat_name, "clean_base": clean_base, "groups": {}})
-            grp["cat_name"] = cat_name
-            grp["clean_base"] = clean_base
-            key = (variant, res)
-            # keep first relation per (variant,res) — provider priority could be added later
-            if key not in grp["groups"]:
-                grp["groups"][key] = (relation, proxy_url)
-
-            last_clean_base = clean_base
-            # Iteration cap for non-"all" batches: stop scanning after a
-            # multiple of the target so we still have a chance to group variants
-            # of nearby titles without walking the whole 500k-row table.
-            if batch_size != "all":
-                cap = target_batch * 50
-                if scanned >= cap:
-                    logger.info("Scan cap reached (%d scanned); flushing pending.", scanned)
-                    break
-        else:
-            # loop exhausted: flush the last pending movie
-            if last_clean_base is not None and last_clean_base in pending_movies:
-                c, r, u, s, e, mt = self._flush_pending_movie(
-                    pending_movies.pop(last_clean_base), root_folder, nest_by_cat, append_tmdb_id,
-                    tmdb_tag_format, generate_nfo, nfo_omit_title, version_format, omit_stream_id,
-                    refresh_existing, logger)
-                self._accum_movie_counts(local_counts, c, r, u, s, e, mt)
+        # Persist the detection cache so the next run (or a resumed partial run)
+        # reuses these ffprobe results instead of re-probing every relation.
+        try:
+            self._save_detect_cache(saved_cache)
+            logger.info("Detection cache: %d entries saved.", len(saved_cache))
+        except Exception as e:
+            logger.warning("Failed to save detection cache: %s", e)
 
         # publish grouped counters into the SUMMARY variables
         created_strm = local_counts["created"]
