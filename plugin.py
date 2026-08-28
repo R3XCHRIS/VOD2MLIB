@@ -772,6 +772,24 @@ class Plugin:
     # ------------------------------------------------------------------
     # Version grouping (DUB/LEG + resolution -> Jellyfin/Emby "Versions")
     # ------------------------------------------------------------------
+    _VARIANT_TAG_RE = re.compile(r'\[(?:DUB|LEG)\]|\(DUB\)|\(LEG\)|\b(dublado|dub|legendado|leg)\b', re.IGNORECASE)
+    _BULLET_TAG_RE = re.compile(r'▪[A-Za-z]{1,8}▪', re.IGNORECASE)
+
+    def _clean_variant_name(self, name):
+        """Strip audio-variant tags so a DUB movie and its LEG twin share a base name.
+
+        Removes [DUB]/[LEG]/(DUB)/(LEG)/dublado/legendado and bullet-wrapped codes
+        (▪DUB▪). Keeps the title and (YYYY). Collapses whitespace.
+        """
+        if not name:
+            return name
+        cleaned = self._VARIANT_TAG_RE.sub("", name)
+        cleaned = self._BULLET_TAG_RE.sub("", cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        # drop a dangling separator left after stripping (e.g. "Title - " -> "Title")
+        cleaned = cleaned.rstrip(' -').strip()
+        return cleaned
+
     _AUDIO_TAG_RE = re.compile(r'\[(?:d|l)\]|\((?:d|l)\)|\b(dublado|dub|legendado|leg)\b', re.IGNORECASE)
     _BULLET_VARIANT_RE = re.compile(r'▪[A-Za-z]{1,8}▪', re.IGNORECASE)
 
@@ -867,19 +885,35 @@ class Plugin:
                              version_format, omit_stream_id, refresh_existing, logger):
         """Write .strm (and .nfo) for one grouped movie.
 
-        pend = {"movie":, "cat_name":, "groups": {(variant,res): (relation, proxy_url)}}
+        pend = {"movie":, "cat_name":, "clean_base":, "groups": {(variant,res): (relation, proxy_url)}}
         Returns tuple of counters (created, refreshed, unchanged, skipped, errors, missing_tmdb).
+
+        The folder is named from `clean_base` (variant tags stripped) so a DUB
+        movie and its LEG twin land in the SAME folder. The version suffix is
+        applied ONLY when the group has >= 2 variants (decision A): a single-
+        variant title keeps its clean .strm name, so the rest of the library is
+        unaffected. When version_format is empty the original behaviour is kept.
         """
         movie = pend["movie"]
         cat_name = pend["cat_name"]
+        clean_base = pend.get("clean_base") or (movie.name or "")
         groups = pend["groups"]
         created = refreshed = unchanged = skipped = errors = missing_tmdb = 0
 
         if append_tmdb_id and not (getattr(movie, "tmdb_id", "") or "").strip():
             missing_tmdb += 1
 
+        # Build a lightweight stand-in so _movie_target_paths names the folder
+        # from clean_base (tags stripped) while still carrying tmdb_id/year.
+        class _Name:
+            def __init__(self, name, tmdb_id, year):
+                self.name = name
+                self.tmdb_id = tmdb_id
+                self.year = year
+        stub = _Name(clean_base, getattr(movie, "tmdb_id", ""), getattr(movie, "year", ""))
+
         movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
-            movie, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
+            stub, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
         )
         try:
             os.makedirs(movie_folder, exist_ok=True)
@@ -887,8 +921,13 @@ class Plugin:
             logger.error("  \u2717 %s: %s", movie_name, e)
             return 0, 0, 0, 0, 1, missing_tmdb
 
+        # Only stamp the version suffix when there is more than one variant in
+        # this group (so single-variant titles stay clean). Empty template =>
+        # no suffix at all (backwards compatible).
+        effective_fmt = version_format if (version_format and len(groups) >= 2) else ""
+
         for (variant, res), (relation, proxy_url) in groups.items():
-            fname = self._apply_version_format(strm_filename, version_format, variant or "", res or "")
+            fname = self._apply_version_format(strm_filename, effective_fmt, variant or "", res or "")
             strm_path = os.path.join(movie_folder, fname)
             is_existing = os.path.exists(strm_path)
             if is_existing and not refresh_existing:
@@ -1018,7 +1057,7 @@ class Plugin:
         errors = 0
         scanned = 0
         pending_movies = {}
-        last_movie_uuid = None
+        last_clean_base = None
         local_counts = {"created": 0, "refreshed": 0, "unchanged": 0, "skipped": 0, "errors": 0, "missing_tmdb": 0}
 
         # seen-set is only used when dedupe is on; kept as None otherwise so the
@@ -1043,38 +1082,46 @@ class Plugin:
             proxy_url = self._build_proxy_url(
                 dispatcharr_url, "movie", movie.uuid, relation.stream_id, omit_stream_id,
             )
-            # version grouping: detect variant/res per relation
+            # version grouping: detect variant/res per relation.
+            # Group KEY is the clean base name (tag [DUB]/[LEG]/dublado/legendado
+            # stripped) so a DUB movie and its LEG twin (separate Dispatcharr Movies)
+            # land in the SAME folder and collapse into Jellyfin/Emby Versions.
+            clean_base = self._clean_variant_name(movie.name or "")
+            # Detect ONLY what the template asks for (conditional ffprobe):
+            # {variant} => audio DUB/LEG; {res} => resolution. A user who only
+            # wants resolution grouping (e.g. non-BR, no DUB/LEG) pays no audio
+            # probe; a BR user who wants DUB/LEG pays both. Keeps the two
+            # features independent while sharing one template.
             if version_format:
-                variant = self._detect_variant(movie.name or "", proxy_url, logger, ffprobe_path)
-                res = self._detect_resolution(proxy_url, logger, ffprobe_path)
+                variant = self._detect_variant(movie.name or "", proxy_url, logger, ffprobe_path) if "{variant}" in version_format else None
+                res = self._detect_resolution(proxy_url, logger, ffprobe_path) if "{res}" in version_format else None
             else:
                 variant, res = None, None
 
-            # group by movie, then (variant,res)
-            grp = pending_movies.setdefault(movie.uuid, {
-                "movie": movie, "cat_name": cat_name, "groups": {}})
+            # group by clean base name, then (variant,res)
+            grp = pending_movies.setdefault(clean_base, {
+                "movie": movie, "cat_name": cat_name, "clean_base": clean_base, "groups": {}})
             grp["cat_name"] = cat_name
+            grp["clean_base"] = clean_base
             key = (variant, res)
             # keep first relation per (variant,res) — provider priority could be added later
             if key not in grp["groups"]:
                 grp["groups"][key] = (relation, proxy_url)
 
-            # flush previous movie when uuid changes
-            if last_movie_uuid is not None and movie.uuid != last_movie_uuid:
-                c, r, u, s, e, mt = self._flush_pending_movie(
-                    pending_movies.pop(last_movie_uuid), root_folder, nest_by_cat, append_tmdb_id,
-                    tmdb_tag_format, generate_nfo, nfo_omit_title, version_format, omit_stream_id,
-                    refresh_existing, logger)
-                self._accum_movie_counts(local_counts, c, r, u, s, e, mt)
-                if batch_size != "all" and (local_counts["created"] + local_counts["refreshed"]) >= target_batch:
-                    logger.info("Batch complete (grouped): %d new + %d refreshed .strm.", local_counts["created"], local_counts["refreshed"])
+            last_clean_base = clean_base
+            # Iteration cap for non-"all" batches: stop scanning after a
+            # multiple of the target so we still have a chance to group variants
+            # of nearby titles without walking the whole 500k-row table.
+            if batch_size != "all":
+                cap = target_batch * 50
+                if scanned >= cap:
+                    logger.info("Scan cap reached (%d scanned); flushing pending.", scanned)
                     break
-            last_movie_uuid = movie.uuid
         else:
             # loop exhausted: flush the last pending movie
-            if last_movie_uuid is not None and last_movie_uuid in pending_movies:
+            if last_clean_base is not None and last_clean_base in pending_movies:
                 c, r, u, s, e, mt = self._flush_pending_movie(
-                    pending_movies.pop(last_movie_uuid), root_folder, nest_by_cat, append_tmdb_id,
+                    pending_movies.pop(last_clean_base), root_folder, nest_by_cat, append_tmdb_id,
                     tmdb_tag_format, generate_nfo, nfo_omit_title, version_format, omit_stream_id,
                     refresh_existing, logger)
                 self._accum_movie_counts(local_counts, c, r, u, s, e, mt)
