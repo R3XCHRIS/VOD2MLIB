@@ -772,21 +772,61 @@ class Plugin:
     # ------------------------------------------------------------------
     # Version grouping (DUB/LEG + resolution -> Jellyfin/Emby "Versions")
     # ------------------------------------------------------------------
-    _VARIANT_TAG_RE = re.compile(r'\[(?:DUB|LEG)\]|\(DUB\)|\(LEG\)|\b(dublado|dub|legendado|leg)\b', re.IGNORECASE)
+    # Title normalization for version grouping — reuses the norm2 rule VALIDATED
+    # 28/08 against the live 83k-movie catalogue: 15.7% dedupe, ZERO false-merge.
+    # norm2 strips year (anywhere), [TAG]/(x) brackets, and EVERY non-alphanumeric
+    # char, so format variants ("15h17 - Trem Para Paris 4K" vs "15h17 Trem para
+    # Paris") and audio tags ([DUB]/[LEG]/dublado/legendado) collapse to one key.
+    # Only formatting differs between merged titles — never different words.
+    #
+    # For the plugin we ALSO strip quality/edition tokens (4K/1080p/HDR/...) from
+    # the grouping key, because IPTV providers stuff resolution into the title
+    # (e.g. "#SalveRosa 4K [HDR]") and those must collapse into the same title.
+    _NORM2_YEAR_RE = re.compile(r'\([0-9]{4}\)')
+    _NORM2_BRACKET_RE = re.compile(r'\[[A-Za-z0-9]+\]')
+    _NORM2_PAREN_RE = re.compile(r'\([a-z]\)')
+    _NORM2_DUBLEG_RE = re.compile(
+        r'-\s*(dub|leg|dual).*$|'          # "- dub ..." / "- leg ..." (hifen)
+        r'\s+(dub|leg|dual)\s*$|'          # " Title LEG" / " Title DUB" (tag solta no fim)
+        r'\([0-9]{4}\)\s*(dub|leg|dual)\s*$',  # " Title (2018) LEG" (após ano)
+        re.IGNORECASE)
+    _QUALITY_TOKEN_RE = re.compile(
+        r'#|\b(4K|2160P|1080P|720P|480P|FHD|UHD|HD|HDR10\+|HDR|DV|DOLBY|REMUX|BLURAY|BDRIP|WEBDL|WEB-DL|HEVC|H265|X264|X265)\b',
+        re.IGNORECASE)
+    _AUDIO_TAG_RE = re.compile(r'\[(?:DUB|LEG|[LD])\]|\((?:DUB|LEG|[LD])\)|\b(dublado|dub|legendado|leg)\b', re.IGNORECASE)
     _BULLET_TAG_RE = re.compile(r'▪[A-Za-z]{1,8}▪', re.IGNORECASE)
 
     def _clean_variant_name(self, name):
-        """Strip audio-variant tags so a DUB movie and its LEG twin share a base name.
+        """Grouping KEY for version grouping (norm2 + quality tokens stripped).
 
-        Removes [DUB]/[LEG]/(DUB)/(LEG)/dublado/legendado and bullet-wrapped codes
-        (▪DUB▪). Keeps the title and (YYYY). Collapses whitespace.
+        Collapses every formatting/resolution/audio variant of a title to one
+        alnum string so a DUB 1080p movie and its LEG 4K twin (separate
+        Dispatcharr Movies with differently-formatted names) land in ONE folder.
+        Used ONLY as the group key — NOT as the on-disk folder name (see
+        _display_title for that).
         """
         if not name:
             return name
-        cleaned = self._VARIANT_TAG_RE.sub("", name)
+        n = name.lower()
+        n = self._NORM2_YEAR_RE.sub("", n)
+        n = self._NORM2_BRACKET_RE.sub("", n)
+        n = self._NORM2_PAREN_RE.sub("", n)
+        n = self._NORM2_DUBLEG_RE.sub("", n)
+        n = self._QUALITY_TOKEN_RE.sub("", n)
+        return re.sub(r'[^a-z0-9]', '', n)
+
+    def _display_title(self, name):
+        """Human-readable folder/title name: tags + quality tokens stripped but
+        spacing and (YYYY) kept, so the Jellyfin library shows a clean title like
+        'SalveRosa (2025)' / '15h17 Trem Para Paris (2018)' instead of the norm2
+        collage 'salverosa' / '15h17trempaparis'.
+        """
+        if not name:
+            return name
+        cleaned = self._AUDIO_TAG_RE.sub("", name)
         cleaned = self._BULLET_TAG_RE.sub("", cleaned)
+        cleaned = self._QUALITY_TOKEN_RE.sub("", cleaned)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-        # drop a dangling separator left after stripping (e.g. "Title - " -> "Title")
         cleaned = cleaned.rstrip(' -').strip()
         return cleaned
 
@@ -910,7 +950,10 @@ class Plugin:
                 self.name = name
                 self.tmdb_id = tmdb_id
                 self.year = year
-        stub = _Name(clean_base, getattr(movie, "tmdb_id", ""), getattr(movie, "year", ""))
+        # Folder name uses the human-readable display title (tags/quality stripped
+        # but spacing + (YYYY) kept), NOT the norm2 collage used as the group key.
+        display_name = self._display_title(movie.name or clean_base)
+        stub = _Name(display_name, getattr(movie, "tmdb_id", ""), getattr(movie, "year", ""))
 
         movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
             stub, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
