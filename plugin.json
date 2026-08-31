@@ -119,6 +119,22 @@
       "help_text": "When ON, .strm URLs omit ?stream_id=, so Dispatcharr's VOD proxy resolves and fails over across every account carrying the title instead of being locked to the one relation this plugin happened to pick. Requires a patched Dispatcharr with VOD failover support (PR #1398). When OFF (default), the .strm is pinned to this plugin's selected relation, matching original behavior."
     },
     {
+      "id": "version_format",
+      "label": "Version suffix template",
+      "type": "string",
+      "default": "",
+      "placeholder": " - {variant} {res}",
+      "help_text": "When a movie has multiple audio variants (DUB/LEG) or resolutions, group them into separate .strm files (Jellyfin/Emby 'Versions'). The template is appended to the .strm filename. Placeholders: {variant} = DUB|LEG (detected from the title tag or audio language), {res} = 720p|1080p|4K (detected via ffprobe). Examples: ' - {variant} {res}' -> 'Title (2021) - DUB 720p.strm' (Jellyfin collapses these into one item with a Versions picker); '[{variant}-{res}]' -> 'Title (2021) [DUB-720p].strm'. Leave EMPTY to keep the original behaviour (one .strm per movie, first source wins). Detection: title tag [DUB]/[LEG]/dublado/legendado wins; otherwise ffprobe audio language por->DUB, eng/und->LEG; und->DUB. Resolution from ffprobe width. Requires ffprobe on the Dispatcharr host."
+    },
+    {
+      "id": "ffprobe_path",
+      "label": "ffprobe binary path",
+      "type": "string",
+      "default": "ffprobe",
+      "placeholder": "/usr/bin/ffprobe",
+      "help_text": "Absolute path (or bare name resolved via PATH) to the ffprobe binary used for audio-language and resolution detection when Version suffix template is set. Leave 'ffprobe' to use PATH. Detection is skipped (variant=und->DUB, res=SD) if ffprobe is missing or fails."
+    },
+    {
       "id": "category_filter",
       "label": "Category Filter (include only)",
       "type": "string",

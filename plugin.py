@@ -14,6 +14,7 @@ This fork:  https://github.com/R3XCHRIS/VOD2MLIB
 """
 import os
 import re
+import json
 from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -769,6 +770,390 @@ class Plugin:
             return f"{base_name} [tmdbid-{tmdb_id}]"
         return f"{base_name} {{tmdb-{tmdb_id}}}"
 
+    # ------------------------------------------------------------------
+    # Version grouping (DUB/LEG + resolution -> Jellyfin/Emby "Versions")
+    # ------------------------------------------------------------------
+    # Title normalization for version grouping — reuses the norm2 rule VALIDATED
+    # 28/08 against the live 83k-movie catalogue: 15.7% dedupe, ZERO false-merge.
+    # norm2 strips year (anywhere), [TAG]/(x) brackets, and EVERY non-alphanumeric
+    # char, so format variants ("15h17 - Trem Para Paris 4K" vs "15h17 Trem para
+    # Paris") and audio tags ([DUB]/[LEG]/dublado/legendado) collapse to one key.
+    # Only formatting differs between merged titles — never different words.
+    #
+    # For the plugin we ALSO strip quality/edition tokens (4K/1080p/HDR/...) from
+    # the grouping key, because IPTV providers stuff resolution into the title
+    # (e.g. "#SalveRosa 4K [HDR]") and those must collapse into the same title.
+    _NORM2_YEAR_RE = re.compile(r'\([0-9]{4}\)')
+    _NORM2_BRACKET_RE = re.compile(r'\[[A-Za-z0-9]+\]')
+    _NORM2_PAREN_RE = re.compile(r'\([a-z]\)')
+    _NORM2_DUBLEG_RE = re.compile(
+        r'-\s*(dub|leg|dual).*$|'          # "- dub ..." / "- leg ..." (hifen)
+        r'\s+(dub|leg|dual)\s*$|'          # " Title LEG" / " Title DUB" (tag solta no fim)
+        r'\([0-9]{4}\)\s*(dub|leg|dual)\s*$',  # " Title (2018) LEG" (após ano)
+        re.IGNORECASE)
+    _QUALITY_TOKEN_RE = re.compile(
+        r'#|\b(4K|2160P|1080P|720P|480P|FHD|UHD|HD|HDR10\+|HDR|DV|DOLBY|REMUX|BLURAY|BDRIP|WEBDL|WEB-DL|HEVC|H265|X264|X265)\b',
+        re.IGNORECASE)
+    _AUDIO_TAG_RE = re.compile(r'\[(?:DUB|LEG|[LD])\]|\((?:DUB|LEG|[LD])\)|\b(dublado|dub|legendado|leg)\b', re.IGNORECASE)
+    _BULLET_TAG_RE = re.compile(r'▪[A-Za-z]{1,8}▪', re.IGNORECASE)
+
+    # --- Detection cache ---------------------------------------------------
+    # ffprobe is the slow part (3-15s per relation). We cache each relation's
+    # detected (variant, res) keyed by (movie_uuid, stream_id) so a re-run (or a
+    # partial run that was stopped mid-way) reuses prior probes instead of
+    # re-probing 570k relations. Cache lives on disk next to the plugin and is
+    # written atomically.
+    _DETECT_CACHE_FILE = "/data/plugins/vod2mlib/.detect_cache.json"
+
+    def _load_detect_cache(self):
+        try:
+            with open(self._DETECT_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, ValueError):
+            return {}
+
+    def _save_detect_cache(self, cache):
+        tmp = self._DETECT_CACHE_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            os.replace(tmp, self._DETECT_CACHE_FILE)
+        except OSError as e:
+            # Non-fatal: a missed cache write just means a future re-probe.
+            pass
+
+    def _detect_variant_cached(self, cache, rel_id, name, proxy_url, logger, ffprobe_path):
+        key = str(rel_id)
+        if key in cache and "variant" in cache[key]:
+            return cache[key]["variant"]
+        v = self._detect_variant(name, proxy_url, logger, ffprobe_path)
+        cache.setdefault(key, {})["variant"] = v
+        return v
+
+    def _detect_resolution_cached(self, cache, rel_id, proxy_url, logger, ffprobe_path):
+        key = str(rel_id)
+        if key in cache and "res" in cache[key]:
+            return cache[key]["res"]
+        r = self._detect_resolution(proxy_url, logger, ffprobe_path)
+        cache.setdefault(key, {})["res"] = r
+        return r
+
+    def _clean_variant_name(self, name):
+        """Grouping KEY for version grouping (norm2 + quality tokens stripped).
+
+        Collapses every formatting/resolution/audio variant of a title to one
+        alnum string so a DUB 1080p movie and its LEG 4K twin (separate
+        Dispatcharr Movies with differently-formatted names) land in ONE folder.
+        Used ONLY as the group key — NOT as the on-disk folder name (see
+        _display_title for that).
+        """
+        if not name:
+            return name
+        n = name.lower()
+        n = self._NORM2_YEAR_RE.sub("", n)
+        n = self._NORM2_BRACKET_RE.sub("", n)
+        n = self._NORM2_PAREN_RE.sub("", n)
+        n = self._NORM2_DUBLEG_RE.sub("", n)
+        n = self._QUALITY_TOKEN_RE.sub("", n)
+        return re.sub(r'[^a-z0-9]', '', n)
+
+    def _display_title(self, name):
+        """Human-readable folder/title name: tags + quality tokens stripped but
+        spacing and (YYYY) kept, so the Jellyfin library shows a clean title like
+        'SalveRosa (2025)' / '15h17 Trem Para Paris (2018)' instead of the norm2
+        collage 'salverosa' / '15h17trempaparis'.
+        """
+        if not name:
+            return name
+        cleaned = self._AUDIO_TAG_RE.sub("", name)
+        cleaned = self._BULLET_TAG_RE.sub("", cleaned)
+        cleaned = self._QUALITY_TOKEN_RE.sub("", cleaned)
+        # Drop brackets/parens left empty after tag removal ("SalveRosa [] (2025)"
+        # -> "SalveRosa (2025)"), so the on-disk folder keeps a clean title.
+        cleaned = re.sub(r'\[\s*\]', '', cleaned)
+        cleaned = re.sub(r'\(\s*\)', '', cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        cleaned = cleaned.rstrip(' -').strip()
+        return cleaned
+
+    _AUDIO_TAG_RE = re.compile(r'\[(?:d|l)\]|\((?:d|l)\)|\b(dublado|dub|legendado|leg)\b', re.IGNORECASE)
+    _BULLET_VARIANT_RE = re.compile(r'▪[A-Za-z]{1,8}▪', re.IGNORECASE)
+
+    def _detect_variant(self, name, proxy_url, logger, ffprobe_path="ffprobe"):
+        """DUB vs LEG for a movie relation.
+
+        Priority: explicit title tag ([DUB]/[LEG]/dublado/legendado/▪XX▪) wins.
+        Else ffprobe the proxy and read the audio stream language
+        (por -> DUB; eng/und/jpn/spa -> LEG). Fallback: und -> DUB.
+        """
+        low = (name or "").lower()
+        tag = self._AUDIO_TAG_RE.search(low)
+        if tag:
+            tok = tag.group(0).lower()
+            if 'leg' in tok or tok in ('[l]', '(l)', 'l'):
+                return "LEG"
+            if 'dub' in tok or tok in ('[d]', '(d)', 'd'):
+                return "DUB"
+        bul = self._BULLET_VARIANT_RE.search(name or "")
+        if bul:
+            b = bul.group(0).lower().strip('▪').strip()
+            if 'leg' in b:
+                return "LEG"
+            if 'dub' in b:
+                return "DUB"
+        try:
+            import subprocess, json as _json
+            r = subprocess.run(
+                [ffprobe_path, "-v", "error", "-user_agent", "Mozilla/5.0",
+                 "-analyzeduration", "4000000", "-probesize", "2000000", "-timeout", "15000000",
+                 "-i", proxy_url,
+                 "-show_entries", "stream=codec_type,language:stream_tags=language", "-of", "json"],
+                capture_output=True, text=True, timeout=40)
+            j = _json.loads(r.stdout)
+            langs = [(s.get('tags', {}).get('language') or s.get('language') or 'und')
+                     for s in j.get('streams', []) if s.get('codec_type') == 'audio']
+            if any(l == 'por' for l in langs):
+                return "DUB"
+            if langs and all(l in ('eng', 'und', 'jpn', 'spa') for l in langs):
+                return "LEG"
+        except Exception as e:
+            logger.debug("ffprobe variant detect failed for %s: %s", name, e)
+        return "DUB"
+
+    def _detect_resolution(self, proxy_url, logger, ffprobe_path="ffprobe"):
+        """Resolution label from ffprobe width: 4K / 1080p / 720p / <w>p."""
+        try:
+            import subprocess, json as _json
+            r = subprocess.run(
+                [ffprobe_path, "-v", "error", "-user_agent", "Mozilla/5.0",
+                 "-analyzeduration", "4000000", "-probesize", "2000000", "-timeout", "15000000",
+                 "-i", proxy_url, "-show_entries", "stream=width,codec_type", "-of", "json"],
+                capture_output=True, text=True, timeout=40)
+            j = _json.loads(r.stdout)
+            v = [s for s in j.get('streams', []) if s.get('codec_type') == 'video']
+            if not v:
+                return "SD"
+            w = v[0].get('width') or 0
+            if w >= 3840:
+                return "4K"
+            if w >= 1920:
+                return "1080p"
+            if w >= 1280:
+                return "720p"
+            return f"{w}p" if w else "SD"
+        except Exception as e:
+            logger.debug("ffprobe resolution detect failed: %s", e)
+            return "SD"
+
+    def _apply_version_format(self, strm_filename, version_format, variant, res):
+        """Append the version suffix template to a .strm filename.
+
+        version_format may use {variant} and {res}. Empty => unchanged.
+        """
+        if not version_format:
+            return strm_filename
+        suffix = version_format.replace("{variant}", variant).replace("{res}", res)
+        if ".strm" in strm_filename:
+            base, _ = strm_filename.rsplit(".strm", 1)
+            return f"{base}{suffix}.strm"
+        return f"{strm_filename}{suffix}"
+
+    def _accum_movie_counts(self, lc, created, refreshed, unchanged, skipped, errors, missing_tmdb):
+        lc["created"] += created
+        lc["refreshed"] += refreshed
+        lc["unchanged"] += unchanged
+        lc["skipped"] += skipped
+        lc["errors"] += errors
+        lc["missing_tmdb"] += missing_tmdb
+
+    def _flush_pending_movie(self, pend, root_folder, nest_by_cat, append_tmdb_id,
+                             tmdb_tag_format, generate_nfo, nfo_omit_title,
+                             version_format, omit_stream_id, refresh_existing, logger):
+        """Write .strm (and .nfo) for one grouped movie.
+
+        pend = {"movie":, "cat_name":, "clean_base":, "groups": {(variant,res): (relation, proxy_url)}}
+        Returns tuple of counters (created, refreshed, unchanged, skipped, errors, missing_tmdb).
+
+        The folder is named from `clean_base` (variant tags stripped) so a DUB
+        movie and its LEG twin land in the SAME folder. The version suffix is
+        applied ONLY when the group has >= 2 variants (decision A): a single-
+        variant title keeps its clean .strm name, so the rest of the library is
+        unaffected. When version_format is empty the original behaviour is kept.
+        """
+        movie = pend["movie"]
+        cat_name = pend["cat_name"]
+        clean_base = pend.get("clean_base") or (movie.name or "")
+        groups = pend["groups"]
+        created = refreshed = unchanged = skipped = errors = missing_tmdb = 0
+
+        if append_tmdb_id and not (getattr(movie, "tmdb_id", "") or "").strip():
+            missing_tmdb += 1
+
+        # Build a lightweight stand-in so _movie_target_paths names the folder
+        # from clean_base (tags stripped) while still carrying tmdb_id/year.
+        class _Name:
+            def __init__(self, name, tmdb_id, year):
+                self.name = name
+                self.tmdb_id = tmdb_id
+                self.year = year
+        # Folder name uses the human-readable display title (tags/quality stripped
+        # but spacing + (YYYY) kept), NOT the norm2 collage used as the group key.
+        display_name = self._display_title(movie.name or clean_base)
+        stub = _Name(display_name, getattr(movie, "tmdb_id", ""), getattr(movie, "year", ""))
+
+        movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
+            stub, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
+        )
+        try:
+            os.makedirs(movie_folder, exist_ok=True)
+        except OSError as e:
+            logger.error("  \u2717 %s: %s", movie_name, e)
+            return 0, 0, 0, 0, 1, missing_tmdb
+
+        # Only stamp the version suffix when there is more than one variant in
+        # this group (so single-variant titles stay clean). Empty template =>
+        # no suffix at all (backwards compatible).
+        effective_fmt = version_format if (version_format and len(groups) >= 2) else ""
+
+        for (variant, res), (relation, proxy_url) in groups.items():
+            fname = self._apply_version_format(strm_filename, effective_fmt, variant or "", res or "")
+            strm_path = os.path.join(movie_folder, fname)
+            is_existing = os.path.exists(strm_path)
+            if is_existing and not refresh_existing:
+                skipped += 1
+                continue
+            try:
+                changed = self._write_if_different_preserve_times(strm_path, proxy_url)
+                if not changed:
+                    unchanged += 1
+                elif is_existing:
+                    refreshed += 1
+                else:
+                    created += 1
+                if generate_nfo:
+                    nfo_filename = fname.replace('.strm', '.nfo')
+                    nfo_path = os.path.join(movie_folder, nfo_filename)
+                    if not os.path.exists(nfo_path):
+                        category_name = relation.category.name if relation.category else ""
+                        with open(nfo_path, 'w', encoding='utf-8') as f:
+                            f.write(self._generate_nfo(movie, category_name, nfo_omit_title))
+            except OSError as e:
+                logger.error("  \u2717 %s: %s", movie_name, e)
+                errors += 1
+        return created, refreshed, unchanged, skipped, errors, missing_tmdb
+
+    def _generate_movies_from_relations(self, relations_iter, settings, logger,
+                                       dispatcharr_url, root_folder, batch_size,
+                                       target_batch, version_format, ffprobe_path,
+                                       nest_by_cat, append_tmdb_id, tmdb_tag_format,
+                                       generate_nfo, nfo_omit_title, omit_stream_id,
+                                       refresh_existing, dedupe_across_cats,
+                                       detect_cache):
+        """Django-free core of the movie generation loop.
+
+        Walks `relations_iter` (an iterator of M3UMovieRelation-like objects),
+        groups relations by clean title + (variant, res), and flushes one or
+        more .strm files per group. Returns a dict with the merged counters and
+        the (possibly updated) detection cache.
+
+        Kept free of any Django import so it can be unit-tested without a live
+        Dispatcharr database. All DB/wiring (query construction, active-account
+        filtering, category filter, the `apps.vod.models` import) stays in
+        `_generate_movies`, which calls this with `query.iterator()`.
+
+        The grouping is lazy: pending groups accumulate in `pending_movies`
+        until either (a) the batch_size limit is reached (then ALL pending
+        groups are flushed before breaking) or (b) the iterator is exhausted
+        (then ALL pending groups are flushed). The exhaustion branch MUST flush
+        every group — a previous bug only flushed the last one, silently
+        dropping every other movie on a full run.
+        """
+        local_counts = {"created": 0, "refreshed": 0, "unchanged": 0,
+                        "skipped": 0, "errors": 0, "missing_tmdb": 0}
+        pending_movies = {}
+        scanned = 0
+        deduped = 0
+
+        # seen-set is only used when dedupe is on; kept as None otherwise so the
+        # membership check short-circuits cheaply for everyone else.
+        seen_movie_uuids = set() if dedupe_across_cats else None
+
+        def _flush_all():
+            flushed = 0
+            for _cb in list(pending_movies.keys()):
+                c, r, u, s, e, mt = self._flush_pending_movie(
+                    pending_movies.pop(_cb), root_folder, nest_by_cat, append_tmdb_id,
+                    tmdb_tag_format, generate_nfo, nfo_omit_title, version_format,
+                    omit_stream_id, refresh_existing, logger)
+                self._accum_movie_counts(local_counts, c, r, u, s, e, mt)
+                flushed += 1
+            return flushed
+
+        logger.info("Processing movies:")
+        logger.info("-" * 60)
+
+        for relation in relations_iter:
+            scanned += 1
+            movie = relation.movie
+            if seen_movie_uuids is not None:
+                if movie.uuid in seen_movie_uuids:
+                    # Same movie already written under an earlier-alphabetical
+                    # category. Skip — counts under `deduped` not `skipped`.
+                    deduped += 1
+                    continue
+                seen_movie_uuids.add(movie.uuid)
+
+            cat_name = relation.category.name if relation.category else ""
+            proxy_url = self._build_proxy_url(
+                dispatcharr_url, "movie", movie.uuid, relation.stream_id, omit_stream_id,
+            )
+            # version grouping: detect variant/res per relation.
+            # Group KEY is the clean base name (tag [DUB]/[LEG]/dublado/legendado
+            # stripped) so a DUB movie and its LEG twin (separate Dispatcharr Movies)
+            # land in the SAME folder and collapse into Jellyfin/Emby Versions.
+            clean_base = self._clean_variant_name(movie.name or "")
+            # Detect ONLY what the template asks for (conditional ffprobe):
+            # {variant} => audio DUB/LEG; {res} => resolution. A user who only
+            # wants resolution grouping (e.g. non-BR, no DUB/LEG) pays no audio
+            # probe; a BR user who wants DUB/LEG pays both. Keeps the two
+            # features independent while sharing one template.
+            if version_format:
+                variant = self._detect_variant_cached(detect_cache, relation.id, movie.name or "", proxy_url, logger, ffprobe_path) if "{variant}" in version_format else None
+                res = self._detect_resolution_cached(detect_cache, relation.id, proxy_url, logger, ffprobe_path) if "{res}" in version_format else None
+            else:
+                variant, res = None, None
+
+            # group by clean base name, then (variant,res)
+            grp = pending_movies.setdefault(clean_base, {
+                "movie": movie, "cat_name": cat_name, "clean_base": clean_base, "groups": {}})
+            grp["cat_name"] = cat_name
+            grp["clean_base"] = clean_base
+            key = (variant, res)
+            # keep first relation per (variant,res) — provider priority could be added later
+            if key not in grp["groups"]:
+                grp["groups"][key] = (relation, proxy_url)
+
+            # Stop after target_batch distinct (grouped) movies have been collected,
+            # so a small batch_size yields a small, fast test run instead of scanning
+            # hundreds of relations. Flush EVERY pending group before breaking.
+            if batch_size != "all" and len(pending_movies) >= target_batch:
+                logger.info("Batch limit reached (%d movies); flushing %d pending.", target_batch, len(pending_movies))
+                _flush_all()
+                break
+        else:
+            # Iterator exhausted: flush EVERY pending group (the bug was flushing
+            # only the last one here, dropping all but one movie on a full run).
+            if pending_movies:
+                logger.info("Flushing %d remaining pending movie group(s).", len(pending_movies))
+                _flush_all()
+
+        return {
+            "counts": local_counts,
+            "detect_cache": detect_cache,
+            "scanned": scanned,
+            "deduped": deduped,
+        }
+
     def _generate_movies(self, settings: Dict[str, Any], logger, refresh_urls: bool = False):
         """Generate movie .strm files according to batch size.
 
@@ -811,6 +1196,13 @@ class Plugin:
             "Category filter": category_filter or "(all)",
             "Category exclude": category_exclude or "(none)",
         })
+
+        version_format = (settings.get("version_format") or "").strip()
+        ffprobe_path = (settings.get("ffprobe_path") or "ffprobe").strip() or "ffprobe"
+
+        # Load the detection cache so re-runs / interrupted runs reuse prior
+        # ffprobe results instead of re-probing every relation.
+        detect_cache = self._load_detect_cache()
 
         try:
             from apps.vod.models import M3UMovieRelation
@@ -870,95 +1262,46 @@ class Plugin:
         errors = 0
         scanned = 0
 
-        # seen-set is only used when dedupe is on; kept as None otherwise so the
-        # membership check short-circuits cheaply for everyone else.
-        seen_movie_uuids = set() if dedupe_across_cats else None
+        # Delegate the grouping + flush loop to the Django-free core so it can
+        # be unit-tested without a live Dispatcharr DB. It returns the merged
+        # counters and (as a side effect) saves the detection cache.
+        loop_result = self._generate_movies_from_relations(
+            query.iterator(), settings, logger,
+            dispatcharr_url=dispatcharr_url,
+            root_folder=root_folder,
+            batch_size=batch_size,
+            target_batch=target_batch,
+            version_format=version_format,
+            ffprobe_path=ffprobe_path,
+            nest_by_cat=nest_by_cat,
+            append_tmdb_id=append_tmdb_id,
+            tmdb_tag_format=tmdb_tag_format,
+            generate_nfo=generate_nfo,
+            nfo_omit_title=nfo_omit_title,
+            omit_stream_id=omit_stream_id,
+            refresh_existing=refresh_existing,
+            dedupe_across_cats=dedupe_across_cats,
+            detect_cache=detect_cache,
+        )
+        local_counts = loop_result["counts"]
+        saved_cache = loop_result.get("detect_cache", detect_cache)
+        scanned = loop_result.get("scanned", 0)
 
-        logger.info("Processing movies:")
-        logger.info("-" * 60)
+        # Persist the detection cache so the next run (or a resumed partial run)
+        # reuses these ffprobe results instead of re-probing every relation.
+        try:
+            self._save_detect_cache(saved_cache)
+            logger.info("Detection cache: %d entries saved.", len(saved_cache))
+        except Exception as e:
+            logger.warning("Failed to save detection cache: %s", e)
 
-        for relation in query.iterator():
-            scanned += 1
-            movie = relation.movie
-            if seen_movie_uuids is not None:
-                if movie.uuid in seen_movie_uuids:
-                    # Same movie already written under an earlier-alphabetical
-                    # category. Skip — counts under `deduped` not `skipped`.
-                    deduped += 1
-                    continue
-                seen_movie_uuids.add(movie.uuid)
-            cat_name = relation.category.name if relation.category else ""
-            # Track titles the TMDB tag can't be applied to, so "I ticked the
-            # box and nothing changed" isn't silent (reported by @drahmed86).
-            if append_tmdb_id and not (getattr(movie, "tmdb_id", "") or "").strip():
-                missing_tmdb_id += 1
-            movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
-                movie, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
-            )
-            strm_path = os.path.join(movie_folder, strm_filename)
-            is_existing = os.path.exists(strm_path)
-
-            if is_existing and not refresh_existing:
-                skipped += 1
-                continue
-
-            proxy_url = self._build_proxy_url(
-                dispatcharr_url, "movie", movie.uuid, relation.stream_id, omit_stream_id,
-            )
-            written = created_strm + refreshed_strm
-            log_this = (written + 1) % self.LOG_EVERY == 1 or written < self.LOG_FIRST_N
-            verb = "refreshed" if is_existing else "created"
-            if log_this:
-                logger.info("")
-                logger.info("[%d %s / %d scanned] %s (%s)", written + 1, verb, scanned, movie_name, year or "—")
-
-            try:
-                os.makedirs(movie_folder, exist_ok=True)
-                changed = self._write_if_different_preserve_times(strm_path, proxy_url)
-                if not changed:
-                    unchanged_strm += 1
-                elif is_existing:
-                    refreshed_strm += 1
-                else:
-                    created_strm += 1
-
-                wrote_nfo = False
-                if generate_nfo:
-                    nfo_filename = strm_filename.replace('.strm', '.nfo')
-                    nfo_path = os.path.join(movie_folder, nfo_filename)
-                    if not os.path.exists(nfo_path):
-                        category_name = relation.category.name if relation.category else ""
-                        with open(nfo_path, 'w', encoding='utf-8') as f:
-                            f.write(self._generate_nfo(movie, category_name, nfo_omit_title))
-                        created_nfo += 1
-                        wrote_nfo = True
-
-                if log_this:
-                    if changed:
-                        logger.info("  ✓ wrote .strm%s", " + .nfo" if wrote_nfo else "")
-                    else:
-                        logger.info("  · .strm already current (mtime preserved)%s", " + wrote .nfo" if wrote_nfo else "")
-            except OSError as e:
-                logger.error("  ✗ %s: %s", movie_name, e)
-                errors += 1
-
-            if batch_size != "all":
-                # In refresh mode an already-current file still counts as
-                # "processed" for pacing, so the batch limit behaves as it did
-                # before no-op writes were skipped (#11).
-                limit_hit = (
-                    (refreshed_strm + created_strm + unchanged_strm) >= target_batch
-                    if refresh_existing
-                    else created_strm >= target_batch
-                )
-                if limit_hit:
-                    logger.info("")
-                    if refresh_existing:
-                        logger.info("Batch complete: %d new + %d refreshed .strm (scanned %d).", created_strm, refreshed_strm, scanned)
-                    else:
-                        logger.info("Batch complete: %d new .strm written (scanned %d, %d already done).", created_strm, scanned, skipped)
-                    break
-
+        # publish grouped counters into the SUMMARY variables
+        created_strm = local_counts["created"]
+        refreshed_strm = local_counts["refreshed"]
+        unchanged_strm = local_counts["unchanged"]
+        skipped = local_counts["skipped"]
+        errors = local_counts["errors"]
+        missing_tmdb_id = local_counts["missing_tmdb"]
         logger.info("")
         logger.info("=" * 60)
         logger.info("SUMMARY:")
