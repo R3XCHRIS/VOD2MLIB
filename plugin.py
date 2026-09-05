@@ -1,6 +1,11 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
+
+This fork adds local patches beyond stock v1.18.0 — see README.md for what's
+different (language detection: NFO tag, filename/folder suffix, sync filter,
+nest-by-language, and a full ISO 639-1 code/name table).
+
 v1.18.0 — cleaner NFO titles (provider tags/quality tokens stripped)
           plus an option to omit <title> entirely so Jellyfin uses TMDB;
           collapse duplicate episode relations to one .strm; bigger
@@ -70,16 +75,174 @@ class Plugin:
     # MANDATORY trailing space, so real titles that merely contain a "+"
     # survive — "Love+War" and "Genera+ion" are both real films.
     _PROVIDER_PLUS_TAG_RE = re.compile(r'^[A-Z0-9]{1,6}(?:[-_][A-Z0-9]{1,6})*\+\s+')
-    _LEADING_DELIM_TAG_RE = re.compile(r'^(?:[\[\(\|]\s*[A-Za-z0-9][A-Za-z0-9 +\-]{0,9}\s*[\]\)\|]\s*)+')
+    _LEADING_DELIM_TAG_RE = re.compile(r'^(?:[\[\(\|]\s*([A-Za-z0-9][A-Za-z0-9 +\-]{0,9})\s*[\]\)\|]\s*)+')
     _EMPTY_DELIM_RE = re.compile(r'[\[\(]\s*[\]\)]')
     _LANGUAGE_PREFIX_RE = re.compile(
         r'^(?:'
-        r'[A-Z]{2,3}\s+-\s*'                              # EN - Title
-        r'|[A-Z]{2,3}\s*\|\s*'                            # EN| Title
-        r'|EN\s+'                                         # EN Title (EN only)
-        r'|[' + _BULLET_CHARS + r']+\s*[A-Za-z]{2,8}\s*[' + _BULLET_CHARS + r']+\s*'  # ▪NL▪ Title
+        r'([A-Z]{2,3})\s+-\s*'                              # EN - Title
+        r'|([A-Z]{2,3})\s*\|\s*'                            # EN| Title
+        r'|(EN)\s+'                                         # EN Title (EN only)
+        r'|[' + _BULLET_CHARS + r']+\s*([A-Za-z]{2,8})\s*[' + _BULLET_CHARS + r']+\s*'  # ▪NL▪ Title
         r')'
     )
+    # Provider-token -> ISO 639-1 map for _extract_language_prefix. This is the
+    # ONLY source of truth for what counts as a real language — there is no
+    # "any 2-letter token passes through" fallback (v1.19.0 and earlier had
+    # one; it was removed in v1.20.0 because it silently accepted junk like
+    # "NF" (Netflix, a source label) as if it were a real ISO code — see
+    # _NON_LANGUAGE_TOKENS below for tokens that look like a code but aren't).
+    # Covers, in order:
+    #   1. The full ISO 639-1 set (identity: "ES" -> "es", etc.) so any
+    #      standard 2-letter code a provider uses resolves correctly.
+    #   2. Common ISO 639-2 three-letter codes, including both
+    #      bibliographic/terminology variants where they differ (e.g. GER/DEU
+    #      both -> de) and other common shorthand providers actually use
+    #      (ENG, JPN, TGL, HEB...).
+    #   3. Provider-specific 2-letter overrides confirmed against a real
+    #      multi-provider catalogue (see comment block below) — country-style
+    #      shorthand that ISN'T a valid ISO 639-1 code itself (GR, AL, IR, PH,
+    #      QC, DK), or a deliberate override of a technically-different ISO
+    #      639-1 meaning where real-world evidence overwhelmingly says
+    #      otherwise (SE).
+    _LANGUAGE_CODE_MAP = {
+        # --- ISO 639-1 identity (2-letter code -> itself) ---
+        "AA": "aa", "AB": "ab", "AE": "ae", "AF": "af", "AK": "ak", "AM": "am",
+        "AN": "an", "AR": "ar", "AS": "as", "AV": "av", "AY": "ay", "AZ": "az",
+        "BA": "ba", "BE": "be", "BG": "bg", "BH": "bh", "BI": "bi", "BM": "bm",
+        "BN": "bn", "BO": "bo", "BR": "br", "BS": "bs", "CA": "ca", "CE": "ce",
+        "CH": "ch", "CO": "co", "CR": "cr", "CS": "cs", "CU": "cu", "CV": "cv",
+        "CY": "cy", "DA": "da", "DE": "de", "DV": "dv", "DZ": "dz", "EE": "ee",
+        "EL": "el", "EN": "en", "EO": "eo", "ES": "es", "ET": "et", "EU": "eu",
+        "FA": "fa", "FF": "ff", "FI": "fi", "FJ": "fj", "FO": "fo", "FR": "fr",
+        "FY": "fy", "GA": "ga", "GD": "gd", "GL": "gl", "GN": "gn", "GU": "gu",
+        "GV": "gv", "HA": "ha", "HE": "he", "HI": "hi", "HO": "ho", "HR": "hr",
+        "HT": "ht", "HU": "hu", "HY": "hy", "HZ": "hz", "IA": "ia", "ID": "id",
+        "IE": "ie", "IG": "ig", "II": "ii", "IK": "ik", "IO": "io", "IS": "is",
+        "IT": "it", "IU": "iu", "JA": "ja", "JV": "jv", "KA": "ka", "KG": "kg",
+        "KI": "ki", "KJ": "kj", "KK": "kk", "KL": "kl", "KM": "km", "KN": "kn",
+        "KO": "ko", "KR": "kr", "KS": "ks", "KU": "ku", "KV": "kv", "KW": "kw",
+        "KY": "ky", "LA": "la", "LB": "lb", "LG": "lg", "LI": "li", "LN": "ln",
+        "LO": "lo", "LT": "lt", "LU": "lu", "LV": "lv", "MG": "mg", "MH": "mh",
+        "MI": "mi", "MK": "mk", "ML": "ml", "MN": "mn", "MR": "mr", "MS": "ms",
+        "MT": "mt", "MY": "my", "NA": "na", "NB": "nb", "ND": "nd", "NE": "ne",
+        "NG": "ng", "NL": "nl", "NN": "nn", "NO": "no", "NR": "nr", "NV": "nv",
+        "NY": "ny", "OC": "oc", "OJ": "oj", "OM": "om", "OR": "or", "OS": "os",
+        "PA": "pa", "PI": "pi", "PL": "pl", "PS": "ps", "PT": "pt", "QU": "qu",
+        "RM": "rm", "RN": "rn", "RO": "ro", "RU": "ru", "RW": "rw", "SA": "sa",
+        "SD": "sd", "SG": "sg", "SI": "si", "SK": "sk", "SL": "sl", "SM": "sm",
+        "SN": "sn", "SO": "so", "SQ": "sq", "SR": "sr", "SS": "ss", "ST": "st",
+        "SU": "su", "SV": "sv", "SW": "sw", "TA": "ta", "TE": "te", "TG": "tg",
+        "TH": "th", "TI": "ti", "TK": "tk", "TL": "tl", "TN": "tn", "TO": "to",
+        "TR": "tr", "TS": "ts", "TT": "tt", "TW": "tw", "TY": "ty", "UG": "ug",
+        "UK": "uk", "UR": "ur", "UZ": "uz", "VE": "ve", "VI": "vi", "VO": "vo",
+        "WA": "wa", "WO": "wo", "XH": "xh", "YI": "yi", "YO": "yo", "ZA": "za",
+        "ZH": "zh", "ZU": "zu",
+        # --- ISO 639-2 three-letter codes: bibliographic/terminology pairs
+        # that differ from each other (both map to the same 639-1 code) ---
+        "ALB": "sq", "SQI": "sq", "ARM": "hy", "HYE": "hy", "BAQ": "eu", "EUS": "eu",
+        "BUR": "my", "MYA": "my", "CHI": "zh", "ZHO": "zh", "CZE": "cs", "CES": "cs",
+        "DUT": "nl", "NLD": "nl", "FRE": "fr", "FRA": "fr", "GEO": "ka", "KAT": "ka",
+        "GER": "de", "DEU": "de", "GRE": "el", "ELL": "el", "ICE": "is", "ISL": "is",
+        "MAC": "mk", "MKD": "mk", "MAO": "mi", "MRI": "mi", "MAY": "ms", "MSA": "ms",
+        "PER": "fa", "FAS": "fa", "RUM": "ro", "RON": "ro", "SLO": "sk", "SLK": "sk",
+        "TIB": "bo", "BOD": "bo", "WEL": "cy", "CYM": "cy",
+        # --- other common three-letter codes providers use as-is ---
+        "ENG": "en", "SPA": "es", "ITA": "it", "POR": "pt", "RUS": "ru", "ARA": "ar",
+        "HIN": "hi", "JPN": "ja", "KOR": "ko", "SWE": "sv", "NOR": "no", "DAN": "da",
+        "FIN": "fi", "HUN": "hu", "BUL": "bg", "UKR": "uk", "POL": "pl", "TUR": "tr",
+        "HEB": "he", "THA": "th", "VIE": "vi", "IND": "id", "TGL": "tl", "URD": "ur",
+        "BEN": "bn", "TAM": "ta", "TEL": "te", "MAR": "mr", "GUJ": "gu", "KAN": "kn",
+        "MAL": "ml", "PAN": "pa", "NEP": "ne", "SIN": "si", "CAT": "ca", "GLG": "gl",
+        # --- provider-specific 2-letter overrides, confirmed against a real
+        # multi-provider VOD catalogue by cross-checking actual titles AND
+        # M3U category names (e.g. "IR - PERSIAN SUB/DUB" confirms IR; run
+        # `[LIBRARY] Catalogue snapshot` to check yours if your provider's
+        # codes differ) — NOT valid ISO 639-1 codes on their own, except SE ---
+        "IR": "fa",  # "IR - PERSIAN SUB/DUB" / "IR - PERSIAN MOVIES" categories
+        "GR": "el",  # "GR - ΚΙΝΗΜΑΤΟΓΡΑΦΟΣ" (Greek for "cinema")
+        "IL": "he",  # Israeli-market catalogue (English titles, Hebrew dub/sub)
+        "AL": "sq",  # "AL - ARKIVA", "AL - FILMA" (Albanian words) categories
+        "PH": "tl",  # "PH - EVENTS" category; titles are Filipino-language
+        "QC": "fr",  # "QC - DOCUMENTAIRE" category; titles are French (Quebec)
+        "DK": "da",  # "NORDIC FILM" category; titles are Danish
+        # DELIBERATE OVERRIDE: real ISO 639-1 "se" is Northern Sami, but this
+        # catalogue's "SE -" prefix is unambiguously Sweden/Swedish (Swedish
+        # titles, "SVENSKA" [Swedish] category) — if your provider genuinely
+        # tags Northern Sami as SE, remove this override.
+        "SE": "sv",
+    }
+    # Tokens the prefix regex matches that are NOT a single real language —
+    # multi-audio/version markers, or provider shorthand confirmed (see
+    # _LANGUAGE_CODE_MAP comment above) to mean something else entirely.
+    # Better to write no <language> tag than a wrong one.
+    _NON_LANGUAGE_TOKENS = {
+        "MULTI", "VO", "VOST", "VOSTFR", "DUAL", "SUB", "SUBS", "DUB",
+        # Confirmed against real catalogue data — these look like language
+        # codes but aren't, for THIS catalogue's actual usage:
+        "NF",  # Netflix (a source label — titles are literal Netflix Originals)
+        "AS",  # "Asia" region bucket (titles are a mix of Chinese/Japanese/Korean,
+               # NOT the real ISO 639-1 "as" = Assamese)
+        "IN",  # India — spans Hindi/Punjabi/Malayalam/Marathi/Tamil/Gujarati/
+               # Kannada in this catalogue's own categories, no single language
+        "PK",  # Pakistan — mixes Urdu- and Punjabi-associated categories
+        "SC",  # Incoherent across totally unrelated categories in this
+               # catalogue (German, Persian, Nordic, Bollywood) — not the real
+               # ISO 639-1 "sc" = Sardinian for this provider's usage
+    }
+    # Full English names for every ISO 639-1 code above — used for the
+    # nested-by-language subfolder and the Jellyfin "Multiple Versions"
+    # filename suffix (see _movie_target_paths / _series_target_folder).
+    # Falls back to the bare uppercased code for anything not listed here
+    # (shouldn't happen for any code actually reachable via _LANGUAGE_CODE_MAP
+    # above, since every value in that map is a key here).
+    _LANGUAGE_DISPLAY_NAMES = {
+        "aa": "Afar", "ab": "Abkhazian", "ae": "Avestan", "af": "Afrikaans",
+        "ak": "Akan", "am": "Amharic", "an": "Aragonese", "ar": "Arabic",
+        "as": "Assamese", "av": "Avaric", "ay": "Aymara", "az": "Azerbaijani",
+        "ba": "Bashkir", "be": "Belarusian", "bg": "Bulgarian", "bh": "Bihari",
+        "bi": "Bislama", "bm": "Bambara", "bn": "Bengali", "bo": "Tibetan",
+        "br": "Breton", "bs": "Bosnian", "ca": "Catalan", "ce": "Chechen",
+        "ch": "Chamorro", "co": "Corsican", "cr": "Cree", "cs": "Czech",
+        "cu": "Church Slavic", "cv": "Chuvash", "cy": "Welsh", "da": "Danish",
+        "de": "German", "dv": "Divehi", "dz": "Dzongkha", "ee": "Ewe",
+        "el": "Greek", "en": "English", "eo": "Esperanto", "es": "Spanish",
+        "et": "Estonian", "eu": "Basque", "fa": "Persian", "ff": "Fulah",
+        "fi": "Finnish", "fj": "Fijian", "fo": "Faroese", "fr": "French",
+        "fy": "Western Frisian", "ga": "Irish", "gd": "Scottish Gaelic", "gl": "Galician",
+        "gn": "Guarani", "gu": "Gujarati", "gv": "Manx", "ha": "Hausa",
+        "he": "Hebrew", "hi": "Hindi", "ho": "Hiri Motu", "hr": "Croatian",
+        "ht": "Haitian Creole", "hu": "Hungarian", "hy": "Armenian", "hz": "Herero",
+        "ia": "Interlingua", "id": "Indonesian", "ie": "Interlingue", "ig": "Igbo",
+        "ii": "Sichuan Yi", "ik": "Inupiaq", "io": "Ido", "is": "Icelandic",
+        "it": "Italian", "iu": "Inuktitut", "ja": "Japanese", "jv": "Javanese",
+        "ka": "Georgian", "kg": "Kongo", "ki": "Kikuyu", "kj": "Kuanyama",
+        "kk": "Kazakh", "kl": "Kalaallisut", "km": "Khmer", "kn": "Kannada",
+        "ko": "Korean", "kr": "Kanuri", "ks": "Kashmiri", "ku": "Kurdish",
+        "kv": "Komi", "kw": "Cornish", "ky": "Kyrgyz", "la": "Latin",
+        "lb": "Luxembourgish", "lg": "Ganda", "li": "Limburgish", "ln": "Lingala",
+        "lo": "Lao", "lt": "Lithuanian", "lu": "Luba-Katanga", "lv": "Latvian",
+        "mg": "Malagasy", "mh": "Marshallese", "mi": "Maori", "mk": "Macedonian",
+        "ml": "Malayalam", "mn": "Mongolian", "mr": "Marathi", "ms": "Malay",
+        "mt": "Maltese", "my": "Burmese", "na": "Nauru", "nb": "Norwegian Bokmal",
+        "nd": "North Ndebele", "ne": "Nepali", "ng": "Ndonga", "nl": "Dutch",
+        "nn": "Norwegian Nynorsk", "no": "Norwegian", "nr": "South Ndebele", "nv": "Navajo",
+        "ny": "Chichewa", "oc": "Occitan", "oj": "Ojibwa", "om": "Oromo",
+        "or": "Oriya", "os": "Ossetian", "pa": "Punjabi", "pi": "Pali",
+        "pl": "Polish", "ps": "Pashto", "pt": "Portuguese", "qu": "Quechua",
+        "rm": "Romansh", "rn": "Rundi", "ro": "Romanian", "ru": "Russian",
+        "rw": "Kinyarwanda", "sa": "Sanskrit", "sc": "Sardinian", "sd": "Sindhi",
+        "se": "Northern Sami", "sg": "Sango", "si": "Sinhala", "sk": "Slovak",
+        "sl": "Slovenian", "sm": "Samoan", "sn": "Shona", "so": "Somali",
+        "sq": "Albanian", "sr": "Serbian", "ss": "Swati", "st": "Southern Sotho",
+        "su": "Sundanese", "sv": "Swedish", "sw": "Swahili", "ta": "Tamil",
+        "te": "Telugu", "tg": "Tajik", "th": "Thai", "ti": "Tigrinya",
+        "tk": "Turkmen", "tl": "Tagalog", "tn": "Tswana", "to": "Tongan",
+        "tr": "Turkish", "ts": "Tsonga", "tt": "Tatar", "tw": "Twi",
+        "ty": "Tahitian", "ug": "Uyghur", "uk": "Ukrainian", "ur": "Urdu",
+        "uz": "Uzbek", "ve": "Venda", "vi": "Vietnamese", "vo": "Volapuk",
+        "wa": "Walloon", "wo": "Wolof", "xh": "Xhosa", "yi": "Yiddish",
+        "yo": "Yoruba", "za": "Zhuang", "zh": "Chinese", "zu": "Zulu",
+    }
     _TRAILING_YEAR_RE = re.compile(r'\s*\((\d{4})\)\s*$')
 
     # First-(YYYY) detector for v1.15.0+ folder-name cleanup. Some providers ship
@@ -198,6 +361,20 @@ class Plugin:
             "help_text": "Leave the `<title>` element OUT of generated movie and tvshow NFO files. Jellyfin (and Emby) treat a `<title>` in the NFO as authoritative and will NOT override it from TMDB — so if your provider prefixes titles with tags like `4K-A+`, `EN-TOP` or `AMZ`, that junk becomes the displayed name. With this ON the plugin still writes the NFO (IDs, plot, genres, rating, poster) but omits the title, letting your media server take the clean title from TMDB via the `<tmdbid>` we already emit. OFF by default (unchanged behaviour). Note v1.18.0 also cleans provider junk out of the title, so try that first — this is the belt-and-braces option. Episode NFOs always keep their title (media servers match episodes by season/episode number)."
         },
         {
+            "id": "nfo_write_language",
+            "label": "Write detected language to NFO <language> tag",
+            "type": "boolean",
+            "default": False,
+            "help_text": "When your provider prefixes titles with a language code (`ES - `, `FR| `, `▪NL▪ `, etc.), write that code into a `<language>` element in the movie/tvshow NFO instead of only stripping it for display. IMPORTANT — read before enabling: Jellyfin parses NFO `<language>` into `PreferredMetadataLanguage`, which controls which language it fetches TMDB metadata (title/plot) in for that item. It does NOT set the item's recognised audio/original language, does NOT add a language badge, and has no effect on audio-track selection — those come from probing the actual media stream, which a `.strm` proxy doesn't expose to the NFO. So this is genuinely useful for getting Spanish-dubbed releases their Spanish TMDB text, but it will not make Jellyfin 'know' the release's spoken language. Ambiguous tokens that aren't a single real language (`MULTI`, `VO`, `VOSTFR`, `DUAL`...) are skipped — no tag is written rather than guessing wrong. OFF by default (unchanged behaviour)."
+        },
+        {
+            "id": "language_filename_suffix",
+            "label": "Suffix filenames with detected language",
+            "type": "boolean",
+            "default": False,
+            "help_text": "When a language prefix is detected on a title (same detection as 'Write detected language to NFO'), append it to the generated filename using Jellyfin's own 'Multiple Versions' bracket convention, e.g. `Amélie (2001) - [Spanish].strm` (movies) or `Show Name (2015) [Spanish]/` (series folder — Jellyfin has no per-file version-grouping for whole shows, so each language becomes its own folder/library entry instead). FIXES A REAL BUG: today, two different-language releases of the same title (e.g. `(ES) Amélie` and `(EN) Amélie`) clean down to the IDENTICAL folder+filename once the language prefix is stripped — the plugin's own 'already exists, skip' check then means only whichever language is scanned first ever gets written; the other is silently dropped, forever, on every run. This setting fixes that by making the two languages resolve to different paths. IMPORTANT — this does NOT reduce how often Jellyfin probes your streams or help with provider rate-limiting: Jellyfin unconditionally ffprobes a `.strm` target's URL whenever playback info is requested for that item (opening its detail page or pressing play), regardless of filename or library metadata settings (including 'local metadata only') — that override can't be turned off. The good news: this is NOT triggered by browsing the library grid or by routine scheduled library scans, only by actually opening/playing a title, so exposure scales with usage, not catalogue size. Either way, this setting doesn't change it. ⚠ MIGRATION: turning this ON only affects newly-detected-language titles going forward — it does not rename or remove already-written unsuffixed files, so previously-collided titles will only start showing their second language from this run onward; the survivor from the old collision keeps its old unsuffixed name alongside the new suffixed one. OFF by default (unchanged behaviour)."
+        },
+        {
             "id": "nest_movies_by_category",
             "label": "Nest Movies by Category",
             "type": "boolean",
@@ -251,6 +428,26 @@ class Plugin:
             "help_text": "Skip content whose M3U CATEGORY name starts with any of these comma-separated prefixes — e.g. `FOR ADULTS,XXX`. Case-insensitive. Applied AFTER the include filter, so you can use both together. This is usually what you want for 'everything EXCEPT adult content': leave `Category Filter` empty and put the unwanted categories here, rather than trying to list every category you do want. Content with no category is never excluded. Run `[LIBRARY] Catalogue snapshot` to see your exact category names. ⚠ Already-generated folders are not removed when you add an exclude — run `[⚠ DANGER] Clean up` once, then re-generate."
         },
         {
+            "id": "_section_language",
+            "label": "[LANGUAGE]",
+            "type": "info",
+            "description": "Filter and organise by the language detected in the TITLE, not the M3U category (see Category Filter/Exclude above for that). Applies to both Movies and Series. See README for details.",
+        },
+        {
+            "id": "language_filter",
+            "label": "Language Sync Filter (include only)",
+            "type": "string",
+            "default": "",
+            "help_text": "Only generate content whose detected title language matches one of these comma-separated ISO codes — e.g. `es,en`. Case-insensitive. Leave empty to sync all languages. Titles with no detected language are excluded once this is set. See README for details."
+        },
+        {
+            "id": "nest_movies_by_language",
+            "label": "Nest Movies by Detected Language",
+            "type": "boolean",
+            "default": False,
+            "help_text": "Wrap each movie's folder inside a subfolder named by its detected language, e.g. `Movies/Spanish/Amélie (2001)/`. Movies with no detected language go into `Unknown Language/`. Combines with Nest Movies by Category if both are ON. Off by default."
+        },
+        {
             "id": "_section_series",
             "label": "[SERIES]",
             "type": "info",
@@ -300,6 +497,13 @@ class Plugin:
             "type": "boolean",
             "default": False,
             "help_text": "When `Nest Series by Category` is ON and a series is tagged with multiple categories upstream, write the series folder + episodes under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Series by Category` is OFF. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — run `[⚠ DANGER] Clean up Series` once, then re-generate, to clean them up."
+        },
+        {
+            "id": "nest_series_by_language",
+            "label": "Nest Series by Detected Language",
+            "type": "boolean",
+            "default": False,
+            "help_text": "Wrap each series' folder inside a subfolder named by its detected language, e.g. `Series/Spanish/Show Name (2015)/`. Series with no detected language go into `Unknown Language/`. Combines with Nest Series by Category if both are ON. Off by default."
         },
         {
             "id": "_section_schedule",
@@ -604,7 +808,24 @@ class Plugin:
             return "Unassigned"
         return self._sanitize_filename(cat)
 
-    def _movie_target_paths(self, movie, root_folder: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False, tmdb_tag_format: str = "plex"):
+    def _language_subfolder(self, lang_code, nest: bool) -> str:
+        """Return the language subfolder segment to insert into a path.
+
+        Returns "" when nest is False (caller should not insert a layer).
+        Returns the human-readable display name (e.g. "Spanish") when nest is
+        True and a language was detected on the title (same detection as
+        `nfo_write_language` / `language_filename_suffix` — see
+        `_extract_language_prefix`). Returns "Unknown Language" when nest is
+        True but no language prefix was detected — mirrors `Unassigned` for
+        `_category_subfolder`.
+        """
+        if not nest:
+            return ""
+        if not lang_code:
+            return "Unknown Language"
+        return self._sanitize_filename(self._language_display_name(lang_code))
+
+    def _movie_target_paths(self, movie, root_folder: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False, tmdb_tag_format: str = "plex", language_suffix: bool = False, language_nest: bool = False):
         """Compute the (folder_path, strm_filename, clean_name, year) for a movie.
 
         When nest=True the folder is wrapped in a category subfolder named
@@ -614,24 +835,36 @@ class Plugin:
         gets a Plex/ChannelsDVR-friendly `{tmdb-NNN}` suffix for exact
         metadata matching. The strm filename inside the folder is NOT
         affected — only the folder name, since that's what scrapers read.
+
+        When language_suffix=True AND a language prefix is detected on the raw
+        title, the STRM filename (not the folder) gets a
+        ` - [Language]` suffix per Jellyfin's Multiple Versions convention —
+        see `_extract_language_prefix` / the `language_filename_suffix`
+        setting for why this matters (it's what stops two different-language
+        releases of the same title from colliding on one filename).
+
+        When language_nest=True the folder is ALSO wrapped in a language
+        subfolder (e.g. `Movies/Spanish/...`, or `Movies/Unknown Language/...`
+        when no language prefix was detected) — see `_language_subfolder`.
+        Inserted OUTSIDE (below) the category subfolder, so with both nesting
+        options on the layout is `root/Category/Language/Title (Year)/`.
         """
         raw_name = movie.name or f"Unknown Movie {movie.id}"
         clean_name, title_year = self._extract_clean_name_and_year(raw_name)
         year = movie.year or title_year
         clean_name, year = self._strip_redundant_trailing_year(clean_name, year)
         safe = self._sanitize_filename(clean_name)
-        if year:
-            base_name = f"{safe} ({year})"
-            strm_filename = f"{safe} ({year}).strm"
-        else:
-            base_name = safe
-            strm_filename = f"{safe}.strm"
+        base_name = f"{safe} ({year})" if year else safe
+        lang_code = self._extract_language_prefix(raw_name) if (language_suffix or language_nest) else None
+        strm_stem = base_name
+        if language_suffix and lang_code:
+            strm_stem = f"{base_name} - [{self._language_display_name(lang_code)}]"
+        strm_filename = f"{strm_stem}.strm"
         folder_name = self._apply_tmdb_suffix(base_name, movie, append_tmdb_id, tmdb_tag_format)
         cat_segment = self._category_subfolder(category_name, nest)
-        if cat_segment:
-            folder_path = os.path.join(root_folder, cat_segment, folder_name)
-        else:
-            folder_path = os.path.join(root_folder, folder_name)
+        lang_segment = self._language_subfolder(lang_code, language_nest)
+        segments = [s for s in (cat_segment, lang_segment) if s]
+        folder_path = os.path.join(root_folder, *segments, folder_name) if segments else os.path.join(root_folder, folder_name)
         return folder_path, strm_filename, clean_name, year
 
     def _strip_redundant_trailing_year(self, name, year):
@@ -694,6 +927,26 @@ class Plugin:
         if not name:
             return False
         return any(name.startswith(p.strip().lower()) for p in prefixes if p.strip())
+
+    def _parse_language_filter(self, language_filter):
+        """Split the comma-separated language-filter setting into a clean,
+        lower-cased list of ISO codes (or bare tokens) — e.g. `"ES, en"` ->
+        `["es", "en"]`. Pure/testable, mirrors `_parse_category_filter`."""
+        return [code.strip().lower() for code in (language_filter or "").split(",") if code.strip()]
+
+    def _matches_language_filter(self, lang_code, allowed_codes) -> bool:
+        """True when `lang_code` (the result of `_extract_language_prefix`,
+        already a lower-cased ISO code or None) is in `allowed_codes`.
+
+        Empty `allowed_codes` means no filter is set — everything matches.
+        When a filter IS set, a title with NO detected language prefix does
+        NOT match (same "uncategorised is excluded by an include filter"
+        convention as `_matches_category_prefixes`/`category_filter`)."""
+        if not allowed_codes:
+            return True
+        if not lang_code:
+            return False
+        return lang_code.lower() in allowed_codes
 
     def _apply_category_exclude(self, query, category_exclude):
         """Drop relations whose category name starts with any of the
@@ -793,6 +1046,11 @@ class Plugin:
         category_filter = (settings.get("category_filter") or "").strip()
         category_exclude = (settings.get("category_exclude") or "").strip()
         nfo_omit_title = bool(settings.get("nfo_omit_title", False))
+        nfo_write_language = bool(settings.get("nfo_write_language", False))
+        language_filename_suffix = bool(settings.get("language_filename_suffix", False))
+        nest_by_lang = bool(settings.get("nest_movies_by_language", False))
+        language_filter = (settings.get("language_filter") or "").strip()
+        language_filter_codes = self._parse_language_filter(language_filter)
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -810,6 +1068,10 @@ class Plugin:
             "Append TMDB ID": ("Yes (%s)" % tmdb_tag_format) if append_tmdb_id else "No",
             "Category filter": category_filter or "(all)",
             "Category exclude": category_exclude or "(none)",
+            "Write language tag": "Yes" if nfo_write_language else "No",
+            "Language filename suffix": "Yes" if language_filename_suffix else "No",
+            "Nest by language": "Yes" if nest_by_lang else "No",
+            "Language sync filter": language_filter or "(all)",
         })
 
         try:
@@ -867,6 +1129,7 @@ class Plugin:
         created_nfo = 0
         skipped = 0
         deduped = 0
+        lang_filtered = 0
         errors = 0
         scanned = 0
 
@@ -887,13 +1150,18 @@ class Plugin:
                     deduped += 1
                     continue
                 seen_movie_uuids.add(movie.uuid)
+            if language_filter_codes:
+                detected_lang = self._extract_language_prefix(movie.name or "")
+                if not self._matches_language_filter(detected_lang, language_filter_codes):
+                    lang_filtered += 1
+                    continue
             cat_name = relation.category.name if relation.category else ""
             # Track titles the TMDB tag can't be applied to, so "I ticked the
             # box and nothing changed" isn't silent (reported by @drahmed86).
             if append_tmdb_id and not (getattr(movie, "tmdb_id", "") or "").strip():
                 missing_tmdb_id += 1
             movie_folder, strm_filename, movie_name, year = self._movie_target_paths(
-                movie, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
+                movie, root_folder, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format, language_filename_suffix, nest_by_lang,
             )
             strm_path = os.path.join(movie_folder, strm_filename)
             is_existing = os.path.exists(strm_path)
@@ -929,7 +1197,7 @@ class Plugin:
                     if not os.path.exists(nfo_path):
                         category_name = relation.category.name if relation.category else ""
                         with open(nfo_path, 'w', encoding='utf-8') as f:
-                            f.write(self._generate_nfo(movie, category_name, nfo_omit_title))
+                            f.write(self._generate_nfo(movie, category_name, nfo_omit_title, nfo_write_language))
                         created_nfo += 1
                         wrote_nfo = True
 
@@ -967,6 +1235,8 @@ class Plugin:
         logger.info("  Already on disk: %d", skipped)
         if dedupe_across_cats:
             logger.info("  Deduped (multi-cat): %d", deduped)
+        if language_filter_codes:
+            logger.info("  Skipped (language filter): %d", lang_filtered)
         logger.info("  .strm created:   %d", created_strm)
         if refresh_existing:
             logger.info("  .strm refreshed: %d  (URL changed)", refreshed_strm)
@@ -993,6 +1263,8 @@ class Plugin:
             summary_msg += f" ({skipped} already on disk)"
         if dedupe_across_cats and deduped:
             summary_msg += f", deduped {deduped} multi-category duplicates"
+        if language_filter_codes and lang_filtered:
+            summary_msg += f", {lang_filtered} skipped by language filter"
 
         return {
             "status": "ok",
@@ -1006,10 +1278,11 @@ class Plugin:
             "created_nfo": created_nfo if generate_nfo else 0,
             "skipped": skipped,
             "deduped": deduped,
+            "lang_filtered": lang_filtered,
             "errors": errors,
         }
     
-    def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False, tmdb_tag_format: str = "plex"):
+    def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False, tmdb_tag_format: str = "plex", language_suffix: bool = False, language_nest: bool = False):
         """Compute the target folder for a series. Returns (folder_path, clean_name, year).
 
         When nest=True the folder is wrapped in a category subfolder named
@@ -1019,6 +1292,19 @@ class Plugin:
         gets a `{tmdb-NNN}` suffix for Plex/ChannelsDVR exact matching. See
         `_apply_tmdb_suffix` for caveats around flipping the toggle on an
         existing library.
+
+        When language_suffix=True AND a language prefix is detected on the raw
+        name, a ` [Language]` tag is folded into the FOLDER name itself (unlike
+        movies, Jellyfin has no per-file version-grouping for a whole TV show,
+        so each language has to be a distinct folder/library entry rather than
+        a suffixed file within one folder) — see the `language_filename_suffix`
+        setting for why (prevents two different-language releases of the same
+        show from colliding on one folder and interleaving episodes).
+
+        When language_nest=True the folder is ALSO wrapped in a language
+        subfolder (e.g. `Series/Spanish/...`, or `Series/Unknown Language/...`
+        when no language prefix was detected) — see `_language_subfolder`.
+        Inserted OUTSIDE (below) the category subfolder, same order as movies.
         """
         raw_name = series.name or f"Unknown Series {series.id}"
         clean_name, title_year = self._extract_clean_name_and_year(raw_name)
@@ -1026,10 +1312,15 @@ class Plugin:
         clean_name, year = self._strip_redundant_trailing_year(clean_name, year)
         safe = self._sanitize_filename(clean_name)
         base_name = f"{safe} ({year})" if year else safe
+        lang_code = self._extract_language_prefix(raw_name) if (language_suffix or language_nest) else None
+        if language_suffix and lang_code:
+            base_name = f"{base_name} [{self._language_display_name(lang_code)}]"
         folder_name = self._apply_tmdb_suffix(base_name, series, append_tmdb_id, tmdb_tag_format)
         cat_segment = self._category_subfolder(category_name, nest)
-        if cat_segment:
-            return os.path.join(series_root, cat_segment, folder_name), clean_name, year
+        lang_segment = self._language_subfolder(lang_code, language_nest)
+        segments = [s for s in (cat_segment, lang_segment) if s]
+        if segments:
+            return os.path.join(series_root, *segments, folder_name), clean_name, year
         return os.path.join(series_root, folder_name), clean_name, year
 
     def _series_already_processed(self, series_folder: str) -> bool:
@@ -1059,6 +1350,11 @@ class Plugin:
         category_filter = (settings.get("category_filter") or "").strip()
         category_exclude = (settings.get("category_exclude") or "").strip()
         nfo_omit_title = bool(settings.get("nfo_omit_title", False))
+        nfo_write_language = bool(settings.get("nfo_write_language", False))
+        language_filename_suffix = bool(settings.get("language_filename_suffix", False))
+        nest_by_lang = bool(settings.get("nest_series_by_language", False))
+        language_filter = (settings.get("language_filter") or "").strip()
+        language_filter_codes = self._parse_language_filter(language_filter)
 
         ok, err = self._validate_dispatcharr_url(dispatcharr_url, logger)
         if not ok:
@@ -1075,6 +1371,10 @@ class Plugin:
             "Dedupe across cats": "Yes" if dedupe_across_cats else "No",
             "Category filter": category_filter or "(all)",
             "Category exclude": category_exclude or "(none)",
+            "Write language tag": "Yes" if nfo_write_language else "No",
+            "Language filename suffix": "Yes" if language_filename_suffix else "No",
+            "Nest by language": "Yes" if nest_by_lang else "No",
+            "Language sync filter": language_filter or "(all)",
             "Workers": self.MAX_WORKERS,
         })
 
@@ -1134,6 +1434,7 @@ class Plugin:
         to_process = []
         scanned = 0
         deduped = 0
+        lang_filtered = 0
         seen_series_uuids = set() if dedupe_across_cats else None
         for series_rel in query.iterator():
             scanned += 1
@@ -1144,10 +1445,15 @@ class Plugin:
                     deduped += 1
                     continue
                 seen_series_uuids.add(series_rel.series.uuid)
+            if language_filter_codes:
+                detected_lang = self._extract_language_prefix(series_rel.series.name or "")
+                if not self._matches_language_filter(detected_lang, language_filter_codes):
+                    lang_filtered += 1
+                    continue
             if not refresh_existing:
                 cat_name = series_rel.category.name if series_rel.category else ""
                 folder, _, _ = self._series_target_folder(
-                    series_rel.series, series_root, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
+                    series_rel.series, series_root, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format, language_filename_suffix, nest_by_lang,
                 )
                 if self._series_already_processed(folder):
                     continue
@@ -1155,13 +1461,15 @@ class Plugin:
             if batch_size != "all" and len(to_process) >= target_batch:
                 break
 
-        skipped_pre = scanned - len(to_process) - deduped
+        skipped_pre = scanned - len(to_process) - deduped - lang_filtered
         if refresh_existing:
             logger.info("Scanned %d series; %d to evaluate this run", scanned, len(to_process))
         else:
             logger.info("Scanned %d series; %d already processed (skipped); %d to process this run", scanned, skipped_pre, len(to_process))
         if dedupe_across_cats and deduped:
             logger.info("Deduped %d multi-category series (only the first-encountered category survives).", deduped)
+        if language_filter_codes and lang_filtered:
+            logger.info("Skipped %d series by language filter.", lang_filtered)
         logger.info("")
 
         if not to_process:
@@ -1173,6 +1481,7 @@ class Plugin:
                 "episodes_created": 0,
                 "nfo_created": 0,
                 "deduped": deduped,
+                "lang_filtered": lang_filtered,
                 "errors": 0,
             }
 
@@ -1202,6 +1511,9 @@ class Plugin:
                     omit_stream_id,
                     tmdb_tag_format,
                     nfo_omit_title,
+                    nfo_write_language,
+                    language_filename_suffix,
+                    nest_by_lang,
                 ): series_rel
                 for series_rel in to_process
             }
@@ -1270,11 +1582,12 @@ class Plugin:
             "episodes_refreshed": refreshed_strm,
             "nfo_created": created_nfo if generate_nfo else 0,
             "deduped": deduped,
+            "lang_filtered": lang_filtered,
             "errors": errors,
             "failures": failures,
         }
 
-    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False, tmdb_tag_format="plex", nfo_omit_title=False):
+    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False, tmdb_tag_format="plex", nfo_omit_title=False, nfo_write_language=False, language_filename_suffix=False, nest_by_lang=False):
         """Process a single series. Idempotent: writes only missing episode files.
 
         With refresh_existing=False, callers should pre-filter already-done
@@ -1291,7 +1604,7 @@ class Plugin:
         series = series_rel.series
         cat_name = series_rel.category.name if series_rel.category else ""
         series_folder, series_name, _year = self._series_target_folder(
-            series, series_root, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
+            series, series_root, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format, language_filename_suffix, nest_by_lang,
         )
 
         try:
@@ -1364,7 +1677,7 @@ class Plugin:
                 tvshow_nfo_path = os.path.join(series_folder, "tvshow.nfo")
                 if not os.path.isfile(tvshow_nfo_path):
                     category_name = series_rel.category.name if series_rel.category else ""
-                    tvshow_content = self._generate_tvshow_nfo(series, category_name, nfo_omit_title)
+                    tvshow_content = self._generate_tvshow_nfo(series, category_name, nfo_omit_title, nfo_write_language)
                     with open(tvshow_nfo_path, 'w', encoding='utf-8') as f:
                         f.write(tvshow_content)
                     new_nfo += 1
@@ -1673,6 +1986,53 @@ class Plugin:
             return title
         return self._LANGUAGE_PREFIX_RE.sub('', title).strip()
 
+    def _extract_language_prefix(self, raw_title: str):
+        """Best-effort ISO 639-1 code for a provider language prefix on
+        raw_title, or None if there isn't one / it isn't a real language.
+
+        Tries two shapes, matching (not subbing) so the token about to be
+        discarded can be captured before it's gone:
+          1. `_LANGUAGE_PREFIX_RE` — the dash/pipe/bare-EN/bullet forms
+             `_clean_title` strips (`EN - Title`, `EN| Title`, `▪NL▪ Title`).
+          2. `_LEADING_DELIM_TAG_RE` — the bracket/paren form `_clean_nfo_title`
+             strips (`(ES) Title`, `[EN] Title`), which is what most
+             Lineuparr-style catalogues actually use. This regex strips ANY
+             short leading tag, not just language codes, so its capture needs
+             the same real-language filter as case 1.
+
+        Deliberately returns None rather than guessing when the token isn't a
+        recognised single language (e.g. MULTI, VO, VOSTFR, 4K, REC, or any
+        2/3-letter token not in `_LANGUAGE_CODE_MAP`): a missing <language>
+        tag is harmless, a wrong one actively misleads Jellyfin's
+        metadata-language matching. v1.20.0 removed the old "any 2-letter
+        token passes through as-is" fallback — it silently accepted junk like
+        "NF" (Netflix) as if it were a real ISO code. `_LANGUAGE_CODE_MAP` now
+        covers the full ISO 639-1 set plus common 3-letter variants, so a
+        legitimate code was never relying on that fallback anyway.
+        """
+        if not raw_title:
+            return None
+        token = None
+        match = self._LANGUAGE_PREFIX_RE.match(raw_title)
+        if match:
+            token = next((g for g in match.groups() if g), None)
+        if not token:
+            match = self._LEADING_DELIM_TAG_RE.match(raw_title)
+            if match:
+                token = next((g for g in match.groups() if g), None)
+        if not token:
+            return None
+        token = token.upper()
+        if token in self._NON_LANGUAGE_TOKENS:
+            return None
+        return self._LANGUAGE_CODE_MAP.get(token)
+
+    def _language_display_name(self, code: str) -> str:
+        """Human-readable label for an ISO 639-1 code, for the filename
+        suffix — falls back to the bare uppercased code (e.g. 'ID') for
+        anything not in `_LANGUAGE_DISPLAY_NAMES`."""
+        return self._LANGUAGE_DISPLAY_NAMES.get(code, code.upper())
+
     def _strip_trailing_year(self, title: str):
         """Strip a trailing ' (YYYY)' from a title.
 
@@ -1712,6 +2072,15 @@ class Plugin:
             return raw_name, None
         # Language prefix first (same regex as _clean_title).
         title = self._LANGUAGE_PREFIX_RE.sub('', raw_name).strip()
+        # Leading delimiter-wrapped tags the above regex doesn't catch — most
+        # Lineuparr-style catalogues actually use this form: "(ES) Title",
+        # "[EN] Title", not the dash/pipe form. Previously only
+        # `_clean_nfo_title` handled this, so folder names for these titles
+        # kept the literal "(ES) " prefix. Same guard `_clean_nfo_title` uses:
+        # skip the strip if the title IS the tag ("[REC] 2" must not become "2").
+        without_tags = self._LEADING_DELIM_TAG_RE.sub('', title).strip()
+        if any(ch.isalpha() for ch in without_tags):
+            title = without_tags
         # Truncate at the first (YYYY) — everything after is provider noise.
         match = self._FIRST_YEAR_RE.search(title)
         year = None
@@ -1838,7 +2207,7 @@ class Plugin:
         title = re.sub(r"\s{2,}", " ", title).strip(" -_")
         return title or self._clean_title(raw_title)
 
-    def _generate_tvshow_nfo(self, series, category_name: str, omit_title: bool = False) -> str:
+    def _generate_tvshow_nfo(self, series, category_name: str, omit_title: bool = False, write_language: bool = False) -> str:
         """Generate tvshow.nfo XML content for a series."""
         raw_title = series.name or "Unknown"
         title = self._clean_nfo_title(raw_title, getattr(series, "year", None))
@@ -1848,6 +2217,7 @@ class Plugin:
         rating = (getattr(series, "rating", "") or "").strip()
         tmdb_id = (getattr(series, "tmdb_id", "") or "").strip()
         imdb_id = (getattr(series, "imdb_id", "") or "").strip()
+        language = self._extract_language_prefix(raw_title) if write_language else None
 
         genres = self._resolve_genres(getattr(series, "genre", ""), category_name)
 
@@ -1855,6 +2225,9 @@ class Plugin:
         xml_lines.append('<tvshow>')
         if not omit_title:
             xml_lines.append(f'    <title>{self._xml_escape(title)}</title>')
+
+        if language:
+            xml_lines.append(f'    <language>{self._xml_escape(language)}</language>')
 
         if year:
             xml_lines.append(f'    <year>{year}</year>')
@@ -1932,7 +2305,7 @@ class Plugin:
 
         return '\n'.join(xml_lines)
     
-    def _generate_nfo(self, movie, category_name: str, omit_title: bool = False) -> str:
+    def _generate_nfo(self, movie, category_name: str, omit_title: bool = False, write_language: bool = False) -> str:
         """Generate NFO XML content for a movie."""
         raw_title = movie.name or "Unknown"
         title = self._clean_nfo_title(raw_title, getattr(movie, "year", None))
@@ -1942,15 +2315,19 @@ class Plugin:
         rating = (movie.rating or "").strip()
         tmdb_id = (movie.tmdb_id or "").strip()
         imdb_id = (movie.imdb_id or "").strip()
+        language = self._extract_language_prefix(raw_title) if write_language else None
 
         genres = self._resolve_genres(getattr(movie, "genre", ""), category_name)
-        
+
         # Build XML
         xml_lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
         xml_lines.append('<movie>')
         if not omit_title:
             xml_lines.append(f'    <title>{self._xml_escape(title)}</title>')
-        
+
+        if language:
+            xml_lines.append(f'    <language>{self._xml_escape(language)}</language>')
+
         if year:
             xml_lines.append(f'    <year>{year}</year>')
         

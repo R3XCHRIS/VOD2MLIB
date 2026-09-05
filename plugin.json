@@ -1,7 +1,7 @@
 {
   "name": "VOD to Media Library",
   "version": "1.18.0",
-  "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
+  "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes. Optional language-based subdirectories and a language sync filter are also available.",
   "author": "R3XCHRIS",
   "license": "MIT",
   "min_dispatcharr_version": "v0.24.0",
@@ -55,13 +55,34 @@
       "type": "select",
       "default": "250",
       "options": [
-        {"value": "10", "label": "10 movies"},
-        {"value": "100", "label": "100 movies"},
-        {"value": "200", "label": "200 movies"},
-        {"value": "250", "label": "250 movies"},
-        {"value": "500", "label": "500 movies"},
-        {"value": "1000", "label": "1000 movies"},
-        {"value": "all", "label": "All movies"}
+        {
+          "value": "10",
+          "label": "10 movies"
+        },
+        {
+          "value": "100",
+          "label": "100 movies"
+        },
+        {
+          "value": "200",
+          "label": "200 movies"
+        },
+        {
+          "value": "250",
+          "label": "250 movies"
+        },
+        {
+          "value": "500",
+          "label": "500 movies"
+        },
+        {
+          "value": "1000",
+          "label": "1000 movies"
+        },
+        {
+          "value": "all",
+          "label": "All movies"
+        }
       ],
       "help_text": "Number of movies to process in this run. Start small (10) to verify, then scale up."
     },
@@ -78,6 +99,20 @@
       "type": "boolean",
       "default": false,
       "help_text": "Leave the `<title>` element OUT of generated movie and tvshow NFO files. Jellyfin (and Emby) treat a `<title>` in the NFO as authoritative and will NOT override it from TMDB — so if your provider prefixes titles with tags like `4K-A+`, `EN-TOP` or `AMZ`, that junk becomes the displayed name. With this ON the plugin still writes the NFO (IDs, plot, genres, rating, poster) but omits the title, letting your media server take the clean title from TMDB via the `<tmdbid>` we already emit. OFF by default (unchanged behaviour). Note v1.18.0 also cleans provider junk out of the title, so try that first — this is the belt-and-braces option. Episode NFOs always keep their title (media servers match episodes by season/episode number)."
+    },
+    {
+      "id": "nfo_write_language",
+      "label": "Write detected language to NFO <language> tag",
+      "type": "boolean",
+      "default": false,
+      "help_text": "When your provider prefixes titles with a language code (`ES - `, `FR| `, `▪NL▪ `, etc.), write that code into a `<language>` element in the movie/tvshow NFO instead of only stripping it for display. IMPORTANT — read before enabling: Jellyfin parses NFO `<language>` into `PreferredMetadataLanguage`, which controls which language it fetches TMDB metadata (title/plot) in for that item. It does NOT set the item's recognised audio/original language, does NOT add a language badge, and has no effect on audio-track selection — those come from probing the actual media stream, which a `.strm` proxy doesn't expose to the NFO. So this is genuinely useful for getting Spanish-dubbed releases their Spanish TMDB text, but it will not make Jellyfin 'know' the release's spoken language. Ambiguous tokens that aren't a single real language (`MULTI`, `VO`, `VOSTFR`, `DUAL`...) are skipped — no tag is written rather than guessing wrong. OFF by default (unchanged behaviour)."
+    },
+    {
+      "id": "language_filename_suffix",
+      "label": "Suffix filenames with detected language",
+      "type": "boolean",
+      "default": false,
+      "help_text": "When a language prefix is detected on a title (same detection as 'Write detected language to NFO'), append it to the generated filename using Jellyfin's own 'Multiple Versions' bracket convention, e.g. `Amélie (2001) - [Spanish].strm` (movies) or `Show Name (2015) [Spanish]/` (series folder — Jellyfin has no per-file version-grouping for whole shows, so each language becomes its own folder/library entry instead). FIXES A REAL BUG: today, two different-language releases of the same title (e.g. `(ES) Amélie` and `(EN) Amélie`) clean down to the IDENTICAL folder+filename once the language prefix is stripped — the plugin's own 'already exists, skip' check then means only whichever language is scanned first ever gets written; the other is silently dropped, forever, on every run. This setting fixes that by making the two languages resolve to different paths. IMPORTANT — this does NOT reduce how often Jellyfin probes your streams or help with provider rate-limiting: Jellyfin unconditionally ffprobes a `.strm` target's URL whenever playback info is requested for that item (opening its detail page or pressing play), regardless of filename or library metadata settings (including 'local metadata only') — that override can't be turned off. The good news: this is NOT triggered by browsing the library grid or by routine scheduled library scans, only by actually opening/playing a title, so exposure scales with usage, not catalogue size. Either way, this setting doesn't change it. ⚠ MIGRATION: turning this ON only affects newly-detected-language titles going forward — it does not rename or remove already-written unsuffixed files, so previously-collided titles will only start showing their second language from this run onward; the survivor from the old collision keeps its old unsuffixed name alongside the new suffixed one. OFF by default (unchanged behaviour)."
     },
     {
       "id": "nest_movies_by_category",
@@ -106,8 +141,14 @@
       "type": "select",
       "default": "plex",
       "options": [
-        {"value": "plex", "label": "Plex / ChannelsDVR — {tmdb-123}"},
-        {"value": "jellyfin", "label": "Jellyfin / Emby — [tmdbid-123]"}
+        {
+          "value": "plex",
+          "label": "Plex / ChannelsDVR — {tmdb-123}"
+        },
+        {
+          "value": "jellyfin",
+          "label": "Jellyfin / Emby — [tmdbid-123]"
+        }
       ],
       "help_text": "Which convention to use for the TMDB folder tag — media servers disagree, and each ignores the other's format. `Plex / ChannelsDVR` writes `Cool Hand Luke (1967) {tmdb-378}`; `Jellyfin / Emby` writes `Cool Hand Luke (1967) [tmdbid-378]`. Only has an effect when `Append TMDB ID to folder names` is ON. Defaults to Plex for backwards compatibility with libraries generated before v1.16.1 — if you use Jellyfin or Emby, switch this to `jellyfin` or the tag is silently ignored by your server. ⚠ MIGRATION: changing the format renames every folder, and the plugin does NOT rename in place — the new names are written ALONGSIDE the old ones. Run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate."
     },
@@ -133,6 +174,26 @@
       "help_text": "Skip content whose M3U CATEGORY name starts with any of these comma-separated prefixes — e.g. `FOR ADULTS,XXX`. Case-insensitive. Applied AFTER the include filter, so you can use both together. This is usually what you want for 'everything EXCEPT adult content': leave `Category Filter` empty and put the unwanted categories here, rather than trying to list every category you do want. Content with no category is never excluded. Run `[LIBRARY] Catalogue snapshot` to see your exact category names. ⚠ Already-generated folders are not removed when you add an exclude — run `[⚠ DANGER] Clean up` once, then re-generate."
     },
     {
+      "id": "_section_language",
+      "label": "[LANGUAGE]",
+      "type": "info",
+      "description": "Filter and organise by the language detected in the TITLE, not the M3U category (see Category Filter/Exclude above for that). Applies to both Movies and Series. See README for details."
+    },
+    {
+      "id": "language_filter",
+      "label": "Language Sync Filter (include only)",
+      "type": "string",
+      "default": "",
+      "help_text": "Only generate content whose detected title language matches one of these comma-separated ISO codes — e.g. `es,en`. Case-insensitive. Leave empty to sync all languages. Titles with no detected language are excluded once this is set. See README for details."
+    },
+    {
+      "id": "nest_movies_by_language",
+      "label": "Nest Movies by Detected Language",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Wrap each movie's folder inside a subfolder named by its detected language, e.g. `Movies/Spanish/Amélie (2001)/`. Movies with no detected language go into `Unknown Language/`. Combines with Nest Movies by Category if both are ON. Off by default."
+    },
+    {
       "id": "_section_series",
       "label": "[SERIES]",
       "type": "info",
@@ -144,14 +205,38 @@
       "type": "select",
       "default": "10",
       "options": [
-        {"value": "1", "label": "1 series (testing)"},
-        {"value": "5", "label": "5 series"},
-        {"value": "10", "label": "10 series"},
-        {"value": "25", "label": "25 series"},
-        {"value": "50", "label": "50 series"},
-        {"value": "100", "label": "100 series"},
-        {"value": "250", "label": "250 series"},
-        {"value": "all", "label": "All series (may time out — use the schedule)"}
+        {
+          "value": "1",
+          "label": "1 series (testing)"
+        },
+        {
+          "value": "5",
+          "label": "5 series"
+        },
+        {
+          "value": "10",
+          "label": "10 series"
+        },
+        {
+          "value": "25",
+          "label": "25 series"
+        },
+        {
+          "value": "50",
+          "label": "50 series"
+        },
+        {
+          "value": "100",
+          "label": "100 series"
+        },
+        {
+          "value": "250",
+          "label": "250 series"
+        },
+        {
+          "value": "all",
+          "label": "All series (may time out — use the schedule)"
+        }
       ],
       "help_text": "Number of series to process per click (episodes are auto-fetched for each, so series are much slower than movies). ⚠ This button runs synchronously and your reverse proxy will usually cut it off after ~60s with a 504 — the run keeps going server-side, but you lose the result. For a big catalogue don't use 'All' here: set the cron to 'Full rescan' and click [SCHEDULE] Apply / Update. Scheduled runs execute on the Celery worker with no HTTP timeout."
     },
@@ -184,6 +269,13 @@
       "help_text": "When `Nest Series by Category` is ON and a series is tagged with multiple categories upstream, write the series folder + episodes under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Series by Category` is OFF. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — run `[⚠ DANGER] Clean up Series` once, then re-generate, to clean them up."
     },
     {
+      "id": "nest_series_by_language",
+      "label": "Nest Series by Detected Language",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Wrap each series' folder inside a subfolder named by its detected language, e.g. `Series/Spanish/Show Name (2015)/`. Series with no detected language go into `Unknown Language/`. Combines with Nest Series by Category if both are ON. Off by default."
+    },
+    {
       "id": "_section_schedule",
       "label": "[AUTO-RESCAN SCHEDULE]",
       "type": "info",
@@ -210,10 +302,22 @@
       "type": "select",
       "default": "rescan_all",
       "options": [
-        {"value": "scan_all_vods", "label": "Scan only (totals)"},
-        {"value": "generate_movies", "label": "Movies only"},
-        {"value": "generate_series", "label": "Series only"},
-        {"value": "rescan_all", "label": "Full rescan (movies + series)"}
+        {
+          "value": "scan_all_vods",
+          "label": "Scan only (totals)"
+        },
+        {
+          "value": "generate_movies",
+          "label": "Movies only"
+        },
+        {
+          "value": "generate_series",
+          "label": "Series only"
+        },
+        {
+          "value": "rescan_all",
+          "label": "Full rescan (movies + series)"
+        }
       ],
       "help_text": "Which action the scheduler should run on each tick. 'Full rescan' is recommended."
     }

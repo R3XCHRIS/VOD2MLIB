@@ -14,6 +14,8 @@
 
 > **Plex users:** Plex does *not* play `.strm` files. Jellyfin and ChannelsDVR do. See [Plex compatibility](#plex-compatibility) below.
 
+> **This fork.** Adds detected-title-language features beyond stock v1.18.0 — an NFO `<language>` tag, a filename/folder disambiguation suffix, a language sync filter, and nest-by-language folders. Version number is intentionally left at `1.18.0` to match the base it's patched from; see [Language detection](#language-detection) for what's different.
+
 ## Credits
 
 - **Original author:** [shedunraid](https://github.com/shedunraid) — created v0.x–v1.3 ([upstream repo](https://github.com/shedunraid/VOD2MLIB)).
@@ -113,7 +115,7 @@ The `Dispatcharr URL` in plugin settings is **baked into every `.strm` file** �
 
 ## Settings
 
-The Settings tab is grouped into four sections:
+The Settings tab is grouped into five sections:
 
 | Section | Field | What it does |
 |---|---|---|
@@ -122,6 +124,8 @@ The Settings tab is grouped into four sections:
 | **Movies** | Batch Size | How many movies to process per click |
 |  | Generate Movie NFO Files | Toggle Kodi/Jellyfin metadata generation |
 |  | Omit `<title>` from NFO files | Leave the title out of movie/tvshow NFOs so Jellyfin/Emby take it from TMDB instead. Useful when your provider prefixes titles (`4K-A+`, `EN-TOP`, `AMZ`) — Jellyfin treats an NFO `<title>` as authoritative and won't override it. Off by default. |
+|  | Write detected language to NFO `<language>` tag | Write the title's detected language into the movie/tvshow NFO. Sets Jellyfin's TMDB-metadata-language preference, not the audio language. Off by default. See [Language detection](#language-detection). |
+|  | Suffix filenames with detected language | Disambiguate same-titled different-language releases with a `- [Language]` filename/folder suffix. Off by default. See [Language detection](#language-detection). |
 |  | Nest Movies by Category | Wrap each movie folder inside a subfolder named by its M3U category (off by default; movies without a category go to `Unassigned/`) |
 |  | Dedupe Movies Across Categories | When nesting is ON and a movie is tagged with multiple categories upstream, write under the first category only (alphabetical) instead of duplicating. No effect when nesting is OFF. Off by default (preserves 4K-vs-HD variant-stream behaviour). ⚠ Doesn't remove existing duplicate folders — `[⚠ DANGER] Clean up` + re-generate to migrate. |
 |  | Append TMDB ID to folder names | Append a TMDB id tag to Movie *and* Series folder names when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Media servers honour this as a forced exact metadata match. Off by default. ⚠ Doesn't rename existing folders in place — writes new names alongside the old ones; `[⚠ DANGER] Clean up` + re-generate to migrate cleanly. |
@@ -129,14 +133,41 @@ The Settings tab is grouped into four sections:
 |  | Don't pin .strm to a specific stream | Omit `?stream_id=` from `.strm` URLs so Dispatcharr can fail over across providers. Off by default; only useful with a Dispatcharr build that has VOD failover ([#1398](https://github.com/Dispatcharr/Dispatcharr/pull/1398)). |
 |  | Category Filter (include only) | Comma-separated **category-name** prefixes (e.g. `[EN],[FR]`, case-insensitive). Only generate content whose category starts with one of them — filters at query level so unwanted folders are never created. Applies to Movies *and* Series. Empty = all. ⚠ Matches the *category* name, not the title. |
 |  | Category Exclude (block list) | Comma-separated category-name prefixes to **skip** (e.g. `FOR ADULTS,XXX`). Applied after the include filter. Usually the right tool for "everything except adult content" — leave the filter empty and list what you don't want here. Content with no category is never excluded. |
+| **Language** | Language Sync Filter (include only) | Comma-separated ISO codes (e.g. `es,en`) — only generate content whose *detected title language* matches. Different axis from Category Filter. Empty = all. See [Language detection](#language-detection). |
+|  | Nest Movies by Detected Language | Wrap each movie folder inside a subfolder named by its detected language, e.g. `Movies/Spanish/`. No detection = `Unknown Language/`. Off by default. |
 | **Series** | Batch Size (Series) | How many series to process per click |
 |  | Generate Series NFO Files | Toggle `tvshow.nfo` and per-episode `.nfo` |
 |  | Refresh Existing Series | Re-evaluate already-processed series for new episodes AND rewrite existing episode `.strm` URLs (cron-friendly). Preserves `tvshow.nfo` and episode `.nfo` edits. |
 |  | Nest Series by Category | Wrap each series folder inside a subfolder named by its M3U category (off by default; series without a category go to `Unassigned/`) |
 |  | Dedupe Series Across Categories | When nesting is ON and a series is tagged with multiple categories upstream, write under the first category only (alphabetical) instead of duplicating. No effect when nesting is OFF. Off by default. ⚠ Doesn't remove existing duplicate folders — `[⚠ DANGER] Clean up` + re-generate to migrate. |
+|  | Nest Series by Detected Language | Wrap each series folder inside a subfolder named by its detected language, e.g. `Series/Spanish/`. No detection = `Unknown Language/`. Off by default. |
 | **Auto-rescan schedule** | Schedule (cron) | Standard 5-field expression. Default `0 3 * * *` (daily 03:00) |
 |  | Schedule Timezone | IANA timezone the cron is interpreted in (e.g. `Europe/London`). Empty = UTC. Handles DST automatically. |
 |  | Scheduled Action | What the cron fires (full rescan recommended) |
+
+## Language detection
+
+Four settings (two under **Movies**, two under the dedicated **Language** section — plus one more under **Series**) all share one detector: it looks for a language prefix on the **title** (`EN - Title`, `(ES) Title`, `▪NL▪ Title`, etc.) — never the M3U category. If your provider tags language via category instead, use `Category Filter`/`Category Exclude` rather than these.
+
+- **Write detected language to NFO `<language>` tag** — sets Jellyfin's TMDB-metadata-language preference for that item. Does *not* set the recognised audio language (that only comes from probing the real stream).
+- **Suffix filenames with detected language** — appends `- [Language]` (movies) or `[Language]` (series folder) so two different-language releases of the same title don't collide on one path and silently drop one of them.
+- **Language Sync Filter** — only generate titles whose detected language is in your comma-separated allow-list. Titles with no detected language are excluded once this is set.
+- **Nest Movies/Series by Detected Language** — wraps output in a `Movies/Spanish/`-style subfolder per detected language (`Unknown Language/` when none detected).
+
+**Code coverage.** The detector recognises the full ISO 639-1 set (any standard 2-letter code) plus common ISO 639-2 three-letter variants (`GER`/`DEU`, `FRE`/`FRA`, etc.) and known provider shorthand. It deliberately returns *no* language rather than guessing wrong — a missing `<language>` tag is harmless, a wrong one misleads Jellyfin.
+
+**A handful of 2-letter codes are overridden or excluded**, based on cross-checking real IPTV catalogue titles *and* M3U category names (not just guessed):
+
+| Prefix | Resolves to | Why |
+|---|---|---|
+| `SE` | Swedish (`sv`) | Deliberate override — ISO 639-1 `se` is technically Northern Sami, but this is a Sweden/Swedish market tag in every catalogue checked (Swedish titles, `SVENSKA` category). |
+| `IR`, `GR`, `IL`, `AL`, `PH`, `QC`, `DK` | Persian, Greek, Hebrew, Albanian, Filipino, French, Danish | Country-style shorthand, not valid ISO 639-1 codes themselves — confirmed via matching category names (e.g. `IR - PERSIAN SUB/DUB`). |
+| `NF` | *(excluded)* | Netflix — a source label, not a language. Titles are literal Netflix Originals. |
+| `AS` | *(excluded)* | An "Asia" region bucket spanning Chinese/Japanese/Korean titles — not the real ISO 639-1 `as` (Assamese). |
+| `IN`, `PK` | *(excluded)* | India and Pakistan both span multiple languages in real catalogues (Hindi/Punjabi/Malayalam/Tamil/... for IN; Urdu/Punjabi for PK) — no single correct guess. |
+| `SC` | *(excluded)* | Incoherent across unrelated categories in every catalogue checked — not a reliable signal. |
+
+If your provider's shorthand differs, `_LANGUAGE_CODE_MAP` / `_NON_LANGUAGE_TOKENS` in `plugin.py` are the place to adjust it — run `[LIBRARY] Catalogue snapshot` first to see your real category names.
 
 ## Workflow
 
