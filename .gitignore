@@ -54,3 +54,7 @@ coverage.xml
 
 # Local Discord/PR message drafts — not part of the plugin, never published
 drafts/
+
+# Selection mode local data (dev server / non-container fallback)
+.dev-selection/
+.selection-data/

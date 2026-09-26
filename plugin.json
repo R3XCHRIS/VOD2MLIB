@@ -184,6 +184,34 @@
       "help_text": "When `Nest Series by Category` is ON and a series is tagged with multiple categories upstream, write the series folder + episodes under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Series by Category` is OFF. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — run `[⚠ DANGER] Clean up Series` once, then re-generate, to clean them up."
     },
     {
+      "id": "_section_selection",
+      "label": "[SELECTION MODE]",
+      "type": "info",
+      "description": "Pick which movies and series (and which provider copy of each) become .strm files, on a page served by this plugin. Off by default."
+    },
+    {
+      "id": "selection_mode",
+      "label": "Selection mode",
+      "type": "boolean",
+      "default": false,
+      "help_text": "When ON, nothing is generated unless you select it on the selection page and press Apply. The Generate / Full rescan actions are paused while this is ON, and the schedule keeps your applied selection up to date instead of generating everything. Existing files are left alone. Turning this on starts the page server within ~30s (or click [SELECTION] Page status)."
+    },
+    {
+      "id": "selection_port",
+      "label": "Selection page port",
+      "type": "number",
+      "default": 9192,
+      "help_text": "Port the selection page listens on inside the container. Publish it in docker-compose, e.g. `- \"9192:9192\"`."
+    },
+    {
+      "id": "selection_password",
+      "label": "Selection page password (required)",
+      "type": "string",
+      "input_type": "password",
+      "default": "",
+      "help_text": "The page can create and delete library files, so it always asks for this password. The server will not start without one."
+    },
+    {
       "id": "_section_schedule",
       "label": "[AUTO-RESCAN SCHEDULE]",
       "type": "info",
@@ -219,6 +247,14 @@
     }
   ],
   "actions": [
+    {
+      "id": "selection_status",
+      "label": "[SELECTION] Page status",
+      "description": "Show whether the selection page is running, which port to open, and whether the Movies folder is writable.",
+      "button_label": "Status",
+      "button_variant": "outline",
+      "button_color": "violet"
+    },
     {
       "id": "scan_all_vods",
       "label": "[LIBRARY] Catalogue snapshot",
