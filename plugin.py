@@ -2530,15 +2530,17 @@ def _scheduled_run_settings(plugin, snapshot, logger):
     was turned on would otherwise run a full classic rescan and generate the
     whole catalogue. The snapshot holds no selection settings
     (_schedule_snapshot), so turning selection mode off resumes the classic
-    rescan."""
+    rescan. (None, None) when the live settings can't be read: the run is
+    skipped rather than risk a classic rescan while selection mode is on."""
     settings, params = snapshot or {}, {}
     if _selection_runtime is not None:
         try:
             live = _selection_runtime.live_settings(plugin)
-            if live.get("selection_mode"):
-                settings, params = live, {"scheduled": True}
         except Exception as e:
-            logger.warning("Could not read live settings for selection mode: %s", e)
+            logger.error("Scheduled run skipped: could not read the plugin settings: %s", e)
+            return None, None
+        if live.get("selection_mode"):
+            settings, params = live, {"scheduled": True}
     return settings, params
 
 
@@ -2559,6 +2561,8 @@ try:
         logger = logging.getLogger("vod2mlib.schedule")
         plugin = Plugin()
         settings, params = _scheduled_run_settings(plugin, settings, logger)
+        if settings is None:
+            return {"status": "error", "message": "Scheduled run skipped: could not read the plugin settings."}
         result = plugin.run(action, params, {"logger": logger, "settings": settings})
         try:
             from django.utils import timezone

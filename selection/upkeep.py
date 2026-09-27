@@ -149,7 +149,7 @@ def _held_titles(catalogue, rows):
         uuids = [r["content_uuid"] for r in watched if r["kind"] == kind]
         present = catalogue.titles_with_copies(kind, uuids)
         lost |= {(kind, u) for u in uuids if str(u) not in present}
-    if len(lost) >= GUARD_MIN_TITLES and len(lost) > GUARD_SHARE * len(rows):
+    if len(lost) >= GUARD_MIN_TITLES and len(lost) > GUARD_SHARE * len(watched):
         return lost
     return set()
 

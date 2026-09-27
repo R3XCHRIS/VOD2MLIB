@@ -42,9 +42,12 @@ def _remove_paths(store, paths, root):
 
 def _write_nfo(plugin, store, kind, content_uuid, path, owned, make_content, written):
     """Existing .nfo files may hold user edits: never overwrite one Apply
-    didn't create, and only claim (and later delete) our own."""
+    didn't create (adopted ones included), and only claim (and later delete)
+    our own and adopted ones."""
+    store.check_free(kind, content_uuid, path)
     if path in owned:
-        plugin._write_if_different_preserve_times(path, make_content())
+        if not store.is_adopted(path):
+            plugin._write_if_different_preserve_times(path, make_content())
     elif os.path.exists(path):
         return
     else:
@@ -83,6 +86,7 @@ def _write_movie(plugin, store, settings, movie, relation, owned=frozenset()):
         dispatcharr_url, "movie", movie.uuid, relation.stream_id,
         bool(settings.get("omit_stream_id", False)),
     )
+    store.check_free("movie", movie.uuid, strm_path)
     plugin._write_if_different_preserve_times(strm_path, url)
     store.record_file("movie", movie.uuid, strm_path)
     written.add(strm_path)
@@ -126,6 +130,7 @@ def _write_series(plugin, store, settings, series, relation, episodes, owned=fro
         os.makedirs(season_folder, exist_ok=True)
         strm_path = os.path.join(season_folder, filename + ".strm")
         url = plugin._build_proxy_url(dispatcharr_url, "episode", episode.uuid, stream_id, omit_stream_id)
+        store.check_free("series", series.uuid, strm_path)
         plugin._write_if_different_preserve_times(strm_path, url)
         store.record_file("series", series.uuid, strm_path)
         written.add(strm_path)

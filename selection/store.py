@@ -17,7 +17,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS selection (
 CREATE TABLE IF NOT EXISTS applied_file (
     path          TEXT PRIMARY KEY,
     kind          TEXT NOT NULL,
-    content_uuid  TEXT NOT NULL
+    content_uuid  TEXT NOT NULL,
+    adopted       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS applied_file_title ON applied_file (kind, content_uuid);
 CREATE TABLE IF NOT EXISTS copy_probe (
@@ -111,6 +112,10 @@ class SelectionStore:
         for name, definition in _ADDED_COLUMNS.items():
             if name not in have:
                 c.execute(f"ALTER TABLE selection ADD COLUMN {name} {definition}")
+        # Files adoption found on disk: a .nfo among them may hold user edits,
+        # so Apply never rewrites it (it still goes with its title).
+        if "adopted" not in {r["name"] for r in c.execute("PRAGMA table_info(applied_file)")}:
+            c.execute("ALTER TABLE applied_file ADD COLUMN adopted INTEGER NOT NULL DEFAULT 0")
         c.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -281,7 +286,8 @@ class SelectionStore:
     def counts(self):
         with self._conn() as c:
             by_kind = dict(c.execute(
-                "SELECT kind, COUNT(*) FROM selection WHERE applied_selected = 1 GROUP BY kind"
+                "SELECT kind, COUNT(*) FROM selection WHERE applied_selected = 1"
+                " AND COALESCE(flag, '') != 'no_copy' GROUP BY kind"  # its files are gone
             ).fetchall())
             pending = c.execute(
                 f"SELECT COUNT(*) FROM selection WHERE ({_PENDING_WHERE})").fetchone()[0]
@@ -291,12 +297,34 @@ class SelectionStore:
 
     # ---------- files written by Apply ----------
 
+    def owner_of(self, path):
+        """(kind, content_uuid, title) of the title that owns a file, or None."""
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT f.kind, f.content_uuid, s.title FROM applied_file f
+                   LEFT JOIN selection s ON s.kind = f.kind AND s.content_uuid = f.content_uuid
+                   WHERE f.path = ?""", (path,)).fetchone()
+        return (row["kind"], row["content_uuid"], row["title"]) if row else None
+
+    def check_free(self, kind, content_uuid, path):
+        """Raise if another title owns the path: two titles whose names come
+        out the same must not overwrite, or later delete, each other's files."""
+        owner = self.owner_of(path)
+        if owner and (owner[0], owner[1]) != (kind, str(content_uuid)):
+            raise FileExistsError(f"{os.path.basename(path)} already belongs to {owner[2] or owner[1]}")
+
     def record_file(self, kind, content_uuid, path):
+        self.check_free(kind, content_uuid, path)
         with self._conn() as c:
             c.execute(
-                "INSERT OR REPLACE INTO applied_file (path, kind, content_uuid) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO applied_file (path, kind, content_uuid) VALUES (?, ?, ?)",
                 (path, kind, str(content_uuid)),
             )
+
+    def is_adopted(self, path):
+        with self._conn() as c:
+            row = c.execute("SELECT adopted FROM applied_file WHERE path = ?", (path,)).fetchone()
+        return bool(row and row["adopted"])
 
     def files_for(self, kind, content_uuid):
         with self._conn() as c:
@@ -351,7 +379,7 @@ class SelectionStore:
             if cur.rowcount == 0:
                 return False
             c.executemany(
-                "INSERT OR IGNORE INTO applied_file (path, kind, content_uuid) VALUES (?, ?, ?)",
+                "INSERT OR IGNORE INTO applied_file (path, kind, content_uuid, adopted) VALUES (?, ?, ?, 1)",
                 [(p, kind, str(content_uuid)) for p in paths],
             )
             return True

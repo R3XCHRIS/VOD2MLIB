@@ -201,7 +201,12 @@ class DjangoCatalogue:
         # Selected titles always show under the "selected" filter, even if a
         # category filter/exclude would now hide them: settings never deselect.
         rels = self._relations(kind, settings, apply_filters=include_uuids is None)
-        titles = model.objects.filter(id__in=rels.values(fk)).select_related("logo")
+        listed = Q(id__in=rels.values(fk))
+        if include_uuids is not None:
+            # A selected title that lost every copy ('no_copy') still shows, with
+            # no copies, so it can be seen and unselected.
+            listed |= Q(uuid__in=list(include_uuids))
+        titles = model.objects.filter(listed).select_related("logo")
         if account_id is not None or category:  # one copy matching both; every copy is still listed
             matching = rels
             if account_id is not None:
@@ -429,18 +434,18 @@ class FakeCatalogue:
         by_title = {}
         for rel in sorted(rels, key=lambda r: (r.m3u_account_id, r.id)):
             by_title.setdefault(getattr(rel, kind).id, []).append(rel)
-        titles = [t for t in self.titles[kind] if t.id in by_title]
+        inc = {str(u) for u in include_uuids} if include_uuids is not None else set()
+        titles = [t for t in self.titles[kind] if t.id in by_title or str(t.uuid) in inc]
         if account_id is not None or category:
             def matches(r):
                 return ((account_id is None or r.m3u_account_id == account_id)
                         and (not category or (r.category and r.category.name == category)))
-            titles = [t for t in titles if any(matches(r) for r in by_title[t.id])]
+            titles = [t for t in titles if any(matches(r) for r in by_title.get(t.id, []))]
         if decade:
             titles = [t for t in titles if decade_key(t.year) == decade]
         if q:
             titles = [t for t in titles if q.lower() in (t.name or "").lower()]
         if include_uuids is not None:
-            inc = {str(u) for u in include_uuids}
             titles = [t for t in titles if str(t.uuid) in inc]
         if exclude_uuids:
             exc = {str(u) for u in exclude_uuids}
@@ -456,7 +461,7 @@ class FakeCatalogue:
         return {
             "total": len(titles),
             "items": [
-                _title_dict(self.plugin, t, [_copy_dict(kind, r, sample(r)) for r in by_title[t.id]])
+                _title_dict(self.plugin, t, [_copy_dict(kind, r, sample(r)) for r in by_title.get(t.id, [])])
                 for t in page
             ],
         }

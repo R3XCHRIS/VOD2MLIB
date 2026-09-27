@@ -531,7 +531,7 @@ function renderTile(item, kind) {
   const copy = item.copies.find((c) => item.chosen && copyKey(c) === copyKey(item.chosen)) || item.copies[0];
   b.title = `${item.name}${item.year ? ` (${item.year})` : ""}\n` +
     (copy ? copyLabel(copy, item) : "No copy available") + `\n${item.selected ? "Click to unselect" : "Click to select"}`;
-  b.disabled = !item.copies.length;
+  b.disabled = !item.copies.length && !item.selected;  // a title that lost every copy can still be unselected
   const marks = [badge(item), item.new ? `<span class="badge new">new</span>` : "",
     item.flag && item.flag !== "duplicates" ? `<span class="badge ${item.flag === "no_copy" ? "remove" : "change"}">${FLAG_LABEL[item.flag] || item.flag}</span>` : ""]
     .filter(Boolean).join("");

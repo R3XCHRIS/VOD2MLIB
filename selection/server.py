@@ -182,7 +182,8 @@ class SelectionService:
             item["copies"] = rank(item["copies"], prefs)
             item["audio_override"] = row.get("audio_override")
             item["selected"] = bool(row.get("desired_selected"))
-            item["on_disk"] = bool(row.get("applied_selected"))
+            # 'no_copy' stays applied so upkeep can restore it, but its files are gone.
+            item["on_disk"] = bool(row.get("applied_selected")) and row.get("flag") != "no_copy"
             item["chosen"] = (
                 {"account_id": row["desired_account_id"], "stream_id": row["desired_stream_id"]}
                 if row.get("desired_selected") else None

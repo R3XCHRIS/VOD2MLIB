@@ -174,7 +174,7 @@ For catalogues too big to generate wholesale. With **Selection mode** ON, everyt
 2. In the plugin settings, set a **Selection page password**, turn **Selection mode** ON and save. The page starts within ~30 s at `http://<dispatcharr-host>:9192/`. `[SELECTION] Page status` shows whether it's running, the port to publish, and whether the Movies folder is writable.
 3. **Restart Dispatcharr after installing or updating the plugin.** The page runs in Dispatcharr's `daphne` process, which only loads plugins at startup.
 
-The page has its own login (the password above, 7-day sessions) and isn't behind Dispatcharr's authentication, so keep the port on your LAN.
+The page has its own login (the password above, 7-day sessions) and isn't behind Dispatcharr's authentication. It serves plain HTTP, like Dispatcharr's own port, so the password and session cookie cross the network unencrypted: keep the port on a network you trust and never forward it to the internet. For access from elsewhere, put it behind an HTTPS reverse proxy on its own hostname (not a sub-path; the same proxy you use for Dispatcharr works) or a VPN.
 
 ### Using the page
 

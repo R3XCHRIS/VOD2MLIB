@@ -503,6 +503,9 @@ class TestSeasonStore:
             INSERT INTO selection (kind, content_uuid, title, desired_selected, desired_account_id,
                 desired_stream_id, applied_selected, applied_account_id, applied_stream_id)
                 VALUES ('series', 'u1', 'Yellowstone', 1, 1, '5001', 1, 1, '5001');
+            CREATE TABLE applied_file (path TEXT PRIMARY KEY, kind TEXT NOT NULL,
+                content_uuid TEXT NOT NULL);
+            INSERT INTO applied_file VALUES ('/s/tvshow.nfo', 'series', 'u1');
         """)
         conn.commit()
         conn.close()
@@ -511,6 +514,8 @@ class TestSeasonStore:
         assert row["applied_selected"] == 1
         assert store.excluded_seasons(row) == []
         assert store.pending() == []
+        assert store.files_for("series", "u1") == ["/s/tvshow.nfo"]
+        assert not store.is_adopted("/s/tvshow.nfo")
         from selection.store import SCHEMA_VERSION
         assert store.schema_version() == SCHEMA_VERSION
         SelectionStore(str(path))  # opening again is a no-op
@@ -2076,3 +2081,110 @@ def test_a_change_made_during_apply_stays_pending(env):
     assert [r["content_uuid"] for r in store.pending("movie")] == [MATRIX]
     assert _apply(env)["removed"] == 1
     assert not _matrix_folder(tmp_path).exists()
+
+
+# ---------- review follow-ups (PR #17) ----------
+
+def test_scheduled_run_is_skipped_when_live_settings_cannot_be_read(monkeypatch):
+    # The snapshot holds no selection settings, so falling back to it would run
+    # a classic full rescan while selection mode may still be on.
+    import plugin as plugin_mod
+
+    def broken(plugin):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(plugin_mod._selection_runtime, "live_settings", broken)
+    snapshot = Plugin()._schedule_snapshot({"selection_mode": True, "batch_size": "250"})
+    assert plugin_mod._scheduled_run_settings(Plugin(), snapshot, LOG) == (None, None)
+
+
+def test_adopted_nfo_is_never_rewritten_but_goes_with_its_title(env):
+    # Classic mode never overwrites an existing .nfo, so an adopted one may
+    # hold the user's edits.
+    plugin, catalogue, store, settings, tmp_path = env
+    _classic_library(env)
+    nfo = next(_matrix_folder(tmp_path).glob("*.nfo"))
+    nfo.write_text("<movie><title>My edit</title></movie>")
+    adoption.adopt(catalogue, store, adoption.scan(catalogue, store, settings), LOG)
+    assert _apply(env)["changed"] == 1  # rewrites the Matrix with its 4K copy
+    assert nfo.read_text() == "<movie><title>My edit</title></movie>"
+    assert str(nfo) in store.files_for("movie", MATRIX)
+    store.set_desired("movie", MATRIX, False)
+    assert _apply(env)["removed"] == 1
+    assert not nfo.exists()  # removed with its title, as classic Clean up would
+
+
+def test_nfo_written_by_apply_is_still_updated(env):
+    plugin, catalogue, store, settings, tmp_path = env
+    store.set_desired("movie", MATRIX, True, 1, 101, "The Matrix")
+    _apply(env)
+    nfo = next(_matrix_folder(tmp_path).glob("*.nfo"))
+    nfo.write_text("stale")
+    store.set_desired("movie", MATRIX, True, 2, 201, "The Matrix")
+    _apply(env)
+    assert nfo.read_text() != "stale"
+
+
+def test_two_titles_with_the_same_file_name_do_not_share_it(tmp_path):
+    plugin = Plugin()
+    settings = {f["id"]: f["default"] for f in plugin.fields if "default" in f}
+    settings.update(dispatcharr_url="http://10.0.0.5:9191", root_folder=str(tmp_path / "Movies"),
+                    series_root_folder=str(tmp_path / "Series"))
+    spec = {"accounts": {1: "Provider A"},
+            "movies": [{"name": "Twin", "year": 2000, "copies": [(1, 301, "Films")]},
+                       {"name": "Twin", "year": 2000, "copies": [(1, 302, "Films")]}],
+            "series": []}
+    first, second = "00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"
+    catalogue = make_fake_catalogue(plugin, spec)
+    store = SelectionStore(str(tmp_path / "db" / "selection.db"))
+    store.set_desired("movie", first, True, 1, 301, "Twin")
+    apply_pending(plugin, catalogue, store, settings, LOG)
+    files = store.files_for("movie", first)
+    store.set_desired("movie", second, True, 1, 302, "Twin")
+    r = apply_pending(plugin, catalogue, store, settings, LOG)
+    assert r["errors"] == 1 and "already belongs to Twin" in r["failures"][0]
+    assert store.files_for("movie", first) == files and store.files_for("movie", second) == []
+    strm = next(p for p in files if p.endswith(".strm"))
+    assert "stream_id=301" in open(strm).read()  # not overwritten by the second title
+    store.set_desired("movie", second, False)
+    apply_pending(plugin, catalogue, store, settings, LOG)
+    assert all(os.path.exists(p) for p in files)
+
+
+def test_guard_share_counts_only_titles_it_watches(env, monkeypatch):
+    # Titles already without a copy aren't watched, so they mustn't dilute the
+    # share: 2 of 2 watched titles lost is an outage, whatever else is flagged.
+    plugin, catalogue, store, settings, tmp_path = env
+    monkeypatch.setattr(upkeep_mod, "GUARD_MIN_TITLES", 2)
+    store.set_desired("movie", MATRIX, True, 1, 101, "The Matrix")
+    store.set_desired("movie", ALADDIN, True, 1, 102, "Aladdin")
+    _apply(env)
+    for n in range(10):
+        uuid = f"00000000-0000-4000-8000-0000000009{n:02d}"
+        store.set_desired("movie", uuid, True, 1, 900 + n, f"Gone {n}")
+        store.mark_applied("movie", uuid)
+        store.set_flag("movie", uuid, "no_copy", "lost")
+    files = store.files_for("movie", MATRIX) + store.files_for("movie", ALADDIN)
+    catalogue.relations["movie"] = []
+    r = _upkeep(env)
+    assert r["held"] == 2 and all(os.path.exists(p) for p in files)
+
+
+def test_no_copy_titles_are_listed_and_not_counted_on_disk(http, env):
+    base, service = http
+    plugin, catalogue, store, settings, _ = env
+    store.set_desired("movie", ALADDIN, True, 1, 102, "Aladdin")
+    _apply(env)
+    _drop_copy(catalogue, "movie", "102")
+    _upkeep(env)
+    cookie = _login(base)
+    for state in ("flagged", "selected"):
+        _, data, _ = _req(base, "GET", f"/api/movies?state={state}", cookie=cookie)
+        assert [i["uuid"] for i in data["items"]] == [ALADDIN]
+        item = data["items"][0]
+        assert (item["copies"], item["on_disk"], item["flag"]) == ([], False, "no_copy")
+    assert store.counts()["movies_on_disk"] == 0
+    # It can still be unselected, which then removes nothing and clears the flag.
+    _req(base, "PUT", f"/api/selection/movie/{ALADDIN}", {"selected": False, "title": "Aladdin"}, cookie=cookie)
+    assert _apply(env)["removed"] == 1
+    _, data, _ = _req(base, "GET", "/api/movies?state=flagged", cookie=cookie)
+    assert data["items"] == []
