@@ -201,12 +201,12 @@ class DjangoCatalogue:
         # Selected titles always show under the "selected" filter, even if a
         # category filter/exclude would now hide them: settings never deselect.
         rels = self._relations(kind, settings, apply_filters=include_uuids is None)
-        listed = Q(id__in=rels.values(fk))
         if include_uuids is not None:
-            # A selected title that lost every copy ('no_copy') still shows, with
-            # no copies, so it can be seen and unselected.
-            listed |= Q(uuid__in=list(include_uuids))
-        titles = model.objects.filter(listed).select_related("logo")
+            # Exactly these titles, copies or not: one that lost every copy
+            # ('no_copy') still shows, so it can be seen and unselected.
+            titles = model.objects.filter(uuid__in=list(include_uuids)).select_related("logo")
+        else:
+            titles = model.objects.filter(id__in=rels.values(fk)).select_related("logo")
         if account_id is not None or category:  # one copy matching both; every copy is still listed
             matching = rels
             if account_id is not None:

@@ -35,6 +35,7 @@ SESSION_TTL = 7 * 24 * 3600
 CSRF_HEADER = "X-VOD2MLIB"  # custom header: forces a CORS preflight cross-site
 MAX_BODY = 1 << 20
 REQUEST_TIMEOUT = 30  # seconds a connection may sit idle or half-sent
+LOGIN_WAIT = 5  # seconds a login waits behind other attempts before a 429
 PAGE_SIZE_MAX = 200
 PROBE_FRESH = 7 * 24 * 3600  # "probe all selected" skips copies probed this recently
 PROBE_BUSY_STOP = 3  # ...and stops after this many "no free connection" copies in a row
@@ -424,6 +425,11 @@ class SelectionService:
         return {"ok": True}
 
     def clear_flag(self, kind, content_uuid):
+        row = self.store.get_many(kind, [content_uuid]).get(str(content_uuid)) or {}
+        if row.get("flag") == "no_copy":
+            # A state, not a notice: its files are gone and upkeep watches for
+            # a copy. It clears when one returns or the title is unselected.
+            raise ValueError("a title with no copy can't be dismissed; unselect it instead")
         self.store.set_flag(kind, content_uuid, None)
         return {"ok": True}
 
@@ -629,10 +635,15 @@ def make_handler(service):
                     password = self._body().get("password")
                     # One attempt at a time, and a failed one holds the lock for
                     # a second: parallel guesses can't go faster than 1/s.
-                    with _login_lock:
+                    if not _login_lock.acquire(timeout=LOGIN_WAIT):
+                        # Many attempts queued: answer instead of piling up threads.
+                        return self._send_json(429, {"error": "too many login attempts; try again shortly"})
+                    try:
                         token = service.login(password)
                         if not token:
                             time.sleep(1)
+                    finally:
+                        _login_lock.release()
                     if not token:
                         return self._send_json(401, {"error": "wrong password"})
                     return self._send_json(200, {"ok": True},

@@ -1290,16 +1290,12 @@ class TestUpkeepHttp:
         assert service.upkeep_job()["result"]["no_copy"] == 1
         _, pending, _ = _req(base, "GET", "/api/pending", cookie=cookie)
         assert "lost every copy" in pending["last_upkeep"]["message"]
-        # The page can still list it once any copy is visible again.
-        catalogue.relations["movie"].append(SimpleNamespace(
-            id=99, movie=next(t for t in catalogue.titles["movie"] if str(t.uuid) == ALADDIN),
-            m3u_account_id=2, m3u_account=catalogue.relations["movie"][0].m3u_account, stream_id="999",
-            category=None, container_extension="mkv", custom_properties={}))
+        # 'no_copy' is a state, not a notice: it can't be dismissed, and the
+        # title stays listed under Flagged.
+        status, _, _ = _req(base, "POST", f"/api/clear-flag/movie/{ALADDIN}", cookie=cookie)
+        assert status == 400
         _, data, _ = _req(base, "GET", "/api/movies?state=flagged", cookie=cookie)
         assert [i["uuid"] for i in data["items"]] == [ALADDIN] and data["items"][0]["flag"] == "no_copy"
-        _req(base, "POST", f"/api/clear-flag/movie/{ALADDIN}", cookie=cookie)
-        _, data, _ = _req(base, "GET", "/api/movies?state=flagged", cookie=cookie)
-        assert data["items"] == []
 
 
 # ---------- adoption of an existing library ----------
@@ -2272,3 +2268,74 @@ def test_parallel_wrong_passwords_are_answered_one_per_second(http):
     for t in threads:
         t.join()
     assert results == [401, 401, 401] and _t.monotonic() - started >= 2.9
+
+
+def _twin_env(tmp_path):
+    plugin = Plugin()
+    settings = {f["id"]: f["default"] for f in plugin.fields if "default" in f}
+    settings.update(dispatcharr_url="http://10.0.0.5:9191", root_folder=str(tmp_path / "Movies"),
+                    series_root_folder=str(tmp_path / "Series"))
+    spec = {"accounts": {1: "Provider A"},
+            "movies": [{"name": "Twin", "year": 2000, "copies": [(1, 301, "Films")]},
+                       {"name": "Twin", "year": 2000, "copies": [(1, 302, "Films")]}],
+            "series": []}
+    store = SelectionStore(str(tmp_path / "db" / "selection.db"))
+    return plugin, make_fake_catalogue(plugin, spec), store, settings
+
+
+def test_switching_between_same_named_titles_in_one_apply(tmp_path):
+    # The removal runs first, so the new title finds the paths free.
+    plugin, catalogue, store, settings = _twin_env(tmp_path)
+    first, second = "00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"
+    store.set_desired("movie", first, True, 1, 301, "Twin")
+    apply_pending(plugin, catalogue, store, settings, LOG)
+    store.set_desired("movie", first, False)
+    store.set_desired("movie", second, True, 1, 302, "Twin")
+    r = apply_pending(plugin, catalogue, store, settings, LOG)
+    assert (r["added"], r["removed"], r["errors"]) == (1, 1, 0)
+    strm = next(p for p in store.files_for("movie", second) if p.endswith(".strm"))
+    assert "stream_id=302" in open(strm).read()
+
+
+def test_taking_over_a_classic_strm_claims_its_nfo_too(env):
+    # As adoption would: the .nfo is kept as it is, and goes with the title.
+    plugin, catalogue, store, settings, tmp_path = env
+    folder = _matrix_folder(tmp_path)
+    folder.mkdir(parents=True)
+    (folder / "The Matrix (1999).strm").write_text(f"http://10.0.0.5:9191/proxy/vod/movie/{MATRIX}?stream_id=201")
+    nfo = folder / "The Matrix (1999).nfo"
+    nfo.write_text("<movie><title>My edit</title></movie>")
+    store.set_desired("movie", MATRIX, True, 1, 101, "The Matrix")
+    assert _apply(env)["added"] == 1
+    assert nfo.read_text() == "<movie><title>My edit</title></movie>"
+    assert str(nfo) in store.adopted_paths("movie", MATRIX)
+    store.set_desired("movie", MATRIX, False)
+    _apply(env)
+    assert not folder.exists()  # nothing left behind
+
+
+def test_an_adopted_nfo_that_went_missing_is_written_again(env):
+    plugin, catalogue, store, settings, tmp_path = env
+    _classic_library(env)
+    adoption.adopt(catalogue, store, adoption.scan(catalogue, store, settings), LOG)
+    nfo = next((tmp_path / "Movies" / "Aladdin (1992)").glob("*.nfo"))
+    assert str(nfo) in store.adopted_paths("movie", ALADDIN)
+    nfo.unlink()
+    _upkeep(env)
+    assert nfo.is_file() and str(nfo) not in store.adopted_paths("movie", ALADDIN)
+
+
+def test_logins_queued_too_long_get_429(http, monkeypatch):
+    import selection.server as server_mod
+    base, _ = http
+    monkeypatch.setattr(server_mod, "LOGIN_WAIT", 0.2)
+    results = []
+
+    def guess():
+        results.append(_req(base, "POST", "/api/login", {"password": "wrong"})[0])
+    threads = [threading.Thread(target=guess) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == [401, 429, 429]

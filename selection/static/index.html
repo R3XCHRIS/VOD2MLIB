@@ -389,8 +389,10 @@ function copyLabels(copies, item) {
 const FLAG_LABEL = { fallback: "switched copy", no_copy: "no copy" };
 function flagBadge(item) {
   if (!item.flag || item.flag === "duplicates") return "";  // shown as the "tidy" pending badge
-  return `<span class="badge ${item.flag === "no_copy" ? "remove" : "change"}" title="${escapeHtml(item.flag_detail)}">${FLAG_LABEL[item.flag] || item.flag}</span>` +
-    `<button class="small clearflag" title="Dismiss: ${escapeHtml(item.flag_detail)}">✕</button>`;
+  const span = `<span class="badge ${item.flag === "no_copy" ? "remove" : "change"}" title="${escapeHtml(item.flag_detail)}">${FLAG_LABEL[item.flag] || item.flag}</span>`;
+  // 'no_copy' is a state (files gone, waiting for a copy), not a notice to dismiss.
+  return item.flag === "no_copy" ? span
+    : span + `<button class="small clearflag" title="Dismiss: ${escapeHtml(item.flag_detail)}">✕</button>`;
 }
 
 function badge(item) {
@@ -441,7 +443,7 @@ function renderRow(item, kind) {
   const options = item.copies.map((c, i) =>
     `<option value="${escapeHtml(copyKey(c))}" ${copyKey(c) === chosenKey ? "selected" : ""}>${escapeHtml(labels[i])}</option>`).join("");
   tr.innerHTML = `
-    <td class="check"><input type="checkbox" ${item.selected ? "checked" : ""} aria-label="Select ${escapeHtml(item.name)}"></td>
+    <td class="check"><input type="checkbox" ${item.selected ? "checked" : ""} ${!item.copies.length && !item.selected ? "disabled" : ""} aria-label="Select ${escapeHtml(item.name)}"></td>
     <td class="poster">${item.poster ? `<img loading="lazy" src="${escapeHtml(item.poster)}" alt="">` : `<div class="ph"></div>`}</td>
     <td>${escapeHtml(item.name)}${item.new ? `<span class="badge new">new</span>` : ""}${kind === "series" && item.selected && item.copies.length ? seasonsButton(item) : ""}</td>
     <td class="year muted">${item.year ?? ""}</td>
@@ -460,6 +462,7 @@ function renderRow(item, kind) {
   };
   const save = async () => {
     const c = currentCopy();
+    if (box.checked && !c) { box.checked = false; return; }  // no copy to select
     const body = { selected: box.checked, title: item.name };
     if (box.checked) { body.account_id = c.account_id; body.stream_id = c.stream_id; }
     try {
