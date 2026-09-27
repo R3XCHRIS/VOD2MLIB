@@ -113,7 +113,7 @@ The `Dispatcharr URL` in plugin settings is **baked into every `.strm` file** �
 
 ## Settings
 
-The Settings tab is grouped into four sections:
+The Settings tab is grouped into five sections:
 
 | Section | Field | What it does |
 |---|---|---|
@@ -134,6 +134,9 @@ The Settings tab is grouped into four sections:
 |  | Refresh Existing Series | Re-evaluate already-processed series for new episodes AND rewrite existing episode `.strm` URLs (cron-friendly). Preserves `tvshow.nfo` and episode `.nfo` edits. |
 |  | Nest Series by Category | Wrap each series folder inside a subfolder named by its M3U category (off by default; series without a category go to `Unassigned/`) |
 |  | Dedupe Series Across Categories | When nesting is ON and a series is tagged with multiple categories upstream, write under the first category only (alphabetical) instead of duplicating. No effect when nesting is OFF. Off by default. ⚠ Doesn't remove existing duplicate folders — `[⚠ DANGER] Clean up` + re-generate to migrate. |
+| **Selection mode** | Selection mode | Off by default. When ON, nothing is generated unless you pick it on the selection page and press Apply; the Generate / Full rescan buttons are paused and the schedule maintains your selection instead. See [Selection mode](#selection-mode-opt-in). |
+|  | Selection page port | Port the page listens on inside the container (default `9192`). Publish it in docker-compose. |
+|  | Selection page password | Required: the page can create and delete library files, and the server won't start without one. |
 | **Auto-rescan schedule** | Schedule (cron) | Standard 5-field expression. Default `0 3 * * *` (daily 03:00) |
 |  | Schedule Timezone | IANA timezone the cron is interpreted in (e.g. `Europe/London`). Empty = UTC. Handles DST automatically. |
 |  | Scheduled Action | What the cron fires (full rescan recommended) |
@@ -152,6 +155,54 @@ The Settings tab is grouped into four sections:
 5. Optional: click `[SCHEDULE] Test fire now` to immediately replay the scheduled action without waiting for the next cron tick.
 
 The cron snapshots your settings at click-time. **Re-click Apply after changing any setting** to refresh the snapshot.
+
+## Selection mode (opt-in)
+
+For catalogues too big to generate wholesale. With **Selection mode** ON, everything is ignored by default: you tick the movies and series you want on a page served by the plugin, choose which provider **copy** of each (copies differ in quality, audio languages and subtitles), and press **Apply** to write or delete their files. With it OFF (the default) the plugin behaves exactly as described above.
+
+### Setup
+
+1. **Publish the page's port** in your Dispatcharr container (default `9192`):
+
+   ```yaml
+   services:
+     dispatcharr:
+       ports:
+         - "9192:9192"
+   ```
+
+2. In the plugin settings, set a **Selection page password**, turn **Selection mode** ON and save. The page starts within ~30 s at `http://<dispatcharr-host>:9192/`. `[SELECTION] Page status` shows whether it's running, the port to publish, and whether the Movies folder is writable.
+3. **Restart Dispatcharr after installing or updating the plugin.** The page runs in Dispatcharr's `daphne` process, which only loads plugins at startup.
+
+The page has its own login (the password above, 7-day sessions) and isn't behind Dispatcharr's authentication. It serves plain HTTP, like Dispatcharr's own port, so the password and session cookie cross the network unencrypted: keep the port on a network you trust and never forward it to the internet. For access from elsewhere, put it behind an HTTPS reverse proxy on its own hostname (not a sub-path; the same proxy you use for Dispatcharr works) or a VPN.
+
+### Using the page
+
+- **Movies | Series**, a **Table** (copies, languages, seasons) or a **Grid** of posters (click to select with the best copy).
+- Tabs: **All**, **New** (added since you last pressed *Mark all seen*), **Selected**, **Ignored**, **Pending** (changes not applied yet), **Flagged** (see upkeep below). Filters: search, provider (M3U account), category and decade.
+- **Copies** are ranked by your **Preferences** (audio languages, subtitle languages, 4K or 1080p first) and labelled with what Dispatcharr knows, e.g. `DE 1080p H264 4.8 Mb/s`. Provider data rarely says which languages a stream really has, so **Probe** (per title) and **Probe all selected** run `ffprobe` through Dispatcharr's own VOD proxy (one connection at a time, so account limits hold) and record every audio and subtitle track. Titles you already picked keep their copy; a better one shows as a *better copy: switch* hint.
+- **Audio override** per title (e.g. a French film in French with your usual subtitle languages).
+- **Seasons**: untick seasons you don't want. New seasons are included automatically.
+- **Review & Apply** lists every change before anything is written.
+
+**Existing library.** If you generated files before turning selection mode on, a banner offers **Scan library**: it reads your `.strm` files, shows which titles and copies they play, and **Adopt** records them as selected without touching the files. Files it can't match are left alone.
+
+### Scheduled upkeep
+
+In selection mode the `[SCHEDULE]` cron (and the page's **Refresh selected now**) maintains what you applied instead of generating the whole catalogue: it refreshes `.strm` URLs, adds new episodes, and handles copies that disappear:
+
+- **Another copy exists:** switches to the best remaining one (flag `fallback`).
+- **No copy left:** deletes the title's files but keeps it selected (flag `no_copy`); it comes back when a copy reappears.
+- **Dispatcharr re-created the titles** (new ids after a provider refresh): selections are relinked by copy id, then TMDB id.
+- **Mass-loss guard:** if more than 20% (and at least 5) of your applied titles lose every copy in one run, nothing is deleted and the run reports it, since that usually means a provider outage.
+
+Changes you haven't applied are never touched by upkeep.
+
+### Safety
+
+- The plugin only deletes files it recorded writing. Other files in your library folders, and `.nfo` files it didn't write, are never modified or deleted. The one exception is a `.strm` that already links to the same title (e.g. left by classic mode without Scan library): Apply takes it over, as adoption would. Any other file in the way stops that title with an error.
+- Selection state lives in `/data/vod2mlib/selection.db` inside the container. Uninstalling the plugin wipes its settings but not this file.
+- Turning selection mode OFF leaves your files as they are and restores the classic buttons.
 
 ## Plex compatibility
 
@@ -221,6 +272,12 @@ python3 -m pytest tests/ -v
 
 The tests don't need Django or a running Dispatcharr — they exercise `_clean_title`, `_strip_trailing_year`, `_sanitize_filename`, `_parse_cron`, `_extract_genres`, `_mask_url`, and the path-building helpers in isolation. 45 tests, ~50ms.
 
+Selection mode has its own suite, `tests/test_selection.py`, which runs against an in-memory fake catalogue (no Django needed). To try the page without Dispatcharr:
+
+```bash
+python3 -m selection.devserver --no-login   # http://127.0.0.1:9192, fake data
+```
+
 The bundled logo is reproducible — replace `tools/source_logo.png` and run `python3 tools/build_logo.py` to regenerate `logo.png` at 512×512 with NEAREST resampling (preserves pixel-art crispness).
 
 ## Architecture (for contributors)
@@ -228,7 +285,15 @@ The bundled logo is reproducible — replace `tools/source_logo.png` and run `py
 - The plugin is a single `plugin.py` declaring a `Plugin` class with `fields`, `actions`, and `run()` per Dispatcharr's plugin contract.
 - `plugin.json` is the manifest the [Dispatcharr/Plugins catalogue](https://github.com/Dispatcharr/Plugins) reads. Dispatcharr's runtime reads action metadata from the Python class — the JSON is for the catalogue and pre-enable preview.
 - Schedule registration uses `django-celery-beat`'s `PeriodicTask` + `CrontabSchedule`. The cron-fired task is a module-level `@shared_task` named `vod2mlib.scheduled_rescan` that constructs a fresh `Plugin()` and dispatches.
-- Settings are snapshotted into the PeriodicTask's `kwargs` at Apply-time so the cron runs with deterministic config. Re-click Apply to refresh.
+- Settings are snapshotted into the PeriodicTask's `kwargs` at Apply-time so the cron runs with deterministic config. Re-click Apply to refresh. The selection page password is left out of the snapshot, and in selection mode the task reads live settings instead.
+- Selection mode lives in the `selection/` subpackage (stdlib only), so `plugin.py` only gains its settings, one action and a few hooks:
+  - `server.py`: the page's HTTP server (`http.server`) and JSON API. It runs in Dispatcharr's `daphne` process (present in every layout and not gevent-patched, so page work can't stall streams); a 30-second watchdog there starts and stops it as the setting changes, and binding the port doubles as the lock against a second copy.
+  - `store.py`: SQLite state. Each title has a *desired* state (edited on the page) and an *applied* state (on disk); `applied_file` records every file written, and only those are ever deleted.
+  - `catalogue.py`: read-only ORM queries over Dispatcharr's VOD models, plus a fake catalogue for tests and the dev server.
+  - `apply.py`, `upkeep.py`, `relink.py`, `adopt.py`: Apply, scheduled upkeep, relinking re-created titles, adopting an existing library. They reuse `Plugin`'s naming and writing helpers, so files are named exactly as in classic mode.
+  - `copyinfo.py`, `probe.py`: copy labels and ranking; ffprobe through Dispatcharr's VOD proxy.
+  - `static/index.html`: the page (plain JS, no build step).
+- ORM calls from the page's threads must close their DB connection afterwards (`close_old_connections()`): they run outside Django's request cycle, and Dispatcharr's pool has 8 connections per process.
 
 ## Changelog
 

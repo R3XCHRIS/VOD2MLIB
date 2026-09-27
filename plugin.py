@@ -17,6 +17,16 @@ import re
 from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Dispatcharr imports this file as `<package>.plugin`, so the relative import
+# works there; tests import it as a top-level `plugin` module.
+try:
+    from .selection import runtime as _selection_runtime
+except ImportError:
+    try:
+        from selection import runtime as _selection_runtime
+    except ImportError:
+        _selection_runtime = None
+
 
 class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
@@ -302,6 +312,34 @@ class Plugin:
             "help_text": "When `Nest Series by Category` is ON and a series is tagged with multiple categories upstream, write the series folder + episodes under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Series by Category` is OFF. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — run `[⚠ DANGER] Clean up Series` once, then re-generate, to clean them up."
         },
         {
+            "id": "_section_selection",
+            "label": "[SELECTION MODE]",
+            "type": "info",
+            "description": "Pick which movies and series (and which provider copy of each) become .strm files, on a page served by this plugin. Off by default.",
+        },
+        {
+            "id": "selection_mode",
+            "label": "Selection mode",
+            "type": "boolean",
+            "default": False,
+            "help_text": "When ON, nothing is generated unless you select it on the selection page and press Apply. The Generate / Full rescan actions are paused while this is ON, and the schedule keeps your applied selection up to date instead of generating everything. Existing files are left alone. Turning this on starts the page server within ~30s (or click [SELECTION] Page status)."
+        },
+        {
+            "id": "selection_port",
+            "label": "Selection page port",
+            "type": "number",
+            "default": 9192,
+            "help_text": "Port the selection page listens on inside the container. Publish it in docker-compose, e.g. `- \"9192:9192\"`."
+        },
+        {
+            "id": "selection_password",
+            "label": "Selection page password (required)",
+            "type": "string",
+            "input_type": "password",
+            "default": "",
+            "help_text": "The page can create and delete library files, so it always asks for this password. The server will not start without one."
+        },
+        {
             "id": "_section_schedule",
             "label": "[AUTO-RESCAN SCHEDULE]",
             "type": "info",
@@ -338,6 +376,14 @@ class Plugin:
     ]
 
     actions = [
+        {
+            "id": "selection_status",
+            "label": "[SELECTION] Page status",
+            "description": "Show whether the selection page is running, which port to open, and whether the Movies folder is writable.",
+            "button_label": "Status",
+            "button_variant": "outline",
+            "button_color": "violet",
+        },
         {
             "id": "scan_all_vods",
             "label": "[LIBRARY] Catalogue snapshot",
@@ -445,16 +491,53 @@ class Plugin:
         },
     ]
     
+    # Actions that write the whole (filtered) catalogue. Paused in selection
+    # mode, otherwise one click would undo the whole point of selecting.
+    _BULK_GENERATE_ACTIONS = ("generate_movies", "generate_series", "rescan_all")
+
+    def __init__(self):
+        # Dispatcharr instantiates the plugin in every web/Celery process; each
+        # one runs a watchdog that serves the selection page when it's enabled.
+        if _selection_runtime is not None:
+            try:
+                _selection_runtime.boot(self)
+            except Exception:
+                pass
+
+    def stop(self, context: dict):
+        """Called by Dispatcharr when the plugin is disabled, deleted or reloaded.
+
+        Dispatcharr calls this in the process that handled the request, usually
+        a uWSGI worker, while the selection page runs in daphne. There the
+        watchdog notices a disabled or deleted plugin within 30 s and stops the
+        page; new plugin code reaches daphne only after a Dispatcharr restart.
+        """
+        if _selection_runtime is not None:
+            _selection_runtime.shutdown()
+
     def run(self, action: str, params: dict, context: dict):
         """Execute plugin action."""
         logger = context.get("logger")
         settings = context.get("settings", {})
-        
+
         logger.info("=" * 60)
         logger.info("VOD .strm Generator v%s", self.version)
         logger.info("Action: %s", action)
         logger.info("=" * 60)
-        
+
+        if action == "selection_status":
+            if _selection_runtime is None:
+                return {"status": "error", "message": "Selection mode files are missing from this install."}
+            return _selection_runtime.status(self, settings)
+        if settings.get("selection_mode") and action in self._BULK_GENERATE_ACTIONS:
+            if (params or {}).get("scheduled") and _selection_runtime is not None:
+                # The cron keeps the applied selection up to date instead.
+                return _selection_runtime.run_scheduled_upkeep(self, settings, logger)
+            msg = ("Selection mode is ON, so bulk generation is paused. Select titles on the "
+                   "selection page and press Apply there (see [SELECTION] Page status).")
+            logger.info(msg)
+            return {"status": "error", "message": msg}
+
         if action == "scan_all_vods":
             return self._scan_all_vods(settings, logger)
         elif action == "generate_movies":
@@ -1371,19 +1454,8 @@ class Plugin:
 
             for episode_rel in episodes:
                 episode = episode_rel.episode
-                season_num = episode.season_number or 0
-                episode_num = episode.episode_number or 0
-
-                season_folder_name = f"Season {season_num:02d}"
+                season_folder_name, filename = self._episode_target_names(series_name, episode)
                 season_folder = os.path.join(series_folder, season_folder_name)
-
-                episode_title = episode.name or ""
-                if episode_title:
-                    clean_title = self._clean_title(episode_title)
-                    filename = f"{series_name} - S{season_num:02d}E{episode_num:02d} - {clean_title}"
-                else:
-                    filename = f"{series_name} - S{season_num:02d}E{episode_num:02d}"
-                filename = self._sanitize_filename(filename)
 
                 strm_path = os.path.join(season_folder, f"{filename}.strm")
                 is_existing = os.path.isfile(strm_path)
@@ -1452,6 +1524,20 @@ class Plugin:
                 "message": f"{series_name} - ✗ Error: {e}",
             }
     
+    def _episode_target_names(self, series_name, episode):
+        """(season folder name, file name without extension) for an episode:
+        ("Season 01", "Show - S01E02 - Title"). Shared with Selection mode, which
+        passes an episode named with the chosen copy's own title."""
+        season_num = episode.season_number or 0
+        episode_num = episode.episode_number or 0
+        episode_title = episode.name or ""
+        if episode_title:
+            clean_title = self._clean_title(episode_title)
+            filename = f"{series_name} - S{season_num:02d}E{episode_num:02d} - {clean_title}"
+        else:
+            filename = f"{series_name} - S{season_num:02d}E{episode_num:02d}"
+        return f"Season {season_num:02d}", self._sanitize_filename(filename)
+
     def _delete_plugin_files_in_dir(self, dir_path: str, logger):
         """Delete only .strm and .nfo files in dir_path. Returns (strm_deleted, nfo_deleted, errors)."""
         strm = nfo = errors = 0
@@ -2186,6 +2272,15 @@ class Plugin:
             )
         return tuple(parts)
 
+    @staticmethod
+    def _schedule_snapshot(settings: Dict[str, Any]) -> Dict[str, Any]:
+        """The settings stored in the PeriodicTask's kwargs: everything but the
+        cron config and the selection settings. Those are read live at run
+        time (_scheduled_run_settings), and the page password would be
+        readable in Django admin."""
+        return {k: v for k, v in (settings or {}).items()
+                if not k.startswith(("schedule_", "selection_"))}
+
     def _valid_schedule_targets(self) -> set:
         """The action ids that are valid as scheduled targets.
 
@@ -2240,7 +2335,7 @@ class Plugin:
             timezone=tz_str,
         )
 
-        snapshot = {k: v for k, v in (settings or {}).items() if not k.startswith("schedule_")}
+        snapshot = self._schedule_snapshot(settings)
 
         task, created = PeriodicTask.objects.update_or_create(
             name=self.SCHEDULE_TASK_NAME,
@@ -2429,6 +2524,49 @@ class Plugin:
         }
 
 
+def _saved_selection_mode(plugin):
+    """The saved Selection mode setting, read without the selection package
+    (same lookup as selection.runtime)."""
+    from apps.plugins.models import PluginConfig
+    key = os.path.basename(os.path.dirname(os.path.abspath(__file__))).lower().replace(" ", "_")
+    cfg = (PluginConfig.objects.filter(key=key).first()
+           or PluginConfig.objects.filter(name=plugin.name).first())
+    return bool(cfg and (cfg.settings or {}).get("selection_mode"))
+
+
+def _scheduled_run_settings(plugin, snapshot, logger):
+    """(settings, params) for a scheduled run. Selection mode is read live,
+    not from the snapshot taken at Apply Schedule: a snapshot from before it
+    was turned on would otherwise run a full classic rescan and generate the
+    whole catalogue. The snapshot holds no selection settings
+    (_schedule_snapshot), so turning selection mode off resumes the classic
+    rescan. (None, None) when the live settings can't be read: the run is
+    skipped rather than risk a classic rescan while selection mode is on."""
+    settings, params = snapshot or {}, {}
+    if _selection_runtime is None and os.path.isdir(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "selection")):
+        # Installed but failed to import: the snapshot can't say whether
+        # selection mode is on, so read the saved setting directly.
+        try:
+            on = _saved_selection_mode(plugin)
+        except Exception as e:
+            logger.error("Scheduled run skipped: could not read the plugin settings: %s", e)
+            return None, None
+        if on:
+            logger.error("Scheduled run skipped: selection mode is on but the selection package "
+                         "failed to import; reinstall the plugin.")
+            return None, None
+    if _selection_runtime is not None:
+        try:
+            live = _selection_runtime.live_settings(plugin)
+        except Exception as e:
+            logger.error("Scheduled run skipped: could not read the plugin settings: %s", e)
+            return None, None
+        if live.get("selection_mode"):
+            settings, params = live, {"scheduled": True}
+    return settings, params
+
+
 try:
     from celery import shared_task as _vod2mlib_shared_task
 
@@ -2444,7 +2582,11 @@ try:
         """
         import logging
         logger = logging.getLogger("vod2mlib.schedule")
-        result = Plugin().run(action, {}, {"logger": logger, "settings": settings or {}})
+        plugin = Plugin()
+        settings, params = _scheduled_run_settings(plugin, settings, logger)
+        if settings is None:
+            return {"status": "error", "message": "Scheduled run skipped: could not read the plugin settings."}
+        result = plugin.run(action, params, {"logger": logger, "settings": settings})
         try:
             from django.utils import timezone
             from django_celery_beat.models import PeriodicTask
