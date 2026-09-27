@@ -2188,3 +2188,45 @@ def test_no_copy_titles_are_listed_and_not_counted_on_disk(http, env):
     assert _apply(env)["removed"] == 1
     _, data, _ = _req(base, "GET", "/api/movies?state=flagged", cookie=cookie)
     assert data["items"] == []
+
+
+def test_scheduled_run_is_skipped_when_the_selection_package_fails_to_import(monkeypatch):
+    # The package is on disk but its import failed: selection mode may be on,
+    # and the snapshot can't tell, so don't risk a classic rescan.
+    import plugin as plugin_mod
+    monkeypatch.setattr(plugin_mod, "_selection_runtime", None)
+    assert plugin_mod._scheduled_run_settings(Plugin(), {"batch_size": "250"}, LOG) == (None, None)
+
+
+def test_negative_content_length_is_rejected(http):
+    base, _ = http
+    host, port = base.rsplit("/", 1)[1].split(":")
+    with socket.create_connection((host, int(port)), timeout=5) as s:
+        s.sendall(b"POST /api/login HTTP/1.1\r\nHost: x\r\nX-VOD2MLIB: 1\r\n"
+                  b"Content-Length: -1\r\n\r\n")  # and the connection stays open
+        assert s.recv(200).split(b"\r\n")[0].endswith(b"400 Bad Request")
+
+
+def test_unmanaged_strm_at_the_target_path_is_left_alone(env):
+    plugin, catalogue, store, settings, tmp_path = env
+    folder = _matrix_folder(tmp_path)
+    folder.mkdir(parents=True)
+    strm = folder / "The Matrix (1999).strm"
+    strm.write_text("http://example.com/my-own-rip.mkv")
+    store.set_desired("movie", MATRIX, True, 1, 101, "The Matrix")
+    r = _apply(env)
+    assert r["errors"] == 1 and "Scan library" in r["failures"][0]
+    assert strm.read_text() == "http://example.com/my-own-rip.mkv"
+    assert store.files_for("movie", MATRIX) == []
+
+
+def test_classic_strm_for_the_same_title_is_taken_over(env):
+    # What Scan library would adopt: a Dispatcharr link to this very title.
+    plugin, catalogue, store, settings, tmp_path = env
+    folder = _matrix_folder(tmp_path)
+    folder.mkdir(parents=True)
+    strm = folder / "The Matrix (1999).strm"
+    strm.write_text(f"http://10.0.0.5:9191/proxy/vod/movie/{MATRIX}?stream_id=201")
+    store.set_desired("movie", MATRIX, True, 1, 101, "The Matrix")
+    assert _apply(env)["added"] == 1
+    assert "stream_id=101" in strm.read_text() and str(strm) in store.files_for("movie", MATRIX)

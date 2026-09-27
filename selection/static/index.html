@@ -443,7 +443,7 @@ function renderRow(item, kind) {
   tr.innerHTML = `
     <td class="check"><input type="checkbox" ${item.selected ? "checked" : ""} aria-label="Select ${escapeHtml(item.name)}"></td>
     <td class="poster">${item.poster ? `<img loading="lazy" src="${escapeHtml(item.poster)}" alt="">` : `<div class="ph"></div>`}</td>
-    <td>${escapeHtml(item.name)}${item.new ? `<span class="badge new">new</span>` : ""}${kind === "series" && item.selected ? seasonsButton(item) : ""}</td>
+    <td>${escapeHtml(item.name)}${item.new ? `<span class="badge new">new</span>` : ""}${kind === "series" && item.selected && item.copies.length ? seasonsButton(item) : ""}</td>
     <td class="year muted">${item.year ?? ""}</td>
     <td class="copy">${item.copies.length > 1 ? `<select>${options}</select>` :
         `<span class="muted">${escapeHtml(item.copies[0] ? copyLabel(item.copies[0], item) : "no copies")}</span>`}
@@ -507,7 +507,8 @@ function renderRow(item, kind) {
     openSeasons.has(item.uuid) ? openSeasons.delete(item.uuid) : openSeasons.add(item.uuid);
     load();
   };
-  if (!(kind === "series" && item.selected && openSeasons.has(item.uuid))) return tr;
+  // No copies ('no_copy'): no season list to show until a copy returns.
+  if (!(kind === "series" && item.selected && item.copies.length && openSeasons.has(item.uuid))) return tr;
   const frag = document.createDocumentFragment();
   frag.append(tr, renderSeasons(item, currentCopy()));
   return frag;

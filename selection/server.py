@@ -591,6 +591,8 @@ def make_handler(service):
 
         def _body(self):
             length = int(self.headers.get("Content-Length") or 0)
+            if length < 0:  # read(-1) would wait for EOF and hold the thread
+                raise ValueError("invalid Content-Length")
             if length > MAX_BODY:
                 raise ValueError("request body too large")
             raw = self.rfile.read(length) if length else b""

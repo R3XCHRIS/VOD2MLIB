@@ -2533,6 +2533,12 @@ def _scheduled_run_settings(plugin, snapshot, logger):
     rescan. (None, None) when the live settings can't be read: the run is
     skipped rather than risk a classic rescan while selection mode is on."""
     settings, params = snapshot or {}, {}
+    if _selection_runtime is None and os.path.isdir(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "selection")):
+        # Installed but failed to import: selection mode may be on and the
+        # snapshot can't say, so the run is skipped rather than risk a rescan.
+        logger.error("Scheduled run skipped: the selection package is installed but failed to import.")
+        return None, None
     if _selection_runtime is not None:
         try:
             live = _selection_runtime.live_settings(plugin)

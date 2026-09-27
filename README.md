@@ -200,7 +200,7 @@ Changes you haven't applied are never touched by upkeep.
 
 ### Safety
 
-- The plugin only deletes files it recorded writing. Other files in your library folders, and `.nfo` files it didn't write, are never modified or deleted.
+- The plugin only deletes files it recorded writing. Other files in your library folders, and `.nfo` files it didn't write, are never modified or deleted. The one exception is a `.strm` that already links to the same title (e.g. left by classic mode without Scan library): Apply takes it over, as adoption would. Any other file in the way stops that title with an error.
 - Selection state lives in `/data/vod2mlib/selection.db` inside the container. Uninstalling the plugin wipes its settings but not this file.
 - Turning selection mode OFF leaves your files as they are and restores the classic buttons.
 

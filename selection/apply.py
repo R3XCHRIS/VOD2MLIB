@@ -40,6 +40,20 @@ def _remove_paths(store, paths, root):
     store.forget_paths(paths)
 
 
+def _check_strm_target(path, owned, url_kind, content_uuid):
+    """A .strm already at the path that Apply doesn't own is only taken over
+    when it links to this same content (a classic-mode file, as Scan library
+    would adopt it); anything else is left alone and the title fails."""
+    if path in owned or not os.path.exists(path):
+        return
+    from .adopt import _read, parse_strm  # adopt imports this module
+    parsed = parse_strm(_read(path))
+    if parsed and parsed[0] == url_kind and parsed[1] == str(content_uuid).lower():
+        return
+    raise FileExistsError(f"{os.path.basename(path)} already exists and isn't a Dispatcharr link to "
+                          "this title: move it, or use Scan library to adopt it")
+
+
 def _write_nfo(plugin, store, kind, content_uuid, path, owned, make_content, written):
     """Existing .nfo files may hold user edits: never overwrite one Apply
     didn't create (adopted ones included), and only claim (and later delete)
@@ -87,6 +101,7 @@ def _write_movie(plugin, store, settings, movie, relation, owned=frozenset()):
         bool(settings.get("omit_stream_id", False)),
     )
     store.check_free("movie", movie.uuid, strm_path)
+    _check_strm_target(strm_path, owned, "movie", movie.uuid)
     plugin._write_if_different_preserve_times(strm_path, url)
     store.record_file("movie", movie.uuid, strm_path)
     written.add(strm_path)
@@ -131,6 +146,7 @@ def _write_series(plugin, store, settings, series, relation, episodes, owned=fro
         strm_path = os.path.join(season_folder, filename + ".strm")
         url = plugin._build_proxy_url(dispatcharr_url, "episode", episode.uuid, stream_id, omit_stream_id)
         store.check_free("series", series.uuid, strm_path)
+        _check_strm_target(strm_path, owned, "episode", episode.uuid)
         plugin._write_if_different_preserve_times(strm_path, url)
         store.record_file("series", series.uuid, strm_path)
         written.add(strm_path)
