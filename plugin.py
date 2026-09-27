@@ -2524,6 +2524,16 @@ class Plugin:
         }
 
 
+def _saved_selection_mode(plugin):
+    """The saved Selection mode setting, read without the selection package
+    (same lookup as selection.runtime)."""
+    from apps.plugins.models import PluginConfig
+    key = os.path.basename(os.path.dirname(os.path.abspath(__file__))).lower().replace(" ", "_")
+    cfg = (PluginConfig.objects.filter(key=key).first()
+           or PluginConfig.objects.filter(name=plugin.name).first())
+    return bool(cfg and (cfg.settings or {}).get("selection_mode"))
+
+
 def _scheduled_run_settings(plugin, snapshot, logger):
     """(settings, params) for a scheduled run. Selection mode is read live,
     not from the snapshot taken at Apply Schedule: a snapshot from before it
@@ -2535,10 +2545,17 @@ def _scheduled_run_settings(plugin, snapshot, logger):
     settings, params = snapshot or {}, {}
     if _selection_runtime is None and os.path.isdir(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "selection")):
-        # Installed but failed to import: selection mode may be on and the
-        # snapshot can't say, so the run is skipped rather than risk a rescan.
-        logger.error("Scheduled run skipped: the selection package is installed but failed to import.")
-        return None, None
+        # Installed but failed to import: the snapshot can't say whether
+        # selection mode is on, so read the saved setting directly.
+        try:
+            on = _saved_selection_mode(plugin)
+        except Exception as e:
+            logger.error("Scheduled run skipped: could not read the plugin settings: %s", e)
+            return None, None
+        if on:
+            logger.error("Scheduled run skipped: selection mode is on but the selection package "
+                         "failed to import; reinstall the plugin.")
+            return None, None
     if _selection_runtime is not None:
         try:
             live = _selection_runtime.live_settings(plugin)

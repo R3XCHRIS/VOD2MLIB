@@ -314,17 +314,25 @@ class SelectionStore:
             raise FileExistsError(f"{os.path.basename(path)} already belongs to {owner[2] or owner[1]}")
 
     def record_file(self, kind, content_uuid, path):
-        self.check_free(kind, content_uuid, path)
+        """Claim a path for a title. Never takes one from another title
+        (and keeps an adopted mark)."""
         with self._conn() as c:
             c.execute(
                 "INSERT OR IGNORE INTO applied_file (path, kind, content_uuid) VALUES (?, ?, ?)",
                 (path, kind, str(content_uuid)),
             )
+            row = c.execute("SELECT kind, content_uuid FROM applied_file WHERE path = ?", (path,)).fetchone()
+        if (row["kind"], row["content_uuid"]) != (kind, str(content_uuid)):
+            self.check_free(kind, content_uuid, path)  # raises with the owner's title
 
-    def is_adopted(self, path):
+    def adopted_paths(self, kind, content_uuid):
+        """This title's files that adoption found on disk (see _migrate)."""
         with self._conn() as c:
-            row = c.execute("SELECT adopted FROM applied_file WHERE path = ?", (path,)).fetchone()
-        return bool(row and row["adopted"])
+            rows = c.execute(
+                "SELECT path FROM applied_file WHERE kind = ? AND content_uuid = ? AND adopted = 1",
+                (kind, str(content_uuid)),
+            ).fetchall()
+        return {r["path"] for r in rows}
 
     def files_for(self, kind, content_uuid):
         with self._conn() as c:

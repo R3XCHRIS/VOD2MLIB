@@ -515,7 +515,7 @@ class TestSeasonStore:
         assert store.excluded_seasons(row) == []
         assert store.pending() == []
         assert store.files_for("series", "u1") == ["/s/tvshow.nfo"]
-        assert not store.is_adopted("/s/tvshow.nfo")
+        assert store.adopted_paths("series", "u1") == set()
         from selection.store import SCHEMA_VERSION
         assert store.schema_version() == SCHEMA_VERSION
         SelectionStore(str(path))  # opening again is a no-op
@@ -861,8 +861,9 @@ class TestProbeTitle:
     def test_unknown_title_is_a_404(self, http):
         base, _ = http
         cookie = _login(base)
-        status, _, _ = _req(base, "POST", "/api/probe/movie/nope", cookie=cookie)
-        assert status == 404
+        unknown = "00000000-0000-4000-8000-00000000abcd"
+        assert _req(base, "POST", f"/api/probe/movie/{unknown}", cookie=cookie)[0] == 404
+        assert _req(base, "POST", "/api/probe/movie/nope", cookie=cookie)[0] == 400  # not a title id
 
 
 def _wait_probe_job(service, timeout=10):
@@ -2190,12 +2191,21 @@ def test_no_copy_titles_are_listed_and_not_counted_on_disk(http, env):
     assert data["items"] == []
 
 
-def test_scheduled_run_is_skipped_when_the_selection_package_fails_to_import(monkeypatch):
-    # The package is on disk but its import failed: selection mode may be on,
-    # and the snapshot can't tell, so don't risk a classic rescan.
+def test_scheduled_run_when_the_selection_package_fails_to_import(monkeypatch):
+    # The snapshot can't say whether selection mode is on, so the saved setting
+    # decides: off runs classic as before, on (or unreadable) skips the run.
     import plugin as plugin_mod
     monkeypatch.setattr(plugin_mod, "_selection_runtime", None)
-    assert plugin_mod._scheduled_run_settings(Plugin(), {"batch_size": "250"}, LOG) == (None, None)
+    snapshot = {"batch_size": "250"}
+    monkeypatch.setattr(plugin_mod, "_saved_selection_mode", lambda p: False)
+    assert plugin_mod._scheduled_run_settings(Plugin(), snapshot, LOG) == (snapshot, {})
+    monkeypatch.setattr(plugin_mod, "_saved_selection_mode", lambda p: True)
+    assert plugin_mod._scheduled_run_settings(Plugin(), snapshot, LOG) == (None, None)
+
+    def broken(p):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(plugin_mod, "_saved_selection_mode", broken)
+    assert plugin_mod._scheduled_run_settings(Plugin(), snapshot, LOG) == (None, None)
 
 
 def test_negative_content_length_is_rejected(http):
@@ -2230,3 +2240,35 @@ def test_classic_strm_for_the_same_title_is_taken_over(env):
     store.set_desired("movie", MATRIX, True, 1, 101, "The Matrix")
     assert _apply(env)["added"] == 1
     assert "stream_id=101" in strm.read_text() and str(strm) in store.files_for("movie", MATRIX)
+
+
+def test_a_stalled_connection_is_closed(env):
+    plugin, catalogue, store, settings, _ = env
+    service = SelectionService(plugin, catalogue, store, lambda: settings, LOG)
+    handler = make_handler(service)
+    handler.timeout = 0.5
+    server = _Server(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with socket.create_connection(server.server_address, timeout=5) as s:
+            s.sendall(b"GET / HTTP/1.1\r\n")  # headers never finished
+            assert s.recv(100) == b""  # the server gave up and closed it
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_parallel_wrong_passwords_are_answered_one_per_second(http):
+    import time as _t
+    base, _ = http
+    results = []
+
+    def guess():
+        results.append(_req(base, "POST", "/api/login", {"password": "wrong"})[0])
+    threads = [threading.Thread(target=guess) for _ in range(3)]
+    started = _t.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == [401, 401, 401] and _t.monotonic() - started >= 2.9

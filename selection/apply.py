@@ -40,6 +40,13 @@ def _remove_paths(store, paths, root):
     store.forget_paths(paths)
 
 
+def _check_target(store, kind, content_uuid, path, owned):
+    """Raise if another title owns the path. Paths this title already owns
+    need no lookup, which keeps upkeep to one query per file."""
+    if path not in owned:
+        store.check_free(kind, content_uuid, path)
+
+
 def _check_strm_target(path, owned, url_kind, content_uuid):
     """A .strm already at the path that Apply doesn't own is only taken over
     when it links to this same content (a classic-mode file, as Scan library
@@ -54,13 +61,13 @@ def _check_strm_target(path, owned, url_kind, content_uuid):
                           "this title: move it, or use Scan library to adopt it")
 
 
-def _write_nfo(plugin, store, kind, content_uuid, path, owned, make_content, written):
+def _write_nfo(plugin, store, kind, content_uuid, path, owned, adopted, make_content, written):
     """Existing .nfo files may hold user edits: never overwrite one Apply
     didn't create (adopted ones included), and only claim (and later delete)
     our own and adopted ones."""
-    store.check_free(kind, content_uuid, path)
+    _check_target(store, kind, content_uuid, path, owned)
     if path in owned:
-        if not store.is_adopted(path):
+        if path not in adopted:
             plugin._write_if_different_preserve_times(path, make_content())
     elif os.path.exists(path):
         return
@@ -100,7 +107,7 @@ def _write_movie(plugin, store, settings, movie, relation, owned=frozenset()):
         dispatcharr_url, "movie", movie.uuid, relation.stream_id,
         bool(settings.get("omit_stream_id", False)),
     )
-    store.check_free("movie", movie.uuid, strm_path)
+    _check_target(store, "movie", movie.uuid, strm_path, owned)
     _check_strm_target(strm_path, owned, "movie", movie.uuid)
     plugin._write_if_different_preserve_times(strm_path, url)
     store.record_file("movie", movie.uuid, strm_path)
@@ -109,7 +116,8 @@ def _write_movie(plugin, store, settings, movie, relation, owned=frozenset()):
     if settings.get("generate_nfo", True):
         nfo_path = strm_path[: -len(".strm")] + ".nfo"
         omit_title = bool(settings.get("nfo_omit_title", False))
-        _write_nfo(plugin, store, "movie", movie.uuid, nfo_path, owned,
+        adopted = store.adopted_paths("movie", movie.uuid) if owned else set()
+        _write_nfo(plugin, store, "movie", movie.uuid, nfo_path, owned, adopted,
                    lambda: plugin._generate_nfo(movie, cat_name, omit_title), written)
     return written
 
@@ -130,9 +138,10 @@ def _write_series(plugin, store, settings, series, relation, episodes, owned=fro
         (settings.get("tmdb_tag_format") or "plex").strip().lower(),
     )
     os.makedirs(folder, exist_ok=True)
+    adopted = store.adopted_paths("series", series.uuid) if owned and generate_nfo else set()
     if generate_nfo:
         omit_title = bool(settings.get("nfo_omit_title", False))
-        _write_nfo(plugin, store, "series", series.uuid, os.path.join(folder, "tvshow.nfo"), owned,
+        _write_nfo(plugin, store, "series", series.uuid, os.path.join(folder, "tvshow.nfo"), owned, adopted,
                    lambda: plugin._generate_tvshow_nfo(series, cat_name, omit_title), written)
     for episode, stream_id, title in episodes:
         if title and title != episode.name:
@@ -145,14 +154,14 @@ def _write_series(plugin, store, settings, series, relation, episodes, owned=fro
         os.makedirs(season_folder, exist_ok=True)
         strm_path = os.path.join(season_folder, filename + ".strm")
         url = plugin._build_proxy_url(dispatcharr_url, "episode", episode.uuid, stream_id, omit_stream_id)
-        store.check_free("series", series.uuid, strm_path)
+        _check_target(store, "series", series.uuid, strm_path, owned)
         _check_strm_target(strm_path, owned, "episode", episode.uuid)
         plugin._write_if_different_preserve_times(strm_path, url)
         store.record_file("series", series.uuid, strm_path)
         written.add(strm_path)
         if generate_nfo:
             _write_nfo(plugin, store, "series", series.uuid,
-                       os.path.join(season_folder, filename + ".nfo"), owned,
+                       os.path.join(season_folder, filename + ".nfo"), owned, adopted,
                        lambda episode=episode: plugin._generate_episode_nfo(episode), written)
     return written
 

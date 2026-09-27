@@ -16,6 +16,7 @@ import secrets
 import socket
 import threading
 import time
+import uuid as uuid_mod
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -33,6 +34,7 @@ SESSION_COOKIE = "vod2mlib_session"
 SESSION_TTL = 7 * 24 * 3600
 CSRF_HEADER = "X-VOD2MLIB"  # custom header: forces a CORS preflight cross-site
 MAX_BODY = 1 << 20
+REQUEST_TIMEOUT = 30  # seconds a connection may sit idle or half-sent
 PAGE_SIZE_MAX = 200
 PROBE_FRESH = 7 * 24 * 3600  # "probe all selected" skips copies probed this recently
 PROBE_BUSY_STOP = 3  # ...and stops after this many "no free connection" copies in a row
@@ -565,6 +567,7 @@ def _better_copy(item, row, prefs):
 def make_handler(service):
     class Handler(BaseHTTPRequestHandler):
         server_version = "VOD2MLIB-Selection"
+        timeout = REQUEST_TIMEOUT  # a stalled client can't hold a thread forever
 
         def log_message(self, fmt, *args):  # keep container logs quiet
             pass
@@ -623,9 +626,14 @@ def make_handler(service):
                 if method == "POST" and path == "/api/login":
                     if self.headers.get(CSRF_HEADER) != "1":
                         return self._send_json(403, {"error": "missing CSRF header"})
-                    token = service.login(self._body().get("password"))
+                    password = self._body().get("password")
+                    # One attempt at a time, and a failed one holds the lock for
+                    # a second: parallel guesses can't go faster than 1/s.
+                    with _login_lock:
+                        token = service.login(password)
+                        if not token:
+                            time.sleep(1)
                     if not token:
-                        time.sleep(1)  # blunt brute-force damping
                         return self._send_json(401, {"error": "wrong password"})
                     return self._send_json(200, {"ok": True},
                                            {"Set-Cookie": self._cookie(token, SESSION_TTL)})
@@ -648,7 +656,7 @@ def make_handler(service):
                         account=query.get("account"), category=query.get("category", ""),
                         year=query.get("year", "")))
                 if method == "GET" and path.startswith("/api/series/") and path.endswith("/seasons"):
-                    uuid = path[len("/api/series/"):-len("/seasons")]
+                    uuid = _title_uuid(path[len("/api/series/"):-len("/seasons")])
                     if "account_id" not in query or "stream_id" not in query:
                         raise ValueError("account_id and stream_id (the copy) are required")
                     return self._send_json(200, service.series_seasons(
@@ -669,7 +677,7 @@ def make_handler(service):
                     return self._send_json(200, service.mark_seen(path[len("/api/seen/"):]))
                 if method == "POST" and path.startswith("/api/clear-flag/"):
                     kind, _, uuid = path[len("/api/clear-flag/"):].partition("/")
-                    return self._send_json(200, service.clear_flag(kind, uuid))
+                    return self._send_json(200, service.clear_flag(kind, _title_uuid(uuid)))
                 if method == "GET" and path == "/api/prefs":
                     return self._send_json(200, service.get_prefs())
                 if method == "PUT" and path == "/api/prefs":
@@ -682,13 +690,13 @@ def make_handler(service):
                     return self._send_json(200, service.probe_job())
                 if method == "POST" and path.startswith("/api/probe/"):
                     kind, _, uuid = path[len("/api/probe/"):].partition("/")
-                    return self._send_json(200, service.start_probe_title(kind, uuid))
+                    return self._send_json(200, service.start_probe_title(kind, _title_uuid(uuid)))
                 if method == "PUT" and path.startswith("/api/override/"):
                     kind, _, uuid = path[len("/api/override/"):].partition("/")
-                    return self._send_json(200, service.set_override(kind, uuid, self._body()))
+                    return self._send_json(200, service.set_override(kind, _title_uuid(uuid), self._body()))
                 if method == "PUT" and path.startswith("/api/selection/"):
                     kind, _, uuid = path[len("/api/selection/"):].partition("/")
-                    return self._send_json(200, service.set_selection(kind, uuid, self._body()))
+                    return self._send_json(200, service.set_selection(kind, _title_uuid(uuid), self._body()))
                 if method == "GET" and path == "/api/pending":
                     return self._send_json(200, service.pending())
                 if method == "POST" and path == "/api/apply":
@@ -734,11 +742,21 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = os.name != "nt"
 
 
+
+def _title_uuid(value):
+    """A title uuid from the URL, canonical (lowercase), or ValueError (400)."""
+    try:
+        return str(uuid_mod.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(f"not a title id: {value!r}") from None
+
+
 # ---------- per-process lifecycle ----------
 
 _state = {"server": None, "thread": None, "port": None, "store": None, "watchdog": None,
           "watchdog_pid": None, "stop": None}
 _state_lock = threading.Lock()
+_login_lock = threading.Lock()
 
 
 def start_server(service, port, host="0.0.0.0"):
