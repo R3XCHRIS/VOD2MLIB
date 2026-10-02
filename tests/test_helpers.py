@@ -1302,24 +1302,6 @@ class TestLanguagePrefixFormats:
         assert p._clean_title("The Matrix") == "The Matrix"
 
 
-# ---------- _parse_category_filter (v1.16.0) ----------
-
-class TestParseCategoryFilter:
-    def test_empty_returns_empty_list(self, p):
-        assert p._parse_category_filter("") == []
-        assert p._parse_category_filter(None) == []
-        assert p._parse_category_filter("   ") == []
-
-    def test_single_prefix(self, p):
-        assert p._parse_category_filter("[EN]") == ["[EN]"]
-
-    def test_comma_separated_trimmed(self, p):
-        assert p._parse_category_filter("[EN], [FR] , [DE]") == ["[EN]", "[FR]", "[DE]"]
-
-    def test_drops_empty_segments(self, p):
-        assert p._parse_category_filter("[EN],,, [FR] ,") == ["[EN]", "[FR]"]
-
-
 # ---------- _write_if_different_preserve_times (v1.16.1, issue #11) ----------
 
 class TestWriteIfDifferentPreserveTimes:
@@ -1414,40 +1396,6 @@ class TestTmdbTagFormat:
             append_tmdb_id=True, tmdb_tag_format="jellyfin",
         )
         assert folder == "/VODS/Series/Breaking Bad (2008) [tmdbid-1396]"
-
-
-# ---------- category exclude + prefix matching (v1.17.0, issue #8) ----------
-
-class TestMatchesCategoryPrefixes:
-    def test_no_prefixes_never_matches(self, p):
-        assert p._matches_category_prefixes("Action", []) is False
-
-    def test_case_insensitive_startswith(self, p):
-        assert p._matches_category_prefixes("FOR ADULTS (movie)", ["for adults"]) is True
-        assert p._matches_category_prefixes("for adults", ["FOR ADULTS"]) is True
-
-    def test_only_matches_at_the_start(self, p):
-        # "EN" appears inside, but not as a prefix -> no match.
-        assert p._matches_category_prefixes("KIDS EN Cartoons", ["EN"]) is False
-
-    def test_any_of_several_prefixes(self, p):
-        assert p._matches_category_prefixes("[FR] Cinema", ["[EN]", "[FR]"]) is True
-
-    def test_missing_or_blank_category_never_matches(self, p):
-        # Mirrors the DB behaviour: NULL category can't satisfy istartswith.
-        assert p._matches_category_prefixes(None, ["EN"]) is False
-        assert p._matches_category_prefixes("", ["EN"]) is False
-        assert p._matches_category_prefixes("   ", ["EN"]) is False
-
-    def test_prefix_whitespace_is_tolerated(self, p):
-        assert p._matches_category_prefixes("Action", ["  action "]) is True
-
-    def test_logand99_scenario(self, p):
-        # Issue #8: the user filtered on "|EN|" (a TITLE prefix their provider
-        # uses) while the category was "FOR ADULTS (movie)" — so nothing
-        # matched. The exclude-list is the right tool for their goal.
-        assert p._matches_category_prefixes("FOR ADULTS (movie)", ["|EN|"]) is False
-        assert p._matches_category_prefixes("FOR ADULTS (movie)", ["FOR ADULTS"]) is True
 
 
 # ---------- NFO title cleanup + omission (v1.18.0, matrix26) ----------
