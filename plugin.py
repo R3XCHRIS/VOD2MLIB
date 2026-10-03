@@ -1,10 +1,7 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.18.0 — cleaner NFO titles (provider tags/quality tokens stripped)
-          plus an option to omit <title> entirely so Jellyfin uses TMDB;
-          collapse duplicate episode relations to one .strm; bigger
-          series batch sizes; warn when a TMDB ID is missing.
+v1.19.0-rc.13 — incremental generation and targeted M3U source verification.
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -13,10 +10,21 @@ Upstream:   https://github.com/shedunraid/VOD2MLIB
 This fork:  https://github.com/R3XCHRIS/VOD2MLIB
 """
 import os
+from pathlib import Path
 import re
 from enum import Enum
 from typing import Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+try:
+    from .inventory import action_lock, state_directory, file_hash, contained, BATCH_SIZE
+    from .reconciliation import Reconciliation
+    from . import action_runner
+    from .media_library import create_adapter
+except ImportError:
+    from inventory import action_lock, state_directory, file_hash, contained, BATCH_SIZE
+    from reconciliation import Reconciliation
+    import action_runner
+    from media_library import create_adapter
 
 
 class VODType(Enum):
@@ -26,9 +34,9 @@ class VODType(Enum):
 
 class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
-    
+
     name = "VOD to Media Library"
-    version = "1.18.0"
+    version = "1.19.0-rc.13"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -133,326 +141,519 @@ class Plugin:
         re.IGNORECASE,
     )
 
-    fields = [
-        {
-            "id": "_about",
-            "label": "About",
-            "type": "info",
-            "description": "Workflow:\n  1. Configure paths below.\n  2. Actions → Scan → see catalogue totals.\n  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n  4. (Optional) Turn ON Refresh Existing Series, set cron, click Apply Schedule for nightly auto-rescan.\n\nDocs: https://github.com/R3XCHRIS/VOD2MLIB",
-        },
-        {
-            "id": "_section_paths",
-            "label": "[PATHS & HOSTS]",
-            "type": "info",
-            "description": "Where to write .strm files and how media servers reach Dispatcharr.",
-        },
-        {
-            "id": "root_folder",
-            "label": "Root Folder for Movies",
-            "type": "string",
-            "default": "/VODS/Movies",
-            "help_text": "Path inside the Dispatcharr container where movie folders will be created."
-        },
-        {
-            "id": "series_root_folder",
-            "label": "Root Folder for Series",
-            "type": "string",
-            "default": "/VODS/Series",
-            "help_text": "Path inside the Dispatcharr container where series folders will be created."
-        },
-        {
-            "id": "dispatcharr_url",
-            "label": "Dispatcharr URL (REQUIRED)",
-            "type": "string",
-            "default": "",
-            "placeholder": "http://192.168.1.10:9191",
-            "help_text": "Required. The externally-reachable URL of your Dispatcharr instance — this gets baked into every .strm file, so it must resolve from wherever your media server runs. localhost works ONLY if the media server is on the same host with shared network namespace; otherwise use a routable LAN IP/hostname. Don't forget to click Save."
-        },
-        {
-            "id": "_section_movies",
-            "label": "[MOVIES]",
-            "type": "info",
-            "description": "Settings for the Generate Movies action.",
-        },
-        {
-            "id": "batch_size",
-            "label": "Batch Size (Movies)",
-            "type": "select",
-            "default": "250",
-            "options": [
-                {"value": "10", "label": "10 movies"},
-                {"value": "100", "label": "100 movies"},
-                {"value": "200", "label": "200 movies"},
-                {"value": "500", "label": "500 movies"},
-                {"value": "1000", "label": "1000 movies"},
-                {"value": "all", "label": "All movies"}
-            ],
-            "help_text": "Number of movies to process in this run"
-        },
-        {
-            "id": "generate_nfo",
-            "label": "Generate Movie NFO Files",
-            "type": "boolean",
-            "default": True,
-            "help_text": "Create .nfo metadata files for movies"
-        },
-        {
-            "id": "nfo_omit_title",
-            "label": "Omit <title> from NFO files",
-            "type": "boolean",
-            "default": False,
-            "help_text": "Leave the `<title>` element OUT of generated movie and tvshow NFO files. Jellyfin (and Emby) treat a `<title>` in the NFO as authoritative and will NOT override it from TMDB — so if your provider prefixes titles with tags like `4K-A+`, `EN-TOP` or `AMZ`, that junk becomes the displayed name. With this ON the plugin still writes the NFO (IDs, plot, genres, rating, poster) but omits the title, letting your media server take the clean title from TMDB via the `<tmdbid>` we already emit. OFF by default (unchanged behaviour). Note v1.18.0 also cleans provider junk out of the title, so try that first — this is the belt-and-braces option. Episode NFOs always keep their title (media servers match episodes by season/episode number)."
-        },
-        {
-            "id": "nest_movies_by_category",
-            "label": "Nest Movies by Category",
-            "type": "boolean",
-            "default": False,
-            "help_text": "Wrap each movie's folder inside a subfolder named by its M3U category. Useful when your provider organises movies by genre. Movies without a category go into a folder named 'Unassigned'. Same content with different categories (e.g. 4K vs HD) gets separate folders intentionally — turn ON Dedupe Movies Across Categories below to suppress this for genre-overlap cases."
-        },
-        {
-            "id": "dedupe_movies_across_categories",
-            "label": "Dedupe Movies Across Categories",
-            "type": "boolean",
-            "default": False,
-            "help_text": "When `Nest Movies by Category` is ON and a movie is tagged with multiple categories upstream (e.g. 'Action' AND 'Sci-Fi'), write the `.strm` under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Movies by Category` is OFF — in that case multi-category movies already resolve to the same folder. Use this when you want one folder per movie regardless of provider tagging; your media server's genre tags still reflect every category via the NFO. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — it just stops creating new ones. To clean up existing duplicates, run `[⚠ DANGER] Clean up Movies` once, then re-generate."
-        },
-        {
-            "id": "append_tmdb_id_to_folder",
-            "label": "Append TMDB ID to folder names",
-            "type": "boolean",
-            "default": False,
-            "help_text": "Append a TMDB id tag to every Movies and Series folder name when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Media servers honour this as a forced exact match, which is the safest defence against name collisions and bad metadata scrapes. Pick the convention your server expects with `TMDB Folder Tag Format` below. ⚠ MIGRATION: the plugin does NOT rename existing folders in place — turning this on (or off) for an already-generated library writes the new folder names ALONGSIDE the old ones, creating duplicates. To switch cleanly, run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate; or accept the duplicates until the old folders age out."
-        },
-        {
-            "id": "tmdb_tag_format",
-            "label": "TMDB Folder Tag Format",
-            "type": "select",
-            "default": "plex",
-            "options": [
-                {"value": "plex", "label": "Plex / ChannelsDVR — {tmdb-123}"},
-                {"value": "jellyfin", "label": "Jellyfin / Emby — [tmdbid-123]"}
-            ],
-            "help_text": "Which convention to use for the TMDB folder tag — media servers disagree, and each ignores the other's format. `Plex / ChannelsDVR` writes `Cool Hand Luke (1967) {tmdb-378}`; `Jellyfin / Emby` writes `Cool Hand Luke (1967) [tmdbid-378]`. Only has an effect when `Append TMDB ID to folder names` is ON. Defaults to Plex for backwards compatibility with libraries generated before v1.16.1 — if you use Jellyfin or Emby, switch this to `jellyfin` or the tag is silently ignored by your server. ⚠ MIGRATION: changing the format renames every folder, and the plugin does NOT rename in place — the new names are written ALONGSIDE the old ones. Run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate."
-        },
-        {
-            "id": "omit_stream_id",
-            "label": "Don't pin .strm files to a specific provider stream",
-            "type": "boolean",
-            "default": False,
-            "help_text": "When ON, .strm URLs omit ?stream_id=, so Dispatcharr's VOD proxy resolves and fails over across every account carrying the title instead of being locked to the one relation this plugin happened to pick. Requires a patched Dispatcharr with VOD failover support (PR #1398). When OFF (default), the .strm is pinned to this plugin's selected relation, matching original behavior."
-        },
-        {
-            "id": "_section_series",
-            "label": "[SERIES]",
-            "type": "info",
-            "description": "Settings for the Generate Series action.",
-        },
-        {
-            "id": "series_batch_size",
-            "label": "Batch Size (Series)",
-            "type": "select",
-            "default": "10",
-            "options": [
-                {"value": "1", "label": "1 series (testing)"},
-                {"value": "5", "label": "5 series"},
-                {"value": "10", "label": "10 series"},
-                {"value": "25", "label": "25 series"},
-                {"value": "50", "label": "50 series"},
-                {"value": "100", "label": "100 series"},
-                {"value": "250", "label": "250 series"},
-                {"value": "all", "label": "All series (may time out — use the schedule)"}
-            ],
-            "help_text": "Series to process per click (episodes are auto-fetched for each, so series are much slower than movies). ⚠ This button runs synchronously and your reverse proxy will usually cut it off after ~60s with a 504 — the run keeps going server-side, but you lose the result. For a big catalogue don't use 'All' here: set the cron to 'Full rescan' and click [SCHEDULE] Apply / Update. Scheduled runs execute on the Celery worker with no HTTP timeout."
-        },
-        {
-            "id": "generate_series_nfo",
-            "label": "Generate Series NFO Files",
-            "type": "boolean",
-            "default": True,
-            "help_text": "Create .nfo metadata files for series and episodes"
-        },
-        {
-            "id": "refresh_existing",
-            "label": "Refresh Existing Series (rescan-friendly)",
-            "type": "boolean",
-            "default": False,
-            "help_text": "Re-evaluate series that already have folders, picking up new episodes added upstream AND rewriting existing episode .strm files so they pick up the current Dispatcharr URL. .nfo files (including tvshow.nfo) are only written when missing, so your edits are preserved. Turn ON for cron rescans."
-        },
-        {
-            "id": "nest_series_by_category",
-            "label": "Nest Series by Category",
-            "type": "boolean",
-            "default": False,
-            "help_text": "Wrap each series' folder inside a subfolder named by its M3U category. Useful when your provider organises series by genre. Series without a category go into a folder named 'Unassigned'. Same content with different categories gets separate folders intentionally — turn ON Dedupe Series Across Categories below to suppress this for genre-overlap cases."
-        },
-        {
-            "id": "dedupe_series_across_categories",
-            "label": "Dedupe Series Across Categories",
-            "type": "boolean",
-            "default": False,
-            "help_text": "When `Nest Series by Category` is ON and a series is tagged with multiple categories upstream, write the series folder + episodes under the first category only (alphabetical by category name) instead of duplicating across all of them. No effect when `Nest Series by Category` is OFF. ⚠ MIGRATION: changing this on an already-generated library does NOT remove the old duplicate folders — run `[⚠ DANGER] Clean up Series` once, then re-generate, to clean them up."
-        },
-        {
-            "id": "_section_schedule",
-            "label": "[AUTO-RESCAN SCHEDULE]",
-            "type": "info",
-            "description": "Configure the cron job. Click Apply in the Actions tab to register or update.",
-        },
-        {
-            "id": "schedule_cron",
-            "label": "Auto-Rescan Schedule (cron)",
-            "type": "string",
-            "default": "0 3 * * *",
-            "help_text": "Standard 5-field cron: 'minute hour day-of-month month day-of-week'. Default '0 3 * * *' = every day at 03:00. Used by 'Apply Schedule'."
-        },
-        {
-            "id": "schedule_timezone",
-            "label": "Schedule Timezone",
-            "type": "string",
-            "default": "",
-            "placeholder": "Europe/London",
-            "help_text": "IANA timezone name the cron expression is interpreted in (e.g. 'Europe/London', 'America/New_York', 'Australia/Sydney'). Leave empty to use UTC. Affects when the cron fires — '0 3 * * *' in 'Europe/London' means 03:00 London time year-round (handling BST automatically), not 03:00 UTC."
-        },
-        {
-            "id": "schedule_target",
-            "label": "Scheduled Action",
-            "type": "select",
-            "default": "rescan_all",
-            "options": [
-                {"value": "scan_all_vods", "label": "Scan only (totals)"},
-                {"value": "generate_movies", "label": "Movies only"},
-                {"value": "generate_series", "label": "Series only"},
-                {"value": "rescan_all", "label": "Full rescan (movies + series)"}
-            ],
-            "help_text": "Which action the scheduler should run on each tick."
-        }
-    ]
+    fields = [{'id': '_about',
+      'label': 'About',
+      'type': 'info',
+      'description': 'Workflow:\n'
+                     '  1. Configure paths below.\n'
+                     '  2. Actions → Scan → see catalogue totals.\n'
+                     '  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n'
+                     '  4. (Optional) Turn ON Refresh Existing Series, set cron, click Apply Schedule for '
+                     'nightly auto-rescan.\n'
+                     '\n'
+                     'Docs: https://github.com/R3XCHRIS/VOD2MLIB'},
+     {'id': '_section_paths',
+      'label': '[PATHS & HOSTS]',
+      'type': 'info',
+      'description': 'Where to write .strm files and how media servers reach Dispatcharr.'},
+     {'id': 'root_folder',
+      'label': 'Root Folder for Movies',
+      'type': 'string',
+      'default': '/VODS/Movies',
+      'help_text': 'Path inside the Dispatcharr container where movie folders will be created. Map a host folder '
+                   'to /VODS in your container.'},
+     {'id': 'series_root_folder',
+      'label': 'Root Folder for Series',
+      'type': 'string',
+      'default': '/VODS/Series',
+      'help_text': 'Path inside the Dispatcharr container where series folders will be created.'},
+     {'id': 'dispatcharr_url',
+      'label': 'Dispatcharr URL (REQUIRED)',
+      'type': 'string',
+      'default': '',
+      'placeholder': 'http://192.168.1.10:9191',
+      'help_text': 'Required. The externally-reachable URL of your Dispatcharr instance — this gets baked into '
+                   'every .strm file, so it must resolve from wherever your media server runs. localhost works '
+                   'ONLY if the media server is on the same host with shared network namespace; otherwise use a '
+                   "routable LAN IP/hostname. Don't forget to click Save."},
+     {'id': '_section_movies',
+      'label': '[MOVIES]',
+      'type': 'info',
+      'description': 'Settings for the Generate Movies action.'},
+     {'id': 'batch_size',
+      'label': 'Batch Size (Movies)',
+      'type': 'select',
+      'default': '250',
+      'options': [{'value': '10', 'label': '10 movies'},
+                  {'value': '100', 'label': '100 movies'},
+                  {'value': '200', 'label': '200 movies'},
+                  {'value': '250', 'label': '250 movies'},
+                  {'value': '500', 'label': '500 movies'},
+                  {'value': '1000', 'label': '1000 movies'},
+                  {'value': 'all', 'label': 'All movies'}],
+      'help_text': 'Number of movies to process in this run. Start small (10) to verify, then scale up.'},
+     {'id': 'generate_nfo',
+      'label': 'Generate Movie NFO Files',
+      'type': 'boolean',
+      'default': True,
+      'help_text': 'Create .nfo metadata files alongside each movie .strm.'},
+     {'id': 'nfo_omit_title',
+      'label': 'Omit <title> from NFO files',
+      'type': 'boolean',
+      'default': False,
+      'help_text': 'Leave the `<title>` element OUT of generated movie and tvshow NFO files. Jellyfin (and Emby) '
+                   'treat a `<title>` in the NFO as authoritative and will NOT override it from TMDB — so if '
+                   'your provider prefixes titles with tags like `4K-A+`, `EN-TOP` or `AMZ`, that junk becomes '
+                   'the displayed name. With this ON the plugin still writes the NFO (IDs, plot, genres, rating, '
+                   'poster) but omits the title, letting your media server take the clean title from TMDB via '
+                   'the `<tmdbid>` we already emit. OFF by default (unchanged behaviour). Note v1.18.0 also '
+                   'cleans provider junk out of the title, so try that first — this is the belt-and-braces '
+                   'option. Episode NFOs always keep their title (media servers match episodes by season/episode '
+                   'number).'},
+     {'id': 'nest_movies_by_category',
+      'label': 'Nest Movies by Category',
+      'type': 'boolean',
+      'default': False,
+      'help_text': "Wrap each movie's folder inside a subfolder named by its M3U category. Useful when your "
+                   'provider organises movies by genre. Movies without a category go into a folder named '
+                   "'Unassigned'. Same content with different categories (e.g. 4K vs HD) gets separate folders "
+                   'intentionally — turn ON Dedupe Movies Across Categories below to suppress this for '
+                   'genre-overlap cases.'},
+     {'id': 'dedupe_movies_across_categories',
+      'label': 'Dedupe Movies Across Categories',
+      'type': 'boolean',
+      'default': False,
+      'help_text': 'When `Nest Movies by Category` is ON and a movie is tagged with multiple categories upstream '
+                   "(e.g. 'Action' AND 'Sci-Fi'), write the `.strm` under the first category only (alphabetical "
+                   'by category name) instead of duplicating across all of them. No effect when `Nest Movies by '
+                   'Category` is OFF — multi-category movies already resolve to the same folder in that case. '
+                   'Use this when you want one folder per movie regardless of provider tagging. ⚠ MIGRATION: '
+                   'changing this on an already-generated library does NOT remove the old duplicate folders — it '
+                   'just stops creating new ones. To clean up existing duplicates, run `[⚠ DANGER] Clean up '
+                   'Movies` once, then re-generate.'},
+     {'id': 'append_tmdb_id_to_folder',
+      'label': 'Append TMDB ID to folder names',
+      'type': 'boolean',
+      'default': False,
+      'help_text': 'Append a TMDB id tag to every Movies and Series folder name when a TMDB ID is known — e.g. '
+                   '`Cool Hand Luke (1967) {tmdb-378}/`. Media servers honour this as a forced exact match, '
+                   'which is the safest defence against name collisions and bad metadata scrapes. Pick the '
+                   'convention your server expects with `TMDB Folder Tag Format` below. ⚠ MIGRATION: the plugin '
+                   'does NOT rename existing folders in place — turning this on (or off) for an '
+                   'already-generated library writes the new folder names ALONGSIDE the old ones, creating '
+                   'duplicates. To switch cleanly, run `[⚠ DANGER] Clean up Movies` / `Series` first, then '
+                   're-generate; or accept the duplicates until the old folders age out.'},
+     {'id': 'tmdb_tag_format',
+      'label': 'TMDB Folder Tag Format',
+      'type': 'select',
+      'default': 'plex',
+      'options': [{'value': 'plex', 'label': 'Plex / ChannelsDVR — {tmdb-123}'},
+                  {'value': 'jellyfin', 'label': 'Jellyfin / Emby — [tmdbid-123]'}],
+      'help_text': 'Which convention to use for the TMDB folder tag — media servers disagree, and each ignores '
+                   "the other's format. `Plex / ChannelsDVR` writes `Cool Hand Luke (1967) {tmdb-378}`; "
+                   '`Jellyfin / Emby` writes `Cool Hand Luke (1967) [tmdbid-378]`. Only has an effect when '
+                   '`Append TMDB ID to folder names` is ON. Defaults to Plex for backwards compatibility with '
+                   'libraries generated before v1.16.1 — if you use Jellyfin or Emby, switch this to `jellyfin` '
+                   'or the tag is silently ignored by your server. ⚠ MIGRATION: changing the format renames '
+                   'every folder, and the plugin does NOT rename in place — the new names are written ALONGSIDE '
+                   'the old ones. Run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate.'},
+     {'id': 'omit_stream_id',
+      'label': "Don't pin .strm files to a specific provider stream",
+      'type': 'boolean',
+      'default': False,
+      'help_text': "When ON, .strm URLs omit ?stream_id=, so Dispatcharr's VOD proxy resolves and fails over "
+                   'across every account carrying the title instead of being locked to the one relation this '
+                   'plugin happened to pick. Requires a patched Dispatcharr with VOD failover support (PR '
+                   "#1398). When OFF (default), the .strm is pinned to this plugin's selected relation, matching "
+                   'original behavior.'},
+     {'id': '_section_series',
+      'label': '[SERIES]',
+      'type': 'info',
+      'description': 'Settings for the Generate Series action.'},
+     {'id': 'series_batch_size',
+      'label': 'Batch Size (Series)',
+      'type': 'select',
+      'default': '10',
+      'options': [{'value': '1', 'label': '1 series (testing)'},
+                  {'value': '5', 'label': '5 series'},
+                  {'value': '10', 'label': '10 series'},
+                  {'value': '25', 'label': '25 series'},
+                  {'value': '50', 'label': '50 series'},
+                  {'value': '100', 'label': '100 series'},
+                  {'value': '250', 'label': '250 series'},
+                  {'value': 'all', 'label': 'All series (may time out — use the schedule)'}],
+      'help_text': 'Number of series to process per click (episodes are auto-fetched for each, so series are '
+                   'much slower than movies). ⚠ This button runs synchronously and your reverse proxy will '
+                   'usually cut it off after ~60s with a 504 — the run keeps going server-side, but you lose the '
+                   "result. For a big catalogue don't use 'All' here: set the cron to 'Full rescan' and click "
+                   '[SCHEDULE] Apply / Update. Scheduled runs execute on the Celery worker with no HTTP '
+                   'timeout.'},
+     {'id': 'generate_series_nfo',
+      'label': 'Generate Series NFO Files',
+      'type': 'boolean',
+      'default': True,
+      'help_text': 'Create tvshow.nfo and per-episode .nfo metadata files.'},
+     {'id': 'refresh_existing',
+      'label': 'Refresh Existing Series (rescan-friendly)',
+      'type': 'boolean',
+      'default': False,
+      'help_text': 'Re-evaluate series that already have folders, picking up new episodes added upstream AND '
+                   'rewriting existing episode .strm files so they pick up the current Dispatcharr URL. .nfo '
+                   'files (including tvshow.nfo) are only written when missing, so your edits are preserved. Off '
+                   '= fast manual iteration (skip done series); On = scan everything for new content and refresh '
+                   'existing URLs. Turn ON before clicking Apply Schedule for cron rescans of target '
+                   "'generate_series'. Note: 'rescan_all' forces this ON regardless."},
+     {'id': 'nest_series_by_category',
+      'label': 'Nest Series by Category',
+      'type': 'boolean',
+      'default': False,
+      'help_text': "Wrap each series' folder inside a subfolder named by its M3U category. Useful when your "
+                   'provider organises series by genre. Series without a category go into a folder named '
+                   "'Unassigned'. Same content with different categories gets separate folders intentionally — "
+                   'turn ON Dedupe Series Across Categories below to suppress this for genre-overlap cases.'},
+     {'id': 'dedupe_series_across_categories',
+      'label': 'Dedupe Series Across Categories',
+      'type': 'boolean',
+      'default': False,
+      'help_text': 'When `Nest Series by Category` is ON and a series is tagged with multiple categories '
+                   'upstream, write the series folder + episodes under the first category only (alphabetical by '
+                   'category name) instead of duplicating across all of them. No effect when `Nest Series by '
+                   'Category` is OFF. ⚠ MIGRATION: changing this on an already-generated library does NOT remove '
+                   'the old duplicate folders — run `[⚠ DANGER] Clean up Series` once, then re-generate, to '
+                   'clean them up.'},
+     {'id': '_section_schedule',
+      'label': '[AUTO-RESCAN SCHEDULE]',
+      'type': 'info',
+      'description': 'Configure the cron job. Click Apply in the Actions tab to register or update.'},
+     {'id': 'schedule_cron',
+      'label': 'Auto-Rescan Schedule (cron)',
+      'type': 'string',
+      'default': '0 3 * * *',
+      'help_text': "Standard 5-field cron: 'minute hour day-of-month month day-of-week'. Default '0 3 * * *' = "
+                   'every day at 03:00. Used by Apply Schedule.'},
+     {'id': 'schedule_timezone',
+      'label': 'Schedule Timezone',
+      'type': 'string',
+      'default': '',
+      'placeholder': 'Europe/London',
+      'help_text': "IANA timezone name the cron expression is interpreted in (e.g. 'Europe/London', "
+                   "'America/New_York', 'Australia/Sydney'). Leave empty to use UTC. Affects when the cron fires "
+                   "— '0 3 * * *' in 'Europe/London' means 03:00 London time year-round (handling BST "
+                   'automatically), not 03:00 UTC.'},
+     {'id': 'schedule_target',
+      'label': 'Scheduled Action',
+      'type': 'select',
+      'default': 'rescan_all',
+      'options': [{'value': 'scan_all_vods', 'label': 'Scan only (totals)'},
+                  {'value': 'generate_movies', 'label': 'Movies only'},
+                  {'value': 'generate_series', 'label': 'Series only'},
+                  {'value': 'rescan_all', 'label': 'Full rescan (movies + series)'}],
+      'help_text': "Which action the scheduler should run on each tick. 'Full rescan' is recommended."},
+     {'id': '_section_media_library',
+      'label': '[MEDIA LIBRARY & CLEANUP]',
+      'type': 'info',
+      'description': 'Skip content already available as real media and optionally remove generated files for '
+                     'duplicates or M3U removals.'},
+     {'id': 'media_library_enabled',
+      'label': 'Enable media-library integration',
+      'type': 'boolean',
+      'default': False,
+      'help_text': 'Check the configured media server before generation to skip content already available as '
+                   'real media. Disabled by default.'},
+     {'id': 'media_server',
+      'label': 'Media server',
+      'type': 'select',
+      'default': 'emby',
+      'options': [{'value': 'emby', 'label': 'Emby'}],
+      'help_text': 'Choose the media server to check for existing real media. This release supports one Emby '
+                   'server.'},
+     {'id': 'media_server_url',
+      'label': 'Emby server URL',
+      'type': 'string',
+      'default': '',
+      'help_text': 'URL of your Emby server as reachable from the Dispatcharr container, for example '
+                   'http://emby:8096. Include any configured base path.'},
+     {'id': 'media_server_token',
+      'label': 'Emby API key/token',
+      'type': 'string',
+      'default': '',
+      'help_text': 'Emby API key used to read libraries and media metadata. Create one in the Emby dashboard '
+                   'under API Keys.'},
+     {'id': 'media_library_ids',
+      'label': 'Library names or IDs',
+      'type': 'string',
+      'default': '',
+      'help_text': 'Required comma-separated library names or IDs, for example Movies, TV Shows. Names are '
+                   'resolved on every run, so recreated libraries keep working under the same name. Run List '
+                   'media libraries to discover names/IDs; omit generated VOD/STRM libraries. Empty, missing '
+                   'or ambiguous selections stop actions; use IDs for duplicate names.'},
+     {'id': 'media_tv_mode',
+      'label': 'TV handling',
+      'type': 'select',
+      'default': 'show',
+      'options': [{'value': 'show', 'label': 'Skip entire owned show'},
+                  {'value': 'episodes', 'label': 'Fill missing episodes'}],
+      'help_text': 'Skip entire owned show excludes all episodes when Emby has any real episode of that show. '
+                   'Fill missing episodes excludes only season/episode positions Emby owns and revisits existing '
+                   'series folders to generate missing episodes. STRM-only episodes do not count.'},
+     {'id': 'media_server_failure',
+      'label': 'Server-check failure',
+      'type': 'select',
+      'default': 'continue',
+      'options': [{'value': 'continue', 'label': 'Continue with warning'},
+                  {'value': 'stop', 'label': 'Stop before file changes'}],
+      'help_text': 'Continue with warning generates without media-server exclusions or duplicate cleanup if the '
+                   'server check fails; enabled M3U cleanup can still run. Stop before file changes aborts the '
+                   'action before changing output files.'},
+     {'id': 'media_duplicate_cleanup',
+      'label': 'Existing duplicate cleanup',
+      'type': 'select',
+      'default': 'every',
+      'options': [{'value': 'every', 'label': 'Every generation'},
+                  {'value': 'rescan', 'label': 'Full rescans only'},
+                  {'value': 'disabled', 'label': 'Disabled'}],
+      'help_text': 'Choose when generation removes verified STRMs that duplicate real media on the server. '
+                   'Cleanup checks all tracked output, regardless of batch size. Disabled stops automatic '
+                   'deletion but still skips owned content during generation. Run selective cleanup checks '
+                   'immediately.'},
+     {'id': 'm3u_cleanup_enabled',
+      'label': 'Clean up M3U removals',
+      'type': 'boolean',
+      'default': False,
+      'help_text': 'Remove verified generated STRMs when their account/provider source is confirmed missing from '
+                   'the complete Dispatcharr catalogue, with no grace period. This ignores generation batches '
+                   'and category selections. Failed queries or episode refreshes do not establish removal. '
+                   'Disabled by default.'},
+     {'id': 'm3u_cleanup_timing',
+      'label': 'M3U cleanup timing',
+      'type': 'select',
+      'default': 'rescan',
+      'options': [{'value': 'rescan', 'label': 'Full rescans'},
+                  {'value': 'manual', 'label': 'Manual action only'}],
+      'help_text': 'When M3U cleanup is enabled, Full rescans checks removals during each Full rescan, including '
+                   'scheduled rescans. Manual action only waits for Run selective cleanup. Preview selective '
+                   'cleanup shows candidates without deleting output files.'},
+     {'id': 'deletion_scope',
+      'label': 'Deletion scope',
+      'type': 'select',
+      'default': 'strm',
+      'options': [{'value': 'strm', 'label': 'STRMs only'},
+                  {'value': 'strm_nfo', 'label': 'STRMs and unedited generated NFOs'}],
+      'help_text': 'STRMs only preserves all NFO metadata. STRMs and unedited generated NFOs also removes NFOs '
+                   'whose recorded generated hashes still match. Edited or unverified files, artwork and '
+                   'subtitles are preserved. Applies to automatic, selective and Movies/Series cleanup actions.'}]
 
-    actions = [
-        {
-            "id": "scan_all_vods",
-            "label": "[LIBRARY] Catalogue snapshot",
-            "description": "Count unique Movies and Series in the Dispatcharr database. Read-only.",
-            "button_label": "Scan",
-            "button_variant": "outline",
-            "button_color": "blue",
-        },
-        {
-            "id": "generate_movies",
-            "label": "[GENERATE] Movies",
-            "description": "Process movies per Batch Size. Existing .strm files are skipped.",
-            "button_label": "Generate",
-            "button_variant": "filled",
-            "button_color": "green",
-        },
-        {
-            "id": "generate_series",
-            "label": "[GENERATE] Series",
-            "description": "Create episode .strm files. See 'Refresh Existing Series' setting.",
-            "button_label": "Generate",
-            "button_variant": "filled",
-            "button_color": "green",
-        },
-        {
-            "id": "rescan_all",
-            "label": "[GENERATE] Full rescan",
-            "description": "Rescan then force regenerate Movies + Series.",
-            "button_label": "Rescan all",
-            "button_variant": "filled",
-            "button_color": "teal",
-            "confirm": {
-                "required": True,
-                "title": "Run full rescan now?",
-                "message": "Full rescan walks every Movie and every Series, re-fetching episode lists from the M3U source and writing any missing files. On large catalogues this can take many minutes. The cron schedule already runs this action nightly — only click here for an immediate refresh.",
-            },
-        },
-        {
-            "id": "schedule_status",
-            "label": "[SCHEDULE] Show status",
-            "description": "Show registered cron, last run, and total runs.",
-            "button_label": "Status",
-            "button_variant": "outline",
-            "button_color": "blue",
-        },
-        {
-            "id": "schedule_test_fire",
-            "label": "[SCHEDULE] Test fire now",
-            "description": "Fire the scheduled task immediately. Verifies the cron pipeline.",
-            "button_label": "Test fire",
-            "button_variant": "outline",
-            "button_color": "blue",
-            "confirm": {
-                "required": True,
-                "title": "Fire scheduled task now?",
-                "message": "Runs the same action the cron will fire (with the snapshotted settings) right now. Useful to verify the pipeline works. May take many minutes depending on the action.",
-            },
-        },
-        {
-            "id": "apply_schedule",
-            "label": "[SCHEDULE] Apply / Update",
-            "description": "Register or update the cron task. Re-click after changing any setting.",
-            "button_label": "Apply",
-            "button_variant": "outline",
-            "button_color": "blue",
-        },
-        {
-            "id": "remove_schedule",
-            "label": "[SCHEDULE] Unschedule",
-            "description": "Remove the periodic auto-rescan task.",
-            "button_label": "Remove",
-            "button_variant": "outline",
-            "button_color": "orange",
-            "confirm": {
-                "required": True,
-                "title": "Remove auto-rescan schedule?",
-                "message": "This unregisters the periodic task. You can re-create it any time with Apply.",
-            },
-        },
-        {
-            "id": "cleanup_movies",
-            "label": "[⚠ DANGER] Clean up Movies",
-            "description": "Delete plugin .strm/.nfo from Movies root. User files preserved.",
-            "button_label": "Clean up",
-            "button_variant": "filled",
-            "button_color": "red",
-            "confirm": {
-                "required": True,
-                "title": "Delete generated movie files?",
-                "message": "This deletes every .strm and .nfo file this plugin created under your Movies root. User-added files (subtitles, posters, custom .nfo) in those folders are preserved. Continue?",
-            },
-        },
-        {
-            "id": "cleanup_series",
-            "label": "[⚠ DANGER] Clean up Series",
-            "description": "Delete plugin .strm/.nfo from Series root. User files preserved.",
-            "button_label": "Clean up",
-            "button_variant": "filled",
-            "button_color": "red",
-            "confirm": {
-                "required": True,
-                "title": "Delete generated series files?",
-                "message": "This deletes every .strm and .nfo file this plugin created under your Series root. User-added files in those folders are preserved. Continue?",
-            },
-        },
-    ]
-    
+    fields.append({'id': 'action_timeout_minutes', 'label': 'Maximum action runtime (minutes)',
+                   'type': 'select', 'default': '30',
+                   'options': [{'value': str(n), 'label': str(n)} for n in (5, 15, 30, 60, 120)],
+                   'help_text': 'Stops a generation, library check or cleanup and all its workers after this deadline. Background actions continue after the browser closes. Use Action status for results or Stop running action to cancel sooner. Completed file changes remain; retry resumes normal processing.'})
+
+    actions = [{'id': 'rebuild_inventory',
+      'label': '[LIBRARY] Rebuild / discover inventory',
+      'description': 'Reconcile external filesystem changes and discover recognizable generated STRMs. Resets generation decisions so the next generation rechecks all eligible output, including missing files. Preserves ownership and NFO hashes; deletes no output files. Unverified files are preserved and reported.'},
+     {'id': 'list_media_libraries',
+      'label': 'List media libraries',
+      'description': 'List Emby library names and IDs.'},
+     {'id': 'preview_cleanup',
+      'label': 'Preview selective cleanup',
+      'description': 'Check complete catalogues and log verified cleanup candidates without deleting output '
+                     'files.'},
+     {'id': 'selective_cleanup',
+      'label': 'Run selective cleanup',
+      'description': 'Delete verified duplicates and confirmed M3U removals according to configured settings.'},
+     {'id': 'scan_all_vods',
+      'label': '[LIBRARY] Catalogue snapshot',
+      'description': 'Count unique Movies and Series in the Dispatcharr database. Read-only.',
+      'button_label': 'Scan',
+      'button_variant': 'outline',
+      'button_color': 'blue'},
+     {'id': 'generate_movies',
+      'label': '[GENERATE] Movies',
+      'description': 'Process movies per Batch Size. Existing .strm files are skipped.',
+      'button_label': 'Generate',
+      'button_variant': 'filled',
+      'button_color': 'green'},
+     {'id': 'generate_series',
+      'label': '[GENERATE] Series',
+      'description': "Create episode .strm files. See 'Refresh Existing Series' setting.",
+      'button_label': 'Generate',
+      'button_variant': 'filled',
+      'button_color': 'green'},
+     {'id': 'rescan_all',
+      'label': '[GENERATE] Full rescan',
+      'description': 'Rescan then force regenerate Movies + Series.',
+      'button_label': 'Rescan all',
+      'button_variant': 'filled',
+      'button_color': 'teal',
+      'confirm': {'required': True,
+                  'title': 'Run full rescan now?',
+                  'message': 'Full rescan walks every Movie and every Series, re-fetching episode lists from the '
+                             'M3U source and writing any missing files. On large catalogues this can take many '
+                             'minutes. The cron schedule already runs this action nightly — only click here for '
+                             'an immediate refresh.'}},
+     {'id': 'schedule_status',
+      'label': '[SCHEDULE] Show status',
+      'description': 'Show registered cron, last run, and total runs.',
+      'button_label': 'Status',
+      'button_variant': 'outline',
+      'button_color': 'blue'},
+     {'id': 'schedule_test_fire',
+      'label': '[SCHEDULE] Test fire now',
+      'description': 'Fire the scheduled task immediately. Verifies the cron pipeline.',
+      'button_label': 'Test fire',
+      'button_variant': 'outline',
+      'button_color': 'blue',
+      'confirm': {'required': True,
+                  'title': 'Fire scheduled task now?',
+                  'message': 'Runs the same action the cron will fire (with the snapshotted settings) right now. '
+                             'Useful to verify the pipeline works. May take many minutes depending on the '
+                             'action.'}},
+     {'id': 'apply_schedule',
+      'label': '[SCHEDULE] Apply / Update',
+      'description': 'Register or update the cron task. Re-click after changing any setting.',
+      'button_label': 'Apply',
+      'button_variant': 'outline',
+      'button_color': 'blue'},
+     {'id': 'remove_schedule',
+      'label': '[SCHEDULE] Unschedule',
+      'description': 'Remove the periodic auto-rescan task.',
+      'button_label': 'Remove',
+      'button_variant': 'outline',
+      'button_color': 'orange',
+      'confirm': {'required': True,
+                  'title': 'Remove auto-rescan schedule?',
+                  'message': 'This unregisters the periodic task. You can re-create it any time with Apply.'}},
+     {'id': 'cleanup_movies',
+      'label': '[⚠ DANGER] Clean up Movies',
+      'description': 'Delete verified generated STRMs inside this root; NFO deletion follows Deletion scope. '
+                     'Unverified and edited files are preserved.',
+      'button_label': 'Clean up',
+      'button_variant': 'filled',
+      'button_color': 'red',
+      'confirm': {'required': True,
+                  'title': 'Delete generated movie files?',
+                  'message': 'Delete verified generated STRMs in this root? NFOs are deleted only if Deletion '
+                             'scope includes NFOs and their generated hashes match. Unverified and edited files '
+                             'are preserved.'}},
+     {'id': 'cleanup_series',
+      'label': '[⚠ DANGER] Clean up Series',
+      'description': 'Delete verified generated STRMs inside this root; NFO deletion follows Deletion scope. '
+                     'Unverified and edited files are preserved.',
+      'button_label': 'Clean up',
+      'button_variant': 'filled',
+      'button_color': 'red',
+      'confirm': {'required': True,
+                  'title': 'Delete generated series files?',
+                  'message': 'Delete verified generated STRMs in this root? NFOs are deleted only if Deletion '
+                             'scope includes NFOs and their generated hashes match. Unverified and edited files '
+                             'are preserved.'}}]
+
+    actions.extend([{'id': 'action_status', 'label': '[ACTION] Status',
+                     'description': 'Show the running background action or its final result.'},
+                    {'id': 'stop_action', 'label': '[ACTION] Stop running action',
+                     'description': 'Stop this plugin action and its workers; completed file changes remain.'}])
+
     def run(self, action: str, params: dict, context: dict):
+        settings = context.get("settings", {})
+        if action == "action_status":
+            return action_runner.status()
+        if action == "stop_action":
+            return action_runner.stop()
+        if action in {"generate_movies", "generate_series", "rescan_all", "cleanup_movies", "cleanup_series", "preview_cleanup", "selective_cleanup", "list_media_libraries", "rebuild_inventory"}:
+            return action_runner.start(action, params, settings)
+        return self._run_action(action, params, context)
+
+    def _run_locked_action(self, action: str, params: dict, context: dict):
+        logger, settings = context.get("logger"), context.get("settings", {})
+        if action == "list_media_libraries":
+            try:
+                libraries = create_adapter(settings).list_libraries()
+                return {"status": "ok", "message": "; ".join(f"{x['Name']}: {x['Id']}" for x in libraries), "libraries": libraries}
+            except Exception as error:
+                return {"status": "error", "message": str(error)}
+        mutating = {"generate_movies", "generate_series", "rescan_all", "cleanup_movies", "cleanup_series", "preview_cleanup", "selective_cleanup", "rebuild_inventory"}
+        if action not in mutating:
+            return self._run_action(action, params, context)
+        reconciliation = None
+        try:
+            with action_lock(state_directory()):
+                reconciliation = Reconciliation(self, settings, logger, state_directory())
+                self._reconciliation = reconciliation
+                try:
+                    reconciliation.prepare(action)
+                    if action == "rebuild_inventory":
+                        result = {"status": "ok", "message": f"Inventory discovery complete; adopted {reconciliation.report['adopted']}, preserved {reconciliation.report['preserved']} unverified files"}
+                    elif action in ("preview_cleanup", "selective_cleanup"):
+                        result = {"status": "ok", "message": "Cleanup preview complete" if action == "preview_cleanup" else "Selective cleanup complete"}
+                    else:
+                        with reconciliation.measure("action_processing"):
+                            result = self._run_action(action, params, context)
+                    with reconciliation.measure("inventory_drain"):
+                        reconciliation.drain()
+                    result['reconciliation'] = reconciliation.report
+                    result['message'] += f"; excluded {reconciliation.report['excluded']}, deleted {reconciliation.report['deleted']}, cleanup errors {reconciliation.report['errors']}"
+                    if reconciliation.report['warnings']:
+                        result['message'] += "; WARNING: " + "; ".join(reconciliation.report['warnings'])
+                    return result
+                finally:
+                    try:
+                        reconciliation.drain()
+                    finally:
+                        reconciliation.store.close()
+                        reconciliation.finish()
+                        self._reconciliation = None
+        except Exception as error:
+            logger.error("Action failed: %s", error)
+            result = {"status": "error", "message": str(error)}
+            if reconciliation:
+                result['reconciliation'] = reconciliation.report
+            return result
+
+    def _owned(self, obj, kind, position=None):
+        rec = getattr(self, '_reconciliation', None)
+        return bool(rec and rec.owns(obj, kind, position))
+
+    def _writable_strm(self, path, uuid, kind):
+        rec = getattr(self, '_reconciliation', None)
+        return not rec or rec.writable(path, uuid, kind)
+
+    def _track(self, path, obj, kind, rel, position=None, nfos=None):
+        rec = getattr(self, '_reconciliation', None)
+        if rec: rec.record(path, obj, kind, rel, position, nfos)
+
+    def _drain_inventory(self):
+        rec = getattr(self, '_reconciliation', None)
+        if rec and (rec.queue.qsize() >= BATCH_SIZE or rec.cache_queue.qsize() >= BATCH_SIZE): rec.drain()
+
+    def _movie_complete(self, relation, path):
+        rec = getattr(self, '_reconciliation', None)
+        decision = getattr(relation, '_generation_signature', None)
+        if rec and decision:
+            rec.cache_complete('movie', *decision, path)
+
+    def _timed_operation(self, name, function, *args, **kwargs):
+        rec = getattr(self, "_reconciliation", None)
+        if rec is None:
+            return function(*args, **kwargs)
+        with rec.measure(name):
+            return function(*args, **kwargs)
+
+    def _run_action(self, action: str, params: dict, context: dict):
         """Execute plugin action."""
         logger = context.get("logger")
         settings = context.get("settings", {})
-        
+
         logger.info("=" * 60)
         logger.info("VOD .strm Generator v%s", self.version)
         logger.info("Action: %s", action)
         logger.info("=" * 60)
-        
+
         if action == "scan_all_vods":
             return self._scan_all_vods(settings, logger)
         elif action == "generate_movies":
-            return self._generate_movies(settings, logger)
+            return self._timed_operation("generate_movies", self._generate_movies, settings, logger)
         elif action == "generate_series":
-            return self._generate_series(settings, logger)
+            return self._timed_operation("generate_series", self._generate_series, settings, logger)
         elif action == "cleanup_movies":
             return self._cleanup_movies(settings, logger)
         elif action == "cleanup_series":
@@ -469,7 +670,7 @@ class Plugin:
             return self._schedule_test_fire(settings, logger)
 
         return {"status": "error", "message": f"Unknown action: {action}"}
-    
+
     def _eligible_vod_relations(self, query, vod_type: VODType):
         """Require an active account and its enabled category for this VOD type.
 
@@ -491,7 +692,7 @@ class Plugin:
         """Scan and show total movies and series available."""
         logger.info("Scanning VODs in Dispatcharr...")
         logger.info("")
-        
+
         try:
             from apps.vod.models import Movie, Series, M3UMovieRelation, M3USeriesRelation
             from django.db.models import Count
@@ -564,7 +765,7 @@ class Plugin:
         except Exception as e:
             logger.error("Scan failed: %s", e)
             return {"status": "error", "message": f"Scan error: {e}"}
-    
+
     def _category_subfolder(self, category_name: str, nest: bool) -> str:
         """Return the category subfolder segment to insert into a path.
 
@@ -778,9 +979,13 @@ class Plugin:
         logger.info("Processing movies:")
         logger.info("-" * 60)
 
-        for relation in query.iterator():
+        rec = getattr(self, '_reconciliation', None)
+        relations = rec.movies(query) if rec else query.iterator()
+        for relation in relations:
             scanned += 1
             movie = relation.movie
+            if self._owned(movie, "movie"):
+                continue
             if seen_movie_uuids is not None:
                 if movie.uuid in seen_movie_uuids:
                     # Same movie already written under an earlier-alphabetical
@@ -798,8 +1003,14 @@ class Plugin:
             )
             strm_path = os.path.join(movie_folder, strm_filename)
             is_existing = os.path.exists(strm_path)
-
-            if is_existing and not refresh_existing:
+            if is_existing and not refresh_existing and not getattr(relation, '_generation_signature', None):
+                # Existing output was adopted before generation; no new write or
+                # inventory update is needed for a skipped file.
+                skipped += 1
+                self._movie_complete(relation, strm_path)
+                continue
+            if not self._writable_strm(strm_path, movie.uuid, "movie"):
+                logger.warning("Preserving unverified or edited STRM: %s", strm_path)
                 skipped += 1
                 continue
 
@@ -824,16 +1035,21 @@ class Plugin:
                     created_strm += 1
 
                 wrote_nfo = False
+                generated_nfos = {}
                 if generate_nfo:
                     nfo_filename = strm_filename.replace('.strm', '.nfo')
                     nfo_path = os.path.join(movie_folder, nfo_filename)
-                    if not os.path.exists(nfo_path):
+                    if not os.path.lexists(nfo_path):
                         category_name = relation.category.name if relation.category else ""
                         with open(nfo_path, 'w', encoding='utf-8') as f:
                             f.write(self._generate_nfo(movie, category_name, nfo_omit_title))
                         created_nfo += 1
                         wrote_nfo = True
+                        generated_nfos[nfo_path] = file_hash(nfo_path)
 
+                self._track(strm_path, movie, "movie", relation, nfos=generated_nfos)
+                self._movie_complete(relation, strm_path)
+                self._drain_inventory()
                 if log_this:
                     if changed:
                         logger.info("  ✓ wrote .strm%s", " + .nfo" if wrote_nfo else "")
@@ -860,6 +1076,8 @@ class Plugin:
                         logger.info("Batch complete: %d new .strm written (scanned %d, %d already done).", created_strm, scanned, skipped)
                     break
 
+        if rec:
+            deduped += rec.report['generation_deduped']
         logger.info("")
         logger.info("=" * 60)
         logger.info("SUMMARY:")
@@ -884,6 +1102,8 @@ class Plugin:
         logger.info("=" * 60)
 
         summary_msg = f"Wrote {created_strm} new .strm files"
+        if rec and rec.report['generation_unchanged']:
+            summary_msg += f", skipped {rec.report['generation_unchanged']} unchanged catalogue entries"
         if refresh_existing and refreshed_strm:
             summary_msg += f", refreshed {refreshed_strm}"
         if refresh_existing and unchanged_strm:
@@ -901,6 +1121,8 @@ class Plugin:
             "total_in_db": total_count,
             "scanned": scanned,
             "created_strm": created_strm,
+            "incremental": rec is not None,
+            "unchanged_candidates": rec.report['generation_unchanged'] if rec else 0,
             "refreshed_strm": refreshed_strm,
             "unchanged_strm": unchanged_strm,
             "missing_tmdb_id": missing_tmdb_id,
@@ -909,7 +1131,7 @@ class Plugin:
             "deduped": deduped,
             "errors": errors,
         }
-    
+
     def _series_target_folder(self, series, series_root: str, category_name: str = "", nest: bool = False, append_tmdb_id: bool = False, tmdb_tag_format: str = "plex"):
         """Compute the target folder for a series. Returns (folder_path, clean_name, year).
 
@@ -951,7 +1173,7 @@ class Plugin:
         dispatcharr_url = (settings.get("dispatcharr_url") or "").rstrip("/")
         batch_size = settings.get("series_batch_size") or "10"
         generate_nfo = settings.get("generate_series_nfo", True)
-        refresh_existing = bool(settings.get("refresh_existing", False))
+        refresh_existing = bool(settings.get("refresh_existing", False)) or (settings.get("media_library_enabled", False) and settings.get("media_tv_mode", "show") == "episodes")
         nest_by_cat = bool(settings.get("nest_series_by_category", False))
         dedupe_across_cats = bool(settings.get("dedupe_series_across_categories", False))
         append_tmdb_id = bool(settings.get("append_tmdb_id_to_folder", False))
@@ -1017,50 +1239,27 @@ class Plugin:
             logger.info("Refresh-existing mode: scanning all series for new episodes...")
         else:
             logger.info("Filtering already-processed series...")
-        to_process = []
-        scanned = 0
         deduped = 0
-        seen_series_uuids = set() if dedupe_across_cats else None
-        for series_rel in query.iterator():
-            scanned += 1
-            if seen_series_uuids is not None:
-                if series_rel.series.uuid in seen_series_uuids:
-                    # Same series tagged under multiple categories — already
-                    # going to be processed under the alphabetically-first one.
-                    deduped += 1
+        def candidates():
+            nonlocal deduped
+            submitted = 0
+            seen = set() if dedupe_across_cats else None
+            for rel in query.iterator(chunk_size=BATCH_SIZE):
+                if self._owned(rel.series, "series"):
                     continue
-                seen_series_uuids.add(series_rel.series.uuid)
-            if not refresh_existing:
-                cat_name = series_rel.category.name if series_rel.category else ""
-                folder, _, _ = self._series_target_folder(
-                    series_rel.series, series_root, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
-                )
-                if self._series_already_processed(folder):
-                    continue
-            to_process.append(series_rel)
-            if batch_size != "all" and len(to_process) >= target_batch:
-                break
-
-        skipped_pre = scanned - len(to_process) - deduped
-        if refresh_existing:
-            logger.info("Scanned %d series; %d to evaluate this run", scanned, len(to_process))
-        else:
-            logger.info("Scanned %d series; %d already processed (skipped); %d to process this run", scanned, skipped_pre, len(to_process))
-        if dedupe_across_cats and deduped:
-            logger.info("Deduped %d multi-category series (only the first-encountered category survives).", deduped)
-        logger.info("")
-
-        if not to_process:
-            logger.info("Nothing to process.")
-            return {
-                "status": "ok",
-                "message": f"Nothing to process; {skipped_pre} series already done.",
-                "series_processed": 0,
-                "episodes_created": 0,
-                "nfo_created": 0,
-                "deduped": deduped,
-                "errors": 0,
-            }
+                if seen is not None:
+                    if rel.series.uuid in seen:
+                        deduped += 1
+                        continue
+                    seen.add(rel.series.uuid)
+                if not refresh_existing:
+                    cat_name = rel.category.name if rel.category else ""
+                    folder, _, _ = self._series_target_folder(rel.series, series_root, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format)
+                    if self._series_already_processed(folder): continue
+                yield rel
+                submitted += 1
+                if batch_size != "all" and submitted >= target_batch: break
+        to_process = candidates()
 
         created_strm = 0
         refreshed_strm = 0
@@ -1070,51 +1269,48 @@ class Plugin:
         series_uptodate = 0
         failures = []
 
-        logger.info("Processing %d series with %d parallel workers:", len(to_process), self.MAX_WORKERS)
-        logger.info("-" * 60)
-
+        logger.info("Processing series with %d parallel workers", self.MAX_WORKERS)
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(
-                    self._process_single_series,
-                    series_rel,
-                    dispatcharr_url,
-                    generate_nfo,
-                    series_root,
-                    logger,
-                    refresh_existing,
-                    nest_by_cat,
-                    append_tmdb_id,
-                    omit_stream_id,
-                    tmdb_tag_format,
-                    nfo_omit_title,
-                ): series_rel
-                for series_rel in to_process
-            }
-
-            for idx, future in enumerate(as_completed(futures), 1):
-                series_rel = futures[future]
-                try:
-                    result = future.result()
-                except Exception as e:
-                    name = getattr(getattr(series_rel, "series", None), "name", "?")
-                    logger.error("[%d/%d] Worker raised for '%s': %s", idx, len(futures), name, e)
-                    errors += 1
-                    failures.append(f"{name}: {e}")
-                    continue
-
-                if result.get("uptodate"):
-                    series_uptodate += 1
-                elif result.get("created"):
-                    series_created += 1
-                    created_strm += result["episodes"]
-                    refreshed_strm += result.get("refreshed", 0)
-                    created_nfo += result["nfo_files"]
-                if "error" in result:
-                    errors += 1
-                    failures.append(f"{result.get('series_name', '?')}: {result['error']}")
-                logger.info("[%d/%d] %s", idx, len(futures), result["message"])
-        
+            try:
+                futures = {}
+                exhausted = False
+                idx = 0
+                while futures or not exhausted:
+                    while not exhausted and len(futures) < self.MAX_WORKERS:
+                        try: rel = next(to_process)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        futures[executor.submit(self._process_single_series, rel, dispatcharr_url, generate_nfo,
+                            series_root, logger, refresh_existing, nest_by_cat, append_tmdb_id,
+                            omit_stream_id, tmdb_tag_format, nfo_omit_title)] = rel
+                    if not futures: break
+                    completed, _ = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
+                    self._drain_inventory()
+                    for future in completed:
+                        rel = futures.pop(future)
+                        idx += 1
+                        self._drain_inventory()
+                        try:
+                            result = future.result()
+                        except Exception as error:
+                            errors += 1
+                            failures.append(str(error))
+                            continue
+                        if result.get("uptodate"): series_uptodate += 1
+                        elif result.get("created"):
+                            series_created += 1
+                            created_strm += result["episodes"]
+                            refreshed_strm += result.get("refreshed", 0)
+                        created_nfo += result.get("nfo_files", 0)
+                        if "error" in result:
+                            errors += 1
+                            failures.append(f"{result.get('series_name', '?')}: {result['error']}")
+                        logger.info("[%d] %s", idx, result["message"])
+            except BaseException:
+                rec = getattr(self, '_reconciliation', None)
+                if rec: rec.cancelled.set()
+                raise
         logger.info("")
         logger.info("=" * 60)
         logger.info("SUMMARY:")
@@ -1175,6 +1371,8 @@ class Plugin:
         from apps.vod.tasks import refresh_series_episodes
 
         series = series_rel.series
+        if self._owned(series, "series"):
+            return {"created": False, "episodes": 0, "nfo_files": 0, "message": "Excluded owned series"}
         cat_name = series_rel.category.name if series_rel.category else ""
         series_folder, series_name, _year = self._series_target_folder(
             series, series_root, cat_name, nest_by_cat, append_tmdb_id, tmdb_tag_format,
@@ -1228,7 +1426,10 @@ class Plugin:
                     series_name, duplicate_rels,
                 )
             episode_count = len(episodes)
-            
+            rec = getattr(self, '_reconciliation', None)
+            episode_cache_kind = f'episode:{series_rel.m3u_account_id}:{series.uuid}'
+            episode_cache = rec.episode_cache(episode_cache_kind) if rec else {}
+
             if episode_count == 0:
                 return {
                     "created": False,
@@ -1239,6 +1440,8 @@ class Plugin:
                     "message": f"{series_name} - No episodes found",
                 }
 
+            if not contained(series_folder, [series_root]):
+                raise ValueError("Series folder resolves outside configured root")
             os.makedirs(series_folder, exist_ok=True)
 
             new_episodes = 0
@@ -1246,19 +1449,28 @@ class Plugin:
             unchanged_episodes = 0
             new_nfo = 0
 
+            shared_nfos = {}
             if generate_nfo:
                 tvshow_nfo_path = os.path.join(series_folder, "tvshow.nfo")
-                if not os.path.isfile(tvshow_nfo_path):
+                if not os.path.lexists(tvshow_nfo_path):
                     category_name = series_rel.category.name if series_rel.category else ""
                     tvshow_content = self._generate_tvshow_nfo(series, category_name, nfo_omit_title)
                     with open(tvshow_nfo_path, 'w', encoding='utf-8') as f:
                         f.write(tvshow_content)
                     new_nfo += 1
+                try:
+                    if Path(tvshow_nfo_path).read_text(encoding="utf-8") == self._generate_tvshow_nfo(series, cat_name, nfo_omit_title):
+                        shared_nfos[tvshow_nfo_path] = file_hash(tvshow_nfo_path)
+                except (OSError, UnicodeError):
+                    pass  # Unreadable or custom metadata is preserved.
 
             for episode_rel in episodes:
                 episode = episode_rel.episode
                 season_num = episode.season_number or 0
                 episode_num = episode.episode_number or 0
+                if self._owned(series, "series", (season_num, episode_num)):
+                    continue
+                generated_nfos = dict(shared_nfos)
 
                 season_folder_name = f"Season {season_num:02d}"
                 season_folder = os.path.join(series_folder, season_folder_name)
@@ -1272,8 +1484,17 @@ class Plugin:
                 filename = self._sanitize_filename(filename)
 
                 strm_path = os.path.join(season_folder, f"{filename}.strm")
+                decision = rec.episode_decision(episode_rel, strm_path) if rec else None
+                if decision and episode_cache.get(decision[0]) == decision[1]:
+                    unchanged_episodes += 1
+                    with rec.counter_lock:
+                        rec.report['generation_unchanged'] += 1
+                    continue
                 is_existing = os.path.isfile(strm_path)
                 if is_existing and not refresh_existing:
+                    continue
+                if not self._writable_strm(strm_path, episode.uuid, "episode"):
+                    logger.warning("Preserving unverified or edited STRM: %s", strm_path)
                     continue
 
                 os.makedirs(season_folder, exist_ok=True)
@@ -1292,10 +1513,14 @@ class Plugin:
 
                 if generate_nfo:
                     nfo_path = os.path.join(season_folder, f"{filename}.nfo")
-                    if not os.path.isfile(nfo_path):
+                    if not os.path.lexists(nfo_path):
                         with open(nfo_path, 'w', encoding='utf-8') as f:
                             f.write(self._generate_episode_nfo(episode))
                         new_nfo += 1
+                        generated_nfos[nfo_path] = file_hash(nfo_path)
+                self._track(strm_path, series, "series", episode_rel, (season_num, episode_num), generated_nfos)
+                if decision:
+                    rec.cache_complete(episode_cache_kind, *decision, strm_path)
 
             if new_episodes == 0 and refreshed_episodes == 0:
                 return {
@@ -1337,32 +1562,6 @@ class Plugin:
                 "error": str(e),
                 "message": f"{series_name} - ✗ Error: {e}",
             }
-    
-    def _delete_plugin_files_in_dir(self, dir_path: str, logger):
-        """Delete only .strm and .nfo files in dir_path. Returns (strm_deleted, nfo_deleted, errors)."""
-        strm = nfo = errors = 0
-        try:
-            entries = os.listdir(dir_path)
-        except OSError as e:
-            logger.error("Cannot list %s: %s", dir_path, e)
-            return 0, 0, 1
-
-        for name in entries:
-            if not name.endswith(self._PLUGIN_FILE_SUFFIXES):
-                continue
-            path = os.path.join(dir_path, name)
-            if not os.path.isfile(path):
-                continue
-            try:
-                os.remove(path)
-                if name.endswith('.strm'):
-                    strm += 1
-                else:
-                    nfo += 1
-            except OSError as e:
-                logger.error("Failed to delete %s: %s", path, e)
-                errors += 1
-        return strm, nfo, errors
 
     def _try_rmdir(self, path: str) -> bool:
         """Remove path if it's an empty directory. Returns True if removed."""
@@ -1373,51 +1572,19 @@ class Plugin:
             return False
 
     def _walk_and_cleanup_plugin_files(self, root: str, logger):
-        """Recursively delete .strm/.nfo files under root, then bottom-up
-        remove any directory that ends up empty (preserves root and any
-        directory that still contains user-added files).
-
-        Works for both flat (Movies/X/...) and nested (Movies/Cat/X/...)
-        layouts because we walk the whole tree.
-        """
-        result = {
-            "deleted_strm": 0,
-            "deleted_nfo": 0,
-            "removed_dirs": 0,
-            "preserved_dirs": 0,
-            "errors": 0,
-            "scanned_dirs": 0,
-        }
-        if not os.path.isdir(root):
+        result = {"deleted_strm": 0, "deleted_nfo": 0, "removed_dirs": 0, "preserved_dirs": 0, "errors": 0, "scanned_dirs": 0}
+        rec = getattr(self, '_reconciliation', None)
+        if not rec:
+            # Direct helper calls have no verified ownership inventory.
             return result
-
-        # Pass 1: top-down — remove plugin files
-        for dirpath, _, filenames in os.walk(root):
-            result["scanned_dirs"] += 1
-            for name in filenames:
-                if not name.endswith(self._PLUGIN_FILE_SUFFIXES):
-                    continue
-                path = os.path.join(dirpath, name)
-                try:
-                    os.remove(path)
-                    if name.endswith('.strm'):
-                        result["deleted_strm"] += 1
-                    else:
-                        result["deleted_nfo"] += 1
-                except OSError as e:
-                    logger.error("Failed to delete %s: %s", path, e)
-                    result["errors"] += 1
-
-        # Pass 2: bottom-up — rmdir any directory that is now empty.
-        # We never remove the root itself.
-        root_real = os.path.realpath(root)
-        for dirpath, _, _ in os.walk(root, topdown=False):
-            if os.path.realpath(dirpath) == root_real:
-                continue
-            if self._try_rmdir(dirpath):
-                result["removed_dirs"] += 1
-            else:
-                result["preserved_dirs"] += 1
+        for row in rec.store.rows():
+            try:
+                outcome = rec.store.delete(row, [root], rec.settings.get('deletion_scope', 'strm') == 'strm_nfo', stats=result)
+                if outcome == 'deleted': result['deleted_strm'] += 1
+                elif outcome == 'preserved': result['preserved_dirs'] += 1
+            except OSError as error:
+                result['errors'] += 1
+                logger.error("Cleanup failed: %s", error)
         return result
 
     def _log_config(self, logger, items: Dict[str, Any]) -> None:
@@ -1548,7 +1715,7 @@ class Plugin:
         if r["preserved_dirs"]:
             msg += f", preserved {r['preserved_dirs']} (user files)"
         return {"status": "ok", "message": msg, **r}
-    
+
     def _clean_title(self, title: str) -> str:
         """Remove language prefixes like 'EN - ', 'FR - ' from titles.
 
@@ -1610,7 +1777,7 @@ class Plugin:
         # Trim trailing punctuation left behind by token removal (e.g. "Title -").
         title = title.rstrip(' -_.,;:').strip()
         return title, year
-    
+
     def _extract_genres(self, category_name: str) -> list:
         """Extract genre names from category name."""
         if not category_name:
@@ -1622,10 +1789,10 @@ class Plugin:
 
         # Remove (movie) or (series) suffix
         genre_text = re.sub(r'\s*\((movie|series)\)\s*$', '', genre_text, flags=re.IGNORECASE)
-        
+
         # Split on common separators
         genres = re.split(r'[/&,]', genre_text)
-        
+
         # Clean up each genre
         cleaned_genres = []
         for genre in genres:
@@ -1634,7 +1801,7 @@ class Plugin:
             genre = ' '.join(word.capitalize() for word in genre.split())
             if genre:
                 cleaned_genres.append(genre)
-        
+
         return cleaned_genres or ["Unknown"]
 
     def _split_genres_clean(self, s: str) -> list:
@@ -1772,7 +1939,7 @@ class Plugin:
         xml_lines.append('</tvshow>')
 
         return '\n'.join(xml_lines)
-    
+
     def _generate_episode_nfo(self, episode) -> str:
         """Generate episode.nfo XML content for an episode."""
         raw_title = episode.name or ""
@@ -1817,7 +1984,7 @@ class Plugin:
         xml_lines.append('</episodedetails>')
 
         return '\n'.join(xml_lines)
-    
+
     def _generate_nfo(self, movie, category_name: str, omit_title: bool = False) -> str:
         """Generate NFO XML content for a movie."""
         raw_title = movie.name or "Unknown"
@@ -1830,22 +1997,22 @@ class Plugin:
         imdb_id = (movie.imdb_id or "").strip()
 
         genres = self._resolve_genres(getattr(movie, "genre", ""), category_name)
-        
+
         # Build XML
         xml_lines = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
         xml_lines.append('<movie>')
         if not omit_title:
             xml_lines.append(f'    <title>{self._xml_escape(title)}</title>')
-        
+
         if year:
             xml_lines.append(f'    <year>{year}</year>')
-        
+
         for genre in genres:
             xml_lines.append(f'    <genre>{self._xml_escape(genre)}</genre>')
-        
+
         if plot:
             xml_lines.append(f'    <plot>{self._xml_escape(plot)}</plot>')
-        
+
         if rating:
             xml_lines.append(f'    <rating>{self._xml_escape(rating)}</rating>')
 
@@ -1898,21 +2065,21 @@ class Plugin:
         text = text.replace('"', '&quot;')
         text = text.replace("'", '&apos;')
         return text
-    
+
     def _sanitize_filename(self, name: str) -> str:
         """Sanitize filename by removing invalid characters."""
         if not name:
             return "Unknown"
-        
+
         # Remove invalid characters for Windows/Linux filesystems
         name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
-        
+
         # Replace multiple spaces with single space
         name = re.sub(r'\s+', ' ', name)
-        
+
         # Trim and limit length
         name = name.strip()[:self.MAX_FILENAME_LEN]
-        
+
         # Remove trailing dots/spaces (Windows issue)
         name = name.rstrip('. ')
 
@@ -1982,7 +2149,7 @@ class Plugin:
         logger.info("Combined rescan: scan + movies + series (refresh URLs forced ON)")
         logger.info("")
 
-        scan = self._scan_all_vods(settings, logger)
+        scan = self._timed_operation("scan_catalogue", self._scan_all_vods, settings, logger)
         if scan.get("status") != "ok":
             return scan
 
@@ -1990,14 +2157,14 @@ class Plugin:
         logger.info("=" * 60)
         logger.info("Rescan: movies  (refresh_urls=True)")
         logger.info("=" * 60)
-        movies = self._generate_movies(settings, logger, refresh_urls=True)
+        movies = self._timed_operation("generate_movies", self._generate_movies, settings, logger, refresh_urls=True)
 
         logger.info("")
         logger.info("=" * 60)
         logger.info("Rescan: series  (refresh_existing=True)")
         logger.info("=" * 60)
         series_settings = {**settings, "refresh_existing": True}
-        series = self._generate_series(series_settings, logger)
+        series = self._timed_operation("generate_series", self._generate_series, series_settings, logger)
 
         m = movies if isinstance(movies, dict) else {}
         s = series if isinstance(series, dict) else {}
@@ -2330,7 +2497,7 @@ try:
         """
         import logging
         logger = logging.getLogger("vod2mlib.schedule")
-        result = Plugin().run(action, {}, {"logger": logger, "settings": settings or {}})
+        result = action_runner.run_and_wait(action, {}, settings or {})
         try:
             from django.utils import timezone
             from django_celery_beat.models import PeriodicTask
