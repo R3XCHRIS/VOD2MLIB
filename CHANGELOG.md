@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.20.1 ? one saved configuration and Save-driven scheduling
+
+- Manual and scheduled actions use current saved settings and the same defaults at run start.
+- Enable Auto-Rescan controls scheduling; Save validates and updates cron/timezone or disables the trigger. Apply and Unschedule actions are removed.
+- Existing schedules retain their enabled state; new installations default off. Legacy payload snapshots are cleared and disabled queued ticks are skipped.
+- Plugin-owned Django signals implement Save behavior without changing Dispatcharr source.
+- README reviewed against the fork's category, reconciliation, filtering, performance, and scheduling commits; installation links, architecture, tests, and cleanup behavior corrected.
+
+## v1.20.0 ? database-only filters and managed-output cleanup
+
+- Independent movie/series score, year, unknown-data, and title regex rules; series genre names remain comma-delimited text.
+- Generation applies current filters to existing managed output before creation batching, with edited/unverified/shared-file protections.
+- Dispatcharr models are the only VOD metadata/episode source; provider fetches and native importer/freshness writes are removed.
+- Finer timing telemetry, configurable series concurrency, incremental signatures, bounded parallel STRM removal, and serialized durable inventory finalization.
+- Stable mwongj fork identity and documentation links.
+
+## v1.19.0 ? Emby reconciliation, inventory, and background actions
+
+- Optional Emby ownership checks with explicit libraries, conservative identity matching, whole-show or missing-episode handling, and configured failure policy.
+- Ownership/source-removal preview and cleanup; verified STRM/NFO protection and persistent SQLite inventory.
+- Isolated actions with deadlines, cancellation, progress and local telemetry; persistent discovery and incremental generation decisions.
+
+## v1.18.1 ? native category eligibility
+
+- Generation and Catalogue Snapshot use active accounts and per-account/type enabled Dispatcharr categories.
+- Remove legacy plugin Category Filter/Exclude fields; disabling categories alone does not remove output.
+
+
 ## v1.18.0 — NFO titles your media server can actually match
 
 Everything here came out of the Dispatcharr Discord thread. No breaking changes, and no folder names change.
