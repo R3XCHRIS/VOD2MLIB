@@ -1161,13 +1161,15 @@ def test_unknown_schema_is_rejected(tmp_path):
         InventoryStore(tmp_path)
 
 
-def test_generated_nfo_is_preserved_by_default(library):
+def test_generated_nfo_is_preserved_in_archive_by_default(library):
     obj = media(1)
     library.rows["movies"].append(relation(obj))
     library.run()
+    before = next(Path(library.settings['root_folder']).rglob('*.nfo')).read_bytes()
     library.state["snapshot"] = Snapshot([owned(obj)])
     library.run(media_library_enabled=True)
-    assert list(Path(library.settings["root_folder"]).rglob("*.nfo"))
+    assert not list(Path(library.settings['root_folder']).rglob('*.nfo'))
+    assert next((library.tmp / 'state' / 'filtered-nfo').rglob('*.nfo')).read_bytes() == before
 
 
 def test_edited_generated_nfo_shared_show_cleanup(library):

@@ -20,6 +20,7 @@ try:
     from .inventory import BATCH_SIZE, LOOKUP_BATCH_SIZE, InventoryStore, contained, strm_contents
     from .generation_cache import movie_candidates, signature
     from .filter_cleanup import cleanup as cleanup_filters, applies as filters_apply, FilterCleanupError
+    from .orphan_nfo import plan as nfo_plan, archive as archive_nfos
     from .media_library import (
         Identity,
         LibrarySelectionError,
@@ -30,6 +31,7 @@ except ImportError:
     from inventory import BATCH_SIZE, LOOKUP_BATCH_SIZE, InventoryStore, contained, strm_contents
     from generation_cache import movie_candidates, signature
     from filter_cleanup import cleanup as cleanup_filters, applies as filters_apply, FilterCleanupError
+    from orphan_nfo import plan as nfo_plan, archive as archive_nfos
     from media_library import (
         Identity,
         LibrarySelectionError,
@@ -114,6 +116,20 @@ class Reconciliation:
             "filter_errors": 0,
             "filter_movie_deleted": 0,
             "filter_series_deleted": 0,
+            "filter_nfo_folders_checked": 0,
+            "filter_nfo_folders_candidates": 0,
+            "filter_nfo_folders_archived": 0,
+            "filter_nfo_folders_preserved": 0,
+            "filter_nfo_candidates": 0,
+            "filter_nfo_archived": 0,
+            "filter_nfo_errors": 0,
+            "ownership_nfo_folders_checked": 0,
+            "ownership_nfo_folders_candidates": 0,
+            "ownership_nfo_folders_archived": 0,
+            "ownership_nfo_folders_preserved": 0,
+            "ownership_nfo_candidates": 0,
+            "ownership_nfo_archived": 0,
+            "ownership_nfo_errors": 0,
             "episodes_evaluated": 0,
             "source_presence_requested": 0,
             "source_presence_found": 0,
@@ -320,8 +336,21 @@ class Reconciliation:
             or action in ("generate_movies", "generate_series", "rescan_all")
             and (timing == "every" or timing == "rescan" and action == "rescan_all")
         )
+        owned_orphans = []
+        if server:
+            try:
+                # Mirror ownership cleanup's scope/timing, including both roots.
+                # Plan before removals: failed native reads cannot imply ownership.
+                owned_orphans = nfo_plan(self, ('movie', 'series'))
+            except Exception as error:
+                if self.settings.get('media_server_failure', 'continue') == 'stop':
+                    raise
+                server = False
+                self.warning(f'Ownership metadata lookup failed; server cleanup disabled ({type(error).__name__})')
         with self.measure("cleanup"):
             self.cleanup(server, self.m3u_complete, action == "preview_cleanup")
+        if server:
+            archive_nfos(self, owned_orphans, action == 'preview_cleanup', prefix='ownership')
 
     def census(self, metadata=True):
         self.report["catalogue_modes"].append("metadata" if metadata else "sources")
@@ -704,6 +733,7 @@ class Reconciliation:
             self.store.mark_discovered(root_key, context)
 
     def cleanup(self, server, m3u, dry_run=False):
+        self.cleanup_preview_removals = {}
         self.progress(
             "Previewing cleanup" if dry_run else "Reconciling generated files"
         )
@@ -734,6 +764,10 @@ class Reconciliation:
                             dry_run,
                             stats=self.report,
                         )
+                        if dry_run and outcome in ('candidate', 'missing'):
+                            self.cleanup_preview_removals[row['path']] = (
+                                json.loads(row['nfos']) if self.settings.get('deletion_scope', 'strm') == 'strm_nfo'
+                                else {})
                         self.report[outcome] += 1
                         self.logger.info(
                             "%s: %s (%s)",

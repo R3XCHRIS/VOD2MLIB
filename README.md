@@ -131,6 +131,12 @@ Changing roots, category nesting, deduplication, or TMDB tag format does not ren
 
 Native category eligibility requires an active account and an enabled category for that same account and VOD type. The old plugin Category Filter/Exclude fields are removed and ignored. Disabling a native category alone does not treat its source as removed or delete existing output; metadata filters and optional Emby/M3U cleanup are separate policies.
 
+### NFO metadata and Emby
+
+The **NFO Metadata** settings group controls the plugin's movie/show/episode sidecar writing. If Emby manages metadata and its NFO saver is enabled, turn **Generate Movie NFO Files** and **Generate Series NFO Files** off to give Emby responsibility for writing metadata. Existing NFOs are not erased by changing these toggles. Defaults remain on for compatibility; saved choices are preserved.
+
+Emby integration is an independent real-media ownership check. It does not enable Emby's NFO reader/saver or replace Emby's metadata/image providers. Plugin NFOs can seed identification with stored Dispatcharr metadata, but cannot guarantee that Emby avoids additional metadata or artwork requests. The plugin does not overwrite existing Emby or edited NFOs.
+
 ### Independent metadata and title filters
 
 All filter rules are disabled by default. Movies and series have independent settings:
@@ -159,7 +165,17 @@ Filters use Dispatcharr model metadata directly, without NFOs, Emby enrichment, 
 
 **Catalogue snapshot** reports separate movie/series eligible, passing, per-rule rejection, and retained-unknown counts. Counts are unique titles after native category/account eligibility and before Emby ownership checks. Rejection counts may overlap because one title can fail several rules.
 
-Each applicable run checks tracked output against current filters before creation batching. Movies generation removes failing movie output; series generation removes failing episode output; full rescan and selective cleanup cover both. Verified generated STRMs and matching generated NFOs can be removed. Edited/unverified files, unresolved sources, and shared output with any passing or unresolved source remain protected. All bounded metadata lookups must finish before deletion starts. Filter NFO removal is automatic and independent of the separate Emby/M3U deletion-scope setting. Catalogue snapshot deletes nothing; Preview selective cleanup reports candidates without changing output files.
+Each applicable run checks tracked output against current filters before creation batching. Movies generation removes failing movie output; series generation removes failing episode output; full rescan and selective cleanup cover both. Verified generated STRMs and matching generated NFOs can be removed. Edited/unverified STRMs, unresolved sources, and shared output with any passing or unresolved source remain protected. Legacy/edited NFOs are preserved or archived as described below. All bounded metadata lookups must finish before deletion starts. Filter NFO removal is automatic and independent of the separate Emby/M3U deletion-scope setting. Catalogue snapshot deletes nothing; Preview selective cleanup reports candidates without changing output files.
+
+Filters also archive **NFO-only title folders**, including legacy NFOs without recorded ownership hashes and NFOs written or edited by Emby. This handles enabling filters after unfiltered generation or after STRM-only cleanup. Complete, bounded Dispatcharr relation projections identify exact folders using the current roots/naming settings; all matching sources must fail. NFO contents never supply filter metadata. Folders with a remaining STRM, symlink, unrelated file, or unresolved identity stay in place. Historical folders with a different naming layout are not guessed or automatically moved.
+
+Archives retain the metadata under `/data/vod2mlib/filtered-nfo/<run>/<movie|series>/...`, with a `manifest.jsonl` mapping original paths to backups. `VOD2MLIB_STATE_DIR` changes that base. Keep state outside media-server library paths. Same-device moves are verified renames; cross-device copies are verified before originals are removed. Copy failures leave originals available for retry. Archives are retained until you remove them yourself; relaxing filters can regenerate eligible STRMs but does not automatically restore archived metadata. Rescan Emby after cleanup to remove cached empty-show entries.
+
+This archive pass runs independently of both NFO-generation toggles and **Deletion scope**, and is limited to the media types selected by the action. Preview reports the folders/NFOs it would archive, including metadata that would remain after planned STRM removal. Results include archive counts, protected/error counts, and the archive location.
+
+Enabled **Emby ownership cleanup** also archives NFO-only output for movies or whole shows already present in the selected real-media libraries, even if they pass all metadata filters. This prevents retained legacy/Emby NFOs from keeping an empty duplicate visible after its STRMs are removed. It uses the same complete Emby snapshot, conservative identity matching, both output roots, automatic timing and failure policy as existing ownership cleanup. Manual selective cleanup applies it immediately; a full-rescan-only or manual-only policy is respected during ordinary generation. Provider-ID conflicts and any unowned matching source protect shared paths.
+
+Whole-show ownership mode can archive a series folder containing only episode NFOs, with no `tvshow.nfo`. Episode mode preserves series NFO-only folders because whole-folder metadata cannot establish ownership of missing episode positions. Metadata is retained in the same persistent archive location, with `reason: ownership` in its recovery manifest. A failed Emby snapshot or incomplete native ownership lookup cannot trigger archival. Real-media files and their metadata are outside plugin output roots and are not moved.
 
 Rejected titles do not consume creation batch slots or trigger episode loading. Incremental signatures include filter settings and metadata, so changing stored metadata or relaxing rules causes affected candidates to be reconsidered and eligible output can return. Filter rejection never establishes upstream absence: M3U cleanup uses an unfiltered database source census.
 
@@ -187,7 +203,7 @@ Automatic duplicate cleanup checks managed output before generation, independent
 
 M3U cleanup uses account/provider stream identities, not UUIDs alone, and checks the complete **unfiltered** Dispatcharr database catalogue, including inactive accounts and disabled categories. Confirmed absence can delete output on the first successful complete check; there is no grace period. Failed/incomplete database checks disable source-removal deletion for that run. Dispatcharr must refresh its own catalogue before newly removed upstream items can be detected.
 
-Removal verifies the recorded STRM URL text and path containment. Edited STRMs, symlinks, files outside configured roots, ambiguous/unrecognized legacy files, artwork, subtitles, and unrelated files remain protected. Optional NFO deletion requires matching recorded generated hashes; legacy NFOs without those hashes remain unverified and protected. Shared `tvshow.nfo` survives while protected episode STRMs remain. Empty directories may be pruned; roots remain. Media files themselves are never hashed.
+Removal verifies the recorded STRM URL text and path containment. Edited STRMs, symlinks, files outside configured roots, ambiguous/unrecognized legacy files, artwork, subtitles, and unrelated files remain protected. Optional NFO deletion requires matching recorded generated hashes. Legacy/edited NFOs are never deleted on that basis; filters can instead archive a confirmed rejected NFO-only title folder as described above. Shared `tvshow.nfo` survives while protected episode STRMs remain. Empty directories may be pruned; roots remain. Media files themselves are never hashed.
 
 ### Scheduling
 
@@ -219,6 +235,10 @@ Changed STRM URLs are refreshed while preserving modification time; identical co
 Telemetry is local. Detailed completed timings are in the action result and `/data/vod2mlib/timings.json` (or the overridden state directory); Action status shows a short phase summary and live progress. Series counters update approximately every two seconds. No telemetry is sent externally, and timing records omit credentials, settings, URLs, and output paths.
 
 Measurements include wall/CPU seconds, item/batch counts, and phases for Emby, database catalogue reads, discovery, filter checks, cleanup, movie/series generation, episode reads, output, and inventory/checkpoint work. `episode_sql` is SQL execution; `episode_query` includes query/hydration; `episode_load` covers the complete read. `cleanup_strm_io` is cumulative verification/removal time across filesystem workers. `filter_cleanup_batch` and `cleanup_batch` include serialized inventory finalization and pruning. Parent phases include child measurements, and concurrent worker durations can exceed elapsed action time; do not add them together. Worker phases use thread CPU time, while action totals use process CPU time and exclude supervisor startup. There is no provider-fetch phase.
+
+`filter_nfo_metadata_read` measures native identity/filter projections for legacy folders; `filter_nfo_archive` measures folder inspection and archiving. `filter_nfo_folders_*`, `filter_nfo_candidates`, `filter_nfo_archived`, and `filter_nfo_errors` distinguish archived metadata from deleted STRMs/NFOs.
+
+`ownership_nfo_metadata_read`, `ownership_nfo_archive` and corresponding `ownership_nfo_*` counters report Emby-excluded NFO-only metadata separately. Preview accounts for the configured STRM/NFO deletion scope and never counts the same folder twice when both filters and ownership exclude it.
 
 ## Inventory, incremental generation, and performance
 
@@ -256,6 +276,7 @@ The entry point is `plugin.py` (`Plugin.fields`, `Plugin.actions`, `Plugin.run`)
 | `action_runner.py` | Supervisor, isolated action process, deadlines, cancellation, status. |
 | `metadata_filters.py` | Shared pure rules, projected eligibility, preview counts. |
 | `filter_cleanup.py` | Bounded checks and removal of managed output failing current filters. |
+| `orphan_nfo.py` | Native path matching, preview and verified archival of rejected NFO-only title folders. |
 | `reconciliation.py` | Emby/source checks, discovery, action telemetry, inventory queues. |
 | `media_library.py` | Emby adapter, complete snapshots, conservative identity/ownership matching. |
 | `inventory.py` | SQLite state, ownership verification, containment, batched writes/removals. |
@@ -267,7 +288,7 @@ Scheduling uses Django model signals; Dispatcharr files are unchanged. Runtime d
 ```bash
 python -m pip install pytest django celery django-celery-beat
 python -m pytest -q
-python -m compileall -q plugin.py action_runner.py metadata_filters.py filter_cleanup.py reconciliation.py media_library.py inventory.py generation_cache.py schedule_settings.py
+python -m compileall -q plugin.py action_runner.py metadata_filters.py filter_cleanup.py orphan_nfo.py reconciliation.py media_library.py inventory.py generation_cache.py schedule_settings.py
 ```
 
 GitHub CI tests Python 3.10 and 3.12. The v1.20.1 suite passes 417 tests with 4 platform-specific skips on Windows. Behavioral changes should update the README and [CHANGELOG.md](CHANGELOG.md), keep Python/manifest fields and versions aligned, and update the fork distribution's pinned source SHA and file list when publishing. ZIP publication verifies checksums before updating the catalogue feed; do not replace an existing version's package with different bytes.

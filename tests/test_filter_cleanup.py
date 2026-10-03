@@ -47,7 +47,7 @@ def test_series_filters_remove_all_episode_output_without_fetching_rejected_show
     assert not list(Path(library.settings['series_root_folder']).rglob('*.nfo'))
 
 
-def test_edited_strm_is_preserved_and_edited_nfo_is_preserved(library):
+def test_edited_strm_is_preserved_and_edited_nfo_is_archived(library):
     library.rows['movies'].extend([relation(media(1, year=1914)), relation(media(2, year=1914))])
     library.run()
     paths = sorted(Path(library.settings['root_folder']).rglob('*.strm'))
@@ -58,7 +58,10 @@ def test_edited_strm_is_preserved_and_edited_nfo_is_preserved(library):
     assert result['reconciliation']['filter_preserved'] == 1
     assert result['reconciliation']['filter_deleted'] == 1
     assert paths[0].read_text() == 'custom stream'
-    assert nfo.read_text() == 'custom metadata'
+    assert not nfo.exists()
+    archived = next((library.tmp / 'state' / 'filtered-nfo').rglob(nfo.name))
+    assert archived.read_text() == 'custom metadata'
+    assert result['reconciliation']['filter_nfo_folders_archived'] == 1
 
 
 def test_passing_source_protects_shared_output_then_all_rejections_remove_it(library):

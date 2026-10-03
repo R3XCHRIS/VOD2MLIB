@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Keep action descriptions and button labels compact so buttons follow the existing right-aligned layout.
+
+- Extend NFO-only archival to enabled Emby ownership cleanup for movies and whole-show mode. Passing-filter titles such as A Different World can otherwise retain an empty VOD duplicate after owned STRMs are removed. Match existing cleanup scope/timing and provider-ID protections, preserve episode-mode folders, and report ownership archives separately in preview, results and telemetry.
+
+- Active metadata filters archive confirmed rejected NFO-only movie/series folders, including legacy or Emby-written metadata, outside output roots with a recovery manifest. Archives preserve metadata; STRMs, symlinks, unrelated files and passing sources protect folders.
+- Handle enabling filters after unfiltered generation or STRM-only cleanup, even with NFO generation disabled. Preview models planned STRM/NFO removal and reports matching archive candidates.
+- Add native lookup/archive telemetry and action-result counts. Complete native lookups precede filter changes; copy verification and inventory protections preserve retryability.
+- Group NFO controls under a UI heading and description; explain how plugin NFO writing, Emby ownership integration and deletion scope interact. Preserve saved settings and compatible defaults.
+
 ## v1.20.1 ? one saved configuration and Save-driven scheduling
 
 - Manual and scheduled actions use current saved settings and the same defaults at run start.
