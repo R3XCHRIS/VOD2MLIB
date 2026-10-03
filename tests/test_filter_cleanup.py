@@ -100,8 +100,9 @@ def test_metadata_lookup_failure_stops_before_any_filter_deletion(library, monke
     assert path.exists()
 
 
-def test_scheduled_runs_use_current_filters_and_preserve_operational_snapshot(monkeypatch):
-    saved = {'movie_earliest_year': '2000', 'series_genre_exclude': 'Horror'}
+def test_scheduled_runs_use_current_settings_and_ignore_legacy_snapshot(monkeypatch):
+    saved = {'movie_earliest_year': '2000', 'series_genre_exclude': 'Horror',
+             'root_folder': '/saved/Movies', 'batch_size': '250'}
     monkeypatch.setitem(sys.modules, 'apps.plugins.models', NS(
         PluginConfig=NS(objects=NS(get=lambda **kwargs: NS(settings=saved)))))
     snapshot = {'movie_earliest_year': '1900', 'series_title_exclude': '^AR',
@@ -111,7 +112,7 @@ def test_scheduled_runs_use_current_filters_and_preserve_operational_snapshot(mo
     assert current['movie_earliest_year'] == '2000'
     assert current['series_genre_exclude'] == 'Horror'
     assert current['series_title_exclude'] == ''
-    assert current['root_folder'] == '/scheduled/Movies' and current['batch_size'] == '100'
+    assert current['root_folder'] == '/saved/Movies' and current['batch_size'] == '250'
     assert snapshot == before
 
 

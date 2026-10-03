@@ -10,7 +10,7 @@
   <i>v1.18.0 — slug <code>vod2mlib</code></i>
 </p>
 
-> **Note on scheduled rescans.** The cron task routes via Dispatcharr's `dvr` Celery worker as a workaround for an upstream plugin-task-registration issue affecting the default prefork worker pool ([Dispatcharr#1244](https://github.com/Dispatcharr/Dispatcharr/issues/1244)). The routing is transparent — no user action required for new installs. If you originally set up your schedule on **v1.14.1 or earlier**, click `[SCHEDULE] Apply / Update` once after upgrading so the stored task picks up the new routing.
+> **Note on scheduled rescans.** The cron task routes via Dispatcharr's `dvr` Celery worker as a workaround for an upstream plugin-task-registration issue affecting the default prefork worker pool ([Dispatcharr#1244](https://github.com/Dispatcharr/Dispatcharr/issues/1244)). The routing is transparent — no user action required for new installs. Existing schedules retain their enabled state and automatically adopt the current routing after upgrading.
 
 > **Plex users:** Plex does *not* play `.strm` files. Jellyfin and ChannelsDVR do. See [Plex compatibility](#plex-compatibility) below.
 
@@ -24,7 +24,7 @@
 
 ## Media-library reconciliation (1.19.0-rc.13)
 
-Optional integration with one Emby server prevents generated STRMs from duplicating real media. Integration is disabled by default. Configure the server URL and API key, enable integration, then use **List media libraries** to find names/IDs and enter the real-media libraries you want checked. Explicit library names or IDs are required; there is no all-libraries option. Leave generated VOD/STRM libraries out to avoid fetching and discarding their contents. Empty, missing or ambiguous selections stop actions even with the continue-on-server-failure policy. Existing installations and scheduled snapshots must be updated with explicit names or IDs. Names are resolved on every run (case-insensitive exact matching), so a recreated library with the same name uses its new ID. Duplicate names require an ID. STRM-only, remote and virtual Emby entries do not count as owned; a movie with both a real file and a STRM does.
+Optional integration with one Emby server prevents generated STRMs from duplicating real media. Integration is disabled by default. Configure the server URL and API key, enable integration, then use **List media libraries** to find names/IDs and enter the real-media libraries you want checked. Explicit library names or IDs are required; there is no all-libraries option. Leave generated VOD/STRM libraries out to avoid fetching and discarding their contents. Empty, missing or ambiguous selections stop actions even with the continue-on-server-failure policy. Existing installations must save explicit library names or IDs. Names are resolved on every run (case-insensitive exact matching), so a recreated library with the same name uses its new ID. Duplicate names require an ID. STRM-only, remote and virtual Emby entries do not count as owned; a movie with both a real file and a STRM does.
 
 Movies and shows match separately, first by TMDB or IMDb ID. When comparable IDs are unavailable, an exact cleaned title and known matching year can match. Conflicting IDs, unknown years and fuzzy titles are retained. A show counts as owned only when Emby has actual non-STRM episodes. **Skip entire owned show** is the default; **Fill missing episodes** compares season/episode positions, including specials and multi-episode files. Uncertain positions are retained in missing-episode mode.
 
@@ -40,7 +40,7 @@ On an Emby failure, **Continue with warning** is the default: generation proceed
 
 A plugin-owned SQLite inventory lives at `/data/vod2mlib/inventory.sqlite3`, beside `/data/plugins`, outside plugin installations and media roots. Keep Dispatcharr's `/data` volume persistent across upgrades. An operator can override the state directory with `VOD2MLIB_STATE_DIR`; use persistent local storage outside both media roots and the plugin installation. The inventory uses schema versioning, indexed source/metadata/path lookups, bulk `executemany()` writes in transactions of up to 1,000 records, bounded queues and streamed catalogue reads. Batched lookups are split to respect SQLite parameter limits. Parent-thread writes and a process lock serialize generation and cleanup. Only generated NFOs are hashed; media files are never hashed. No new runtime dependencies are required.
 
-Apply/Update the existing schedule after changing integration or cleanup settings; these settings, including credentials, are stored in the schedule snapshot. Jellyfin and Plex adapters are not included in this prerelease.
+Save integration or cleanup changes in Settings; manual actions and scheduled jobs read the same current saved configuration at run start. Jellyfin and Plex adapters are not included in this prerelease.
 
 ---
 
@@ -154,6 +154,7 @@ The Settings tab is grouped into four sections:
 |  | Refresh Existing Series | Re-evaluate already-processed series using stored Dispatcharr episodes and refresh changed episode `.strm` URLs (cron-friendly), without provider requests. Preserves `tvshow.nfo` and episode `.nfo` edits. |
 |  | Nest Series by Category | Wrap each series folder inside a subfolder named by its M3U category (off by default; series without a category go to `Unassigned/`) |
 |  | Dedupe Series Across Categories | When nesting is ON and a series is tagged with multiple categories upstream, write under the first category only (alphabetical) instead of duplicating. No effect when nesting is OFF. Off by default. ⚠ Doesn't remove existing duplicate folders — `[⚠ DANGER] Clean up` + re-generate to migrate. |
+| **Enable Auto-Rescan** | Schedule enabled | Off for new installs; enable and Save with a valid cron to schedule jobs |
 | **Auto-rescan schedule** | Schedule (cron) | Standard 5-field expression. Default `0 3 * * *` (daily 03:00) |
 |  | Schedule Timezone | IANA timezone the cron is interpreted in (e.g. `Europe/London`). Empty = UTC. Handles DST automatically. |
 |  | Scheduled Action | What the cron fires (full rescan recommended) |
@@ -169,11 +170,11 @@ VOD category selection uses Dispatcharr’s native per-account category settings
 **Auto-rescan.**
 1. Turn ON **Refresh Existing Series**.
 2. Set **Scheduled Action** to **Full rescan**.
-3. Click `[SCHEDULE] Apply / Update`.
+3. Turn **Enable Auto-Rescan** ON and click **Save**. A valid cron and timezone are required before scheduling can be enabled.
 4. Verify with `[SCHEDULE] Show status` — last run / total runs populate after the first cron tick.
 5. Optional: click `[SCHEDULE] Test fire now` to immediately replay the scheduled action without waiting for the next cron tick.
 
-The cron snapshots operational settings at click-time. **Re-click Apply after changing paths, batching, concurrency, integration, or cleanup settings**. Metadata and title filters are read from the latest saved settings at each scheduled run; filter changes do not require Apply.
+Manual actions, scheduled runs, and Test fire use one configuration: the current saved plugin settings, with the same defaults. Save changes to paths, batching, concurrency, integration, cleanup, filters, timeout, or the scheduled action; they apply to the next run. Save also registers or updates the cron time and timezone. Turn **Enable Auto-Rescan** OFF and Save to use manual actions only; queued ticks are skipped, and a running action keeps the configuration it started with. New installations default to scheduling disabled, while existing schedules retain their enabled state. Existing task snapshots are ignored and cleared. Invalid enabled-schedule settings are rejected before saving.
 
 ## Plex compatibility
 
@@ -197,7 +198,7 @@ Workable alternatives:
 - Check container logs for `core.scheduling Updated periodic task 'vod2mlib.auto_rescan'`.
 - Click `[SCHEDULE] Test fire now` to confirm the task itself works (proves it's a scheduling-layer issue, not a plugin issue).
 
-**Schedule fires but no new files appear.** Most likely: `Refresh Existing Series` is OFF and your existing series already have folders, so the cron only adds *new* series. Toggle Refresh Existing ON, click Apply Schedule again to update the snapshot.
+**Schedule fires but no new files appear.** Most likely: `Refresh Existing Series` is OFF and your existing series already have folders, so the cron only adds *new* series. Toggle Refresh Existing ON and Save; the next run uses the change.
 
 **Media server can't see the generated files at all.** The host path isn't shared with the media server's process. See [Sharing the VODs folder](#sharing-the-vods-folder-with-media-servers).
 
@@ -250,7 +251,7 @@ The bundled logo is reproducible — replace `tools/source_logo.png` and run `py
 - The plugin is a single `plugin.py` declaring a `Plugin` class with `fields`, `actions`, and `run()` per Dispatcharr's plugin contract.
 - `plugin.json` is the manifest the [Dispatcharr/Plugins catalogue](https://github.com/Dispatcharr/Plugins) reads. Dispatcharr's runtime reads action metadata from the Python class — the JSON is for the catalogue and pre-enable preview.
 - Schedule registration uses `django-celery-beat`'s `PeriodicTask` + `CrontabSchedule`. The cron-fired task is a module-level `@shared_task` named `vod2mlib.scheduled_rescan` that constructs a fresh `Plugin()` and dispatches.
-- Settings are snapshotted into the PeriodicTask's `kwargs` at Apply-time so the cron runs with deterministic config. Re-click Apply to refresh.
+- PeriodicTask stores only the registered trigger. The worker reads current saved plugin settings and the selected scheduled action at run start; old task snapshots are ignored. Plugin-owned Django save signals validate and synchronize the cron trigger; Dispatcharr source code is unchanged.
 
 ## Changelog
 
@@ -260,7 +261,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 Generation, library listing, preview, and cleanup run in isolated background processes. The action button returns immediately; use **[ACTION] Status** to read the final result, exclusions, deletions, and warnings. **[ACTION] Stop running action** cancels the action and its worker group within a few seconds without restarting Dispatcharr or its stream workers.
 
-**Maximum action runtime (minutes)** defaults to 30 and applies to manual and scheduled actions. A separate supervisor enforces the deadline even during blocked Emby HTTP/DNS and generation threads. Cancellation keeps completed file changes; the OS releases the SQLite/action locks and the next run reconciles inventory and missing files. Scheduled settings snapshots include this limit. Settings passed to workers are stored temporarily with private permissions, removed when the action exits, and never included in status output or command arguments.
+**Maximum action runtime (minutes)** defaults to 30 and applies to manual and scheduled actions. A separate supervisor enforces the deadline even during blocked Emby HTTP/DNS and generation threads. Cancellation keeps completed file changes; the OS releases the SQLite/action locks and the next run reconciles inventory and missing files. Both entry points use the current saved limit. Settings passed to workers are stored temporarily with private permissions, removed when the action exits, and never included in status output or command arguments.
 
 M3U cleanup checks tracked sources against Dispatcharr's complete, unfiltered database catalogue. It never contacts VOD providers or updates native metadata. Failed database checks disable M3U deletion for that run. A running action from an older plugin version cannot be cancelled by the new supervisor; its original process must finish or be recycled once.
 
@@ -321,7 +322,7 @@ Each generation run first applies current filters to tracked output for its medi
 Save settings and run **Catalogue snapshot** to inspect eligibility, or **Preview cleanup** to inspect existing-file removals. The next manual or scheduled run uses current saved filters. Filter cleanup telemetry reports checked, candidate, deleted, missing, preserved, and error counts; series deletion counts represent episode STRMs. Verified filter NFO removal is automatic and preserves edited or unverified NFOs, independently of the separate cleanup deletion-scope setting.
 
 
-Parallel Series Workers (under SERIES) defaults to 3 and accepts 1-6 workers. It controls series database-read/generation concurrency; movie concurrency stays at 3. Worker-count changes do not invalidate output signatures. Apply/Update the schedule after changing it if scheduled runs should use the new value. Increase concurrency only after comparing the same workload and checking database and storage errors.
+Parallel Series Workers (under SERIES) defaults to 3 and accepts 1-6 workers. It controls series database-read/generation concurrency; movie concurrency stays at 3. Worker-count changes do not invalidate output signatures. Save changes to use the new value for the next manual or scheduled run. Increase concurrency only after comparing the same workload and checking database and storage errors.
 
 Containment validation checks a lexically matching root first while still resolving the candidate and root on every check, preserving alias and symlink-escape behavior. Series ownership matching is calculated once from stored series metadata and reused for episode positions against the immutable library snapshot. Telemetry separates `output_guard`, `episode_ownership`, `inventory_enqueue`, and `checkpoint_enqueue`; enqueue durations include queue blocking and overhead. Inventory record/checkpoint CPU timings now use the action thread CPU clock to exclude concurrent generation work.
 

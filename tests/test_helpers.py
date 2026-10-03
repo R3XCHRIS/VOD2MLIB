@@ -1135,50 +1135,6 @@ class TestMovieTargetPathsBareYear:
         assert year == 2025
 
 
-# ---------- _settings_drift_keys (v1.15.2) ----------
-
-class _FakeTask:
-    def __init__(self, kwargs_str):
-        self.kwargs = kwargs_str
-
-
-class TestSettingsDriftKeys:
-    def test_no_drift_when_identical(self, p):
-        import json
-        snap = {"action": "rescan_all", "settings": {"batch_size": "250", "generate_nfo": True}}
-        task = _FakeTask(json.dumps(snap))
-        current = {"batch_size": "250", "generate_nfo": True, "schedule_cron": "0 3 * * *"}
-        assert p._settings_drift_keys(task, current) == []
-
-    def test_detects_changed_value(self, p):
-        import json
-        snap = {"settings": {"append_tmdb_id_to_folder": False, "batch_size": "250"}}
-        task = _FakeTask(json.dumps(snap))
-        current = {"append_tmdb_id_to_folder": True, "batch_size": "250"}
-        assert p._settings_drift_keys(task, current) == ["append_tmdb_id_to_folder"]
-
-    def test_new_setting_not_in_snapshot_is_not_flagged(self, p):
-        # A setting added by a plugin upgrade (absent from the old snapshot)
-        # must not raise a false drift warning.
-        import json
-        snap = {"settings": {"batch_size": "250"}}
-        task = _FakeTask(json.dumps(snap))
-        current = {"batch_size": "250", "dedupe_movies_across_categories": True}
-        assert p._settings_drift_keys(task, current) == []
-
-    def test_malformed_kwargs_returns_empty(self, p):
-        task = _FakeTask("{not valid json")
-        assert p._settings_drift_keys(task, {"batch_size": "250"}) == []
-
-    def test_schedule_prefixed_keys_ignored(self, p):
-        import json
-        snap = {"settings": {"batch_size": "250"}}
-        task = _FakeTask(json.dumps(snap))
-        # changing schedule_cron must NOT count as settings drift
-        current = {"batch_size": "250", "schedule_cron": "0 4 * * *"}
-        assert p._settings_drift_keys(task, current) == []
-
-
 # ---------- _build_proxy_url (#6 / omit_stream_id) ----------
 
 class TestBuildProxyUrl:

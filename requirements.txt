@@ -5,4 +5,4 @@
 #   - celery (optional; same)
 #
 # For local development of the test suite:
-#   pip install pytest
+#   pip install pytest django celery django-celery-beat

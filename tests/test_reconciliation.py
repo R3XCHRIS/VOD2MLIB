@@ -79,12 +79,6 @@ def test_series_uses_configured_worker_pool_without_changing_output(library, mon
     assert metrics['checkpoint_enqueue']['items'] == 1
 
 
-def test_nondefault_worker_count_reports_schedule_drift(library):
-    task = NS(kwargs='{"settings": {}}')
-    assert 'series_workers' not in library.p._settings_drift_keys(task, {'series_workers': '3'})
-    assert 'series_workers' in library.p._settings_drift_keys(task, {'series_workers': '6'})
-
-
 def test_drain_frees_checkpoints_before_inventory_and_never_commits_after_failure(library, monkeypatch):
     rec = Reconciliation(library.p, library.settings, LOG, library.tmp / 'drain-slots')
     rec.queue.put(('pending record',))
@@ -1003,6 +997,9 @@ def test_runtime_manifest_agreement_and_schedule_snapshot():
     ] == [(f["id"], f.get("default"), f.get("options")) for f in Plugin.fields]
     assert [a["id"] for a in manifest["actions"]] == [a["id"] for a in Plugin.actions]
     assert manifest["version"] == Plugin.version
+    action_ids = {a["id"] for a in manifest["actions"]}
+    assert not {"apply_schedule", "remove_schedule"} & action_ids
+    assert next(f for f in manifest["fields"] if f["id"] == "schedule_enabled")["default"] is False
     fields = {f["id"] for f in Plugin.fields}
     settings = {f["id"]: f.get("default") for f in Plugin.fields if "default" in f}
     snapshot = {k: v for k, v in settings.items() if not k.startswith("schedule_")}
@@ -1224,36 +1221,6 @@ def test_strm_inventory_stores_raw_url_without_hash(library, monkeypatch):
         ]
         == 1
     )
-
-
-def test_apply_schedule_persists_reconciliation_settings(library, monkeypatch):
-    captured = {}
-
-    def update_or_create(**kwargs):
-        captured.update(kwargs)
-        return NS(), True
-
-    models = NS(
-        PeriodicTask=NS(objects=NS(update_or_create=update_or_create)),
-        CrontabSchedule=NS(objects=NS(get_or_create=lambda **kwargs: (NS(), True))),
-    )
-    monkeypatch.setitem(sys.modules, "django_celery_beat.models", models)
-    result = library.run(
-        "apply_schedule",
-        media_library_enabled=True,
-        media_server_token="key",
-        media_tv_mode="episodes",
-        m3u_cleanup_enabled=True,
-        deletion_scope="strm_nfo",
-    )
-    assert result["status"] == "ok"
-    snapshot = json.loads(captured["defaults"]["kwargs"])["settings"]
-    assert snapshot["media_library_enabled"] is True
-    assert snapshot["media_server_token"] == "key"
-    assert snapshot["media_tv_mode"] == "episodes"
-    assert snapshot["m3u_cleanup_enabled"] is True
-    assert snapshot["deletion_scope"] == "strm_nfo"
-    assert captured["defaults"]["queue"] == "dvr"
 
 
 def test_whole_show_mode_never_fetches_owned_provider_episodes(library, monkeypatch):

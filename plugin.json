@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library (mwongj fork)",
-  "version": "1.20.0",
+  "version": "1.20.1",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "mwongj",
   "license": "MIT",
@@ -13,7 +13,7 @@
       "id": "_about",
       "label": "About",
       "type": "info",
-      "description": "Workflow:\n  1. Configure paths below.\n  2. Actions → Scan → see catalogue totals.\n  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n  4. (Optional) Turn ON Refresh Existing Series, set cron, click Apply Schedule for nightly auto-rescan.\n\nDocs: https://github.com/mwongj/VOD2MLIB"
+      "description": "Workflow:\n  1. Configure paths below.\n  2. Actions → Scan → see catalogue totals.\n  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n  4. (Optional) Turn ON Refresh Existing Series, enable Auto-Rescan, set cron, and Save for nightly auto-rescan.\n\nDocs: https://github.com/mwongj/VOD2MLIB"
     },
     {
       "id": "_section_paths",
@@ -190,7 +190,7 @@
           "label": "All series (may time out — use the schedule)"
         }
       ],
-      "help_text": "Number of series to process per click (episodes are auto-fetched for each, so series are much slower than movies). ⚠ This button runs synchronously and your reverse proxy will usually cut it off after ~60s with a 504 — the run keeps going server-side, but you lose the result. For a big catalogue don't use 'All' here: set the cron to 'Full rescan' and click [SCHEDULE] Apply / Update. Scheduled runs execute on the Celery worker with no HTTP timeout."
+      "help_text": "Number of series to process per run using episodes stored in Dispatcharr. Actions run in the background. For automatic full rescans, select Full rescan, enable Auto-Rescan, and Save."
     },
     {
       "id": "series_workers",
@@ -257,14 +257,21 @@
       "id": "_section_schedule",
       "label": "[AUTO-RESCAN SCHEDULE]",
       "type": "info",
-      "description": "Configure the cron job. Click Apply in the Actions tab to register or update."
+      "description": "Scheduled jobs use the same saved settings as manual actions. Enable auto-rescan and Save to register or update a valid cron schedule; disable it and Save for manual actions only."
+    },
+    {
+      "id": "schedule_enabled",
+      "label": "Enable Auto-Rescan",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Enable scheduled runs with a valid cron and timezone. Save applies all settings. Turn off and Save for manual actions only."
     },
     {
       "id": "schedule_cron",
       "label": "Auto-Rescan Schedule (cron)",
       "type": "string",
       "default": "0 3 * * *",
-      "help_text": "Standard 5-field cron: 'minute hour day-of-month month day-of-week'. Default '0 3 * * *' = every day at 03:00. Used by Apply Schedule."
+      "help_text": "Standard 5-field cron: 'minute hour day-of-month month day-of-week'. Default '0 3 * * *' = every day at 03:00. Validated when scheduling is enabled; Save applies changes."
     },
     {
       "id": "schedule_timezone",
@@ -672,28 +679,7 @@
       "confirm": {
         "required": true,
         "title": "Fire scheduled task now?",
-        "message": "Runs the same action the cron will fire (with the snapshotted settings) right now. Useful to verify the pipeline works. May take many minutes depending on the action."
-      }
-    },
-    {
-      "id": "apply_schedule",
-      "label": "[SCHEDULE] Apply / Update",
-      "description": "Register or update the cron task. Re-apply after operational changes; filters are read live.",
-      "button_label": "Apply",
-      "button_variant": "outline",
-      "button_color": "blue"
-    },
-    {
-      "id": "remove_schedule",
-      "label": "[SCHEDULE] Unschedule",
-      "description": "Remove the periodic auto-rescan task.",
-      "button_label": "Remove",
-      "button_variant": "outline",
-      "button_color": "orange",
-      "confirm": {
-        "required": true,
-        "title": "Remove auto-rescan schedule?",
-        "message": "This unregisters the periodic task. You can re-create it any time with Apply."
+        "message": "Runs the current saved scheduled action with the current saved settings right now. Useful to verify the pipeline works. May take many minutes depending on the action."
       }
     },
     {

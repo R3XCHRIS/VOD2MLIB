@@ -13,6 +13,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install pytest
+      - run: python -m pip install pytest django celery django-celery-beat
       - run: python -m pytest -q
-      - run: python -m compileall -q plugin.py media_library.py inventory.py reconciliation.py action_runner.py generation_cache.py metadata_filters.py filter_cleanup.py
+      - run: python -m compileall -q plugin.py media_library.py inventory.py reconciliation.py action_runner.py generation_cache.py metadata_filters.py filter_cleanup.py schedule_settings.py

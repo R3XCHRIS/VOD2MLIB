@@ -139,19 +139,6 @@ def test_series_metadata_and_settings_invalidate_episode_decisions(library):
     assert library.run('generate_series', refresh_existing=True, series_minimum_score='7')['reconciliation']['generation_unchanged'] == 0
 
 
-def test_schedule_filter_changes_are_live_without_snapshot_drift():
-    from types import SimpleNamespace
-    task = SimpleNamespace(kwargs=json.dumps({'settings': {'batch_size': 'all'}}))
-    defaults = {field['id']: field['default'] for field in FIELDS}
-    p = Plugin()
-    assert p._settings_drift_keys(task, {'batch_size': 'all', **defaults}) == []
-    current = {'batch_size': 'all', **defaults, 'movie_earliest_year': '2000',
-               'series_earliest_year': '2010', 'series_genre_exclude': 'Horror'}
-    assert p._settings_drift_keys(task, current) == []
-    task.kwargs = json.dumps({'settings': current})
-    assert p._settings_drift_keys(task, current) == []
-
-
 @pytest.mark.parametrize('title', ['AF - Yard Palava', 'ar: Title', ' AR|Title', 'AR - +Title'])
 def test_title_regex_excludes_provider_variants(title):
     rules = configuration({'series_title_exclude': r'^\s*(AF|AR)\s*[-:|]\s*'})['series']
@@ -228,12 +215,6 @@ def test_title_snapshot_matches_generation_candidates(monkeypatch):
     passing = list(passing_relations(Query(rows), 'movie', rules))
     assert counts['passing'] == len(passing) == 2
     assert counts['rejected_title'] == 1 and counts['retained_unknown'] == 1
-
-
-def test_new_title_rule_is_live_without_schedule_drift():
-    from types import SimpleNamespace
-    task = SimpleNamespace(kwargs=json.dumps({'settings': {}}))
-    assert Plugin()._settings_drift_keys(task, {'series_title_exclude': '^AR'}) == []
 
 
 def test_genre_lists_keep_regex_characters_literal():
