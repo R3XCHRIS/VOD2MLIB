@@ -7,7 +7,7 @@ MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
 Copyright (c) 2026 R3XCHRIS (downstream maintainer, fork)
 Upstream:   https://github.com/shedunraid/VOD2MLIB
-This fork:  https://github.com/R3XCHRIS/VOD2MLIB
+This fork:  https://github.com/mwongj/VOD2MLIB
 """
 import os
 import time
@@ -40,9 +40,9 @@ class VODType(Enum):
 class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
 
-    name = "VOD to Media Library"
+    name = "VOD to Media Library (mwongj fork)"
     version = "1.20.0"
-    help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
+    help_url = "https://github.com/mwongj/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
         "optional NFO metadata, batch processing, and a cron-driven auto-rescan."
@@ -156,7 +156,7 @@ class Plugin:
                      '  4. (Optional) Turn ON Refresh Existing Series, set cron, click Apply Schedule for '
                      'nightly auto-rescan.\n'
                      '\n'
-                     'Docs: https://github.com/R3XCHRIS/VOD2MLIB'},
+                     'Docs: https://github.com/mwongj/VOD2MLIB'},
      {'id': '_section_paths',
       'label': '[PATHS & HOSTS]',
       'type': 'info',

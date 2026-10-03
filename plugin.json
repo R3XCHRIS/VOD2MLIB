@@ -1,19 +1,19 @@
 {
-  "name": "VOD to Media Library",
+  "name": "VOD to Media Library (mwongj fork)",
   "version": "1.20.0",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
-  "author": "R3XCHRIS",
+  "author": "mwongj",
   "license": "MIT",
   "min_dispatcharr_version": "v0.24.0",
-  "repo_url": "https://github.com/R3XCHRIS/VOD2MLIB",
-  "help_url": "https://github.com/R3XCHRIS/VOD2MLIB#readme",
+  "repo_url": "https://github.com/mwongj/VOD2MLIB",
+  "help_url": "https://github.com/mwongj/VOD2MLIB#readme",
   "discord_thread": "https://discord.com/channels/1340492560220684331/1503076618078261374",
   "fields": [
     {
       "id": "_about",
       "label": "About",
       "type": "info",
-      "description": "Workflow:\n  1. Configure paths below.\n  2. Actions → Scan → see catalogue totals.\n  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n  4. (Optional) Turn ON Refresh Existing Series, set cron, click Apply Schedule for nightly auto-rescan.\n\nDocs: https://github.com/R3XCHRIS/VOD2MLIB"
+      "description": "Workflow:\n  1. Configure paths below.\n  2. Actions → Scan → see catalogue totals.\n  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n  4. (Optional) Turn ON Refresh Existing Series, set cron, click Apply Schedule for nightly auto-rescan.\n\nDocs: https://github.com/mwongj/VOD2MLIB"
     },
     {
       "id": "_section_paths",
