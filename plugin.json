@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.19.0-rc.13",
+  "version": "1.20.0-rc.9",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -193,6 +193,39 @@
       "help_text": "Number of series to process per click (episodes are auto-fetched for each, so series are much slower than movies). ⚠ This button runs synchronously and your reverse proxy will usually cut it off after ~60s with a 504 — the run keeps going server-side, but you lose the result. For a big catalogue don't use 'All' here: set the cron to 'Full rescan' and click [SCHEDULE] Apply / Update. Scheduled runs execute on the Celery worker with no HTTP timeout."
     },
     {
+      "id": "series_workers",
+      "label": "Parallel Series Workers",
+      "type": "select",
+      "default": "3",
+      "options": [
+        {
+          "value": "1",
+          "label": "1"
+        },
+        {
+          "value": "2",
+          "label": "2"
+        },
+        {
+          "value": "3",
+          "label": "3"
+        },
+        {
+          "value": "4",
+          "label": "4"
+        },
+        {
+          "value": "5",
+          "label": "5"
+        },
+        {
+          "value": "6",
+          "label": "6"
+        }
+      ],
+      "help_text": "Concurrent series generation tasks using Dispatcharr database metadata. Default 3; increase after measuring database and storage performance. Movies continue using 3 workers."
+    },
+    {
       "id": "generate_series_nfo",
       "label": "Generate Series NFO Files",
       "type": "boolean",
@@ -204,7 +237,7 @@
       "label": "Refresh Existing Series (rescan-friendly)",
       "type": "boolean",
       "default": false,
-      "help_text": "Re-evaluate series that already have folders, picking up new episodes added upstream AND rewriting existing episode .strm files so they pick up the current Dispatcharr URL. .nfo files (including tvshow.nfo) are only written when missing, so your edits are preserved. Off = fast manual iteration (skip done series); On = scan everything for new content and refresh existing URLs. Turn ON before clicking Apply Schedule for cron rescans of target 'generate_series'. Note: 'rescan_all' forces this ON regardless."
+      "help_text": "Re-evaluate existing series using only metadata and episodes already stored in Dispatcharr. Include newly stored episodes and refresh changed managed STRM/NFO output while preserving edited files. No provider requests or native metadata updates occur. Off skips already-generated series; On rechecks them. Full rescan forces this On. Refresh or fetch episode data in Dispatcharr before generating if its database is incomplete or stale."
     },
     {
       "id": "nest_series_by_category",
@@ -437,6 +470,130 @@
         }
       ],
       "help_text": "Stops a generation, library check or cleanup and all its workers after this deadline. Background actions continue after the browser closes. Use Action status for results or Stop running action to cancel sooner. Completed file changes remain; retry resumes normal processing."
+    },
+    {
+      "id": "_section_metadata_filters",
+      "label": "[METADATA FILTERS]",
+      "type": "info",
+      "description": "Filter movies and series independently by score, year, and title regex, and series by genre, using Dispatcharr metadata. Blank rules are disabled; unknown metadata is kept by default. The next generation run removes verified generated STRMs and NFOs that fail current filters, while preserving edited files. Scheduled runs use current saved filters automatically."
+    },
+    {
+      "id": "movie_minimum_score",
+      "label": "Minimum Score (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive numeric score 0–10. Blank disables. Zero or invalid model ratings are unknown."
+    },
+    {
+      "id": "movie_earliest_year",
+      "label": "Earliest Year (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive positive integer year. Blank disables."
+    },
+    {
+      "id": "movie_latest_year",
+      "label": "Latest Year (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive positive integer year. Blank disables."
+    },
+    {
+      "id": "movie_missing_metadata",
+      "label": "Missing Metadata (Movie)",
+      "type": "select",
+      "default": "keep",
+      "options": [
+        {
+          "value": "keep",
+          "label": "Keep unknowns"
+        },
+        {
+          "value": "reject",
+          "label": "Reject unknowns"
+        }
+      ],
+      "help_text": "Applies only to enabled metadata rules. Uses Dispatcharr model metadata."
+    },
+    {
+      "id": "movie_title_include",
+      "label": "Title Include Regex (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Case-insensitive regular expression searched in the original Dispatcharr title before cleanup. Use ^\\s*(AF|AR)\\s*[-:|]\\s* for provider prefixes or ^\\s*\\[(AF|AR)\\]\\s* for bracketed tags. Include requires a match; exclude rejects a match and wins over include. Blank disables."
+    },
+    {
+      "id": "movie_title_exclude",
+      "label": "Title Exclude Regex (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Case-insensitive regular expression searched in the original Dispatcharr title before cleanup. Use ^\\s*(AF|AR)\\s*[-:|]\\s* for provider prefixes or ^\\s*\\[(AF|AR)\\]\\s* for bracketed tags. Include requires a match; exclude rejects a match and wins over include. Blank disables."
+    },
+    {
+      "id": "series_minimum_score",
+      "label": "Minimum Score (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive numeric score 0–10. Blank disables. Zero or invalid model ratings are unknown."
+    },
+    {
+      "id": "series_earliest_year",
+      "label": "Earliest Year (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive positive integer year. Blank disables."
+    },
+    {
+      "id": "series_latest_year",
+      "label": "Latest Year (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive positive integer year. Blank disables."
+    },
+    {
+      "id": "series_missing_metadata",
+      "label": "Missing Metadata (Series)",
+      "type": "select",
+      "default": "keep",
+      "options": [
+        {
+          "value": "keep",
+          "label": "Keep unknowns"
+        },
+        {
+          "value": "reject",
+          "label": "Reject unknowns"
+        }
+      ],
+      "help_text": "Applies only to enabled metadata rules. Uses Dispatcharr model metadata."
+    },
+    {
+      "id": "series_title_include",
+      "label": "Title Include Regex (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Case-insensitive regular expression searched in the original Dispatcharr title before cleanup. Use ^\\s*(AF|AR)\\s*[-:|]\\s* for provider prefixes or ^\\s*\\[(AF|AR)\\]\\s* for bracketed tags. Include requires a match; exclude rejects a match and wins over include. Blank disables."
+    },
+    {
+      "id": "series_title_exclude",
+      "label": "Title Exclude Regex (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Case-insensitive regular expression searched in the original Dispatcharr title before cleanup. Use ^\\s*(AF|AR)\\s*[-:|]\\s* for provider prefixes or ^\\s*\\[(AF|AR)\\]\\s* for bracketed tags. Include requires a match; exclude rejects a match and wins over include. Blank disables."
+    },
+    {
+      "id": "series_genre_include",
+      "label": "Genre Include (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Comma-separated complete genre names, case-insensitive. Compound names remain intact. Any include qualifies; any exclude rejects. Blank disables."
+    },
+    {
+      "id": "series_genre_exclude",
+      "label": "Genre Exclude (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Comma-separated complete genre names, case-insensitive. Compound names remain intact. Any include qualifies; any exclude rejects. Blank disables."
     }
   ],
   "actions": [
@@ -471,7 +628,7 @@
     {
       "id": "generate_movies",
       "label": "[GENERATE] Movies",
-      "description": "Process movies per Batch Size. Existing .strm files are skipped.",
+      "description": "Remove verified output failing current movie filters, then generate per Batch Size.",
       "button_label": "Generate",
       "button_variant": "filled",
       "button_color": "green"
@@ -479,7 +636,7 @@
     {
       "id": "generate_series",
       "label": "[GENERATE] Series",
-      "description": "Create episode .strm files. See 'Refresh Existing Series' setting.",
+      "description": "Remove verified output failing current series filters, then generate episode files.",
       "button_label": "Generate",
       "button_variant": "filled",
       "button_color": "green"
@@ -487,7 +644,7 @@
     {
       "id": "rescan_all",
       "label": "[GENERATE] Full rescan",
-      "description": "Rescan then force regenerate Movies + Series.",
+      "description": "Apply current filters to existing output, then rescan Movies and Series.",
       "button_label": "Rescan all",
       "button_variant": "filled",
       "button_color": "teal",
@@ -521,7 +678,7 @@
     {
       "id": "apply_schedule",
       "label": "[SCHEDULE] Apply / Update",
-      "description": "Register or update the cron task. Re-click after changing any setting.",
+      "description": "Register or update the cron task. Re-apply after operational changes; filters are read live.",
       "button_label": "Apply",
       "button_variant": "outline",
       "button_color": "blue"

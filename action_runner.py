@@ -85,7 +85,9 @@ def status(directory=None):
     if job["state"] in ACTIVE:
         elapsed = max(0, int((time.time() - job.get("started", time.time())) / 60))
         remaining = max(0, int((job.get("deadline", time.time()) - time.time()) / 60))
-        progress = read_json(directory / f"{job['id']}.progress.json").get(
+        live = read_json(directory / f"{job['id']}.progress.json")
+        job['progress'] = live
+        progress = live.get(
             "phase", job.get("message", job["state"])
         )
         job["message"] = (
@@ -300,9 +302,13 @@ def work(directory, job_id):
     from plugin import Plugin
 
     plugin = Plugin()
-    plugin._progress = lambda message: write_json(
-        directory / f"{job_id}.progress.json", {"phase": message}
-    )
+    def progress(message):
+        rec = getattr(plugin, '_reconciliation', None)
+        telemetry = rec.telemetry() if rec else {}
+        write_json(directory / f"{job_id}.progress.json", {
+            'phase': message, 'updated_at': time.time(), **telemetry,
+        })
+    plugin._progress = progress
     result = plugin._run_locked_action(
         request["action"],
         request["params"],

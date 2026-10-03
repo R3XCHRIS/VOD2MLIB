@@ -7,7 +7,7 @@ import sqlite3
 import stat
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from collections import defaultdict
 from dataclasses import asdict
 from functools import lru_cache
@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 try:
     from .inventory import BATCH_SIZE, LOOKUP_BATCH_SIZE, InventoryStore, contained, strm_contents
     from .generation_cache import movie_candidates, signature
+    from .filter_cleanup import cleanup as cleanup_filters, applies as filters_apply, FilterCleanupError
     from .media_library import (
         Identity,
         LibrarySelectionError,
@@ -28,6 +29,7 @@ try:
 except ImportError:
     from inventory import BATCH_SIZE, LOOKUP_BATCH_SIZE, InventoryStore, contained, strm_contents
     from generation_cache import movie_candidates, signature
+    from filter_cleanup import cleanup as cleanup_filters, applies as filters_apply, FilterCleanupError
     from media_library import (
         Identity,
         LibrarySelectionError,
@@ -74,6 +76,9 @@ class Reconciliation:
         self.started_wall, self.started_cpu = time.perf_counter(), time.process_time()
         self.plugin, self.settings, self.logger = plugin, settings, logger
         self.store = InventoryStore(directory)
+        # Resolve the private inventory location once, rather than traversing its
+        # ancestors for every output ownership lookup.
+        self.reader_uri = Path(self.store.db_path).resolve().as_uri() + '?mode=ro'
         self.snapshot = None
         self.queue = Queue(maxsize=BATCH_SIZE)
         self.cache_queue = Queue(maxsize=BATCH_SIZE)
@@ -100,6 +105,16 @@ class Reconciliation:
             "generation_unchanged": 0,
             "generation_candidates": 0,
             "generation_deduped": 0,
+            "series_completed": 0,
+            "filter_checked": 0,
+            "filter_candidates": 0,
+            "filter_deleted": 0,
+            "filter_preserved": 0,
+            "filter_missing": 0,
+            "filter_errors": 0,
+            "filter_movie_deleted": 0,
+            "filter_series_deleted": 0,
+            "episodes_evaluated": 0,
             "source_presence_requested": 0,
             "source_presence_found": 0,
             "source_presence_queries": 0,
@@ -116,8 +131,9 @@ class Reconciliation:
         self.inventory_write_failed = False
 
     @contextmanager
-    def measure(self, name, items=0):
-        wall, cpu = time.perf_counter(), time.process_time()
+    def measure(self, name, items=0, worker=False):
+        cpu_clock = time.thread_time if worker else time.process_time
+        wall, cpu = time.perf_counter(), cpu_clock()
         try:
             yield
         finally:
@@ -126,9 +142,38 @@ class Reconciliation:
                     "wall_seconds": 0.0, "cpu_seconds": 0.0, "calls": 0, "items": 0,
                 })
                 timing["wall_seconds"] += time.perf_counter() - wall
-                timing["cpu_seconds"] += time.process_time() - cpu
+                timing["cpu_seconds"] += cpu_clock() - cpu
                 timing["calls"] += 1
                 timing["items"] += items
+                if worker:
+                    timing['cpu_clock'] = 'thread'
+
+    def telemetry(self):
+        # Copy under the same lock used by workers; never publish URLs or settings.
+        with self.counter_lock:
+            return {
+                'timings': {k: dict(v) for k, v in self.report['timings'].items()},
+                'series_completed': self.report['series_completed'],
+                'episodes_evaluated': self.report['episodes_evaluated'],
+            }
+
+    @contextmanager
+    def episode_query(self):
+        # Django wrappers are connection/thread-local. No SQL or parameters are logged.
+        from contextlib import nullcontext
+        wrapper = nullcontext()
+        try:
+            from django.conf import settings
+            if settings.configured:
+                from django.db import connection
+                def execute(execute, sql, params, many, context):
+                    with self.measure('episode_sql', 1, worker=True):
+                        return execute(sql, params, many, context)
+                wrapper = connection.execute_wrapper(execute)
+        except ImportError:
+            pass
+        with self.measure('episode_query', 1, worker=True), wrapper:
+            yield
 
     def finish(self):
         timings = self.report["timings"]
@@ -243,7 +288,7 @@ class Reconciliation:
             or action == "rescan_all"
             and self.settings.get("m3u_cleanup_timing", "rescan") == "rescan"
         )
-        # Refresh failures must never establish episode absence.
+        # Incomplete database lookups must never establish episode absence.
         try:
             roots = self.discovery_roots()
             if roots:
@@ -251,23 +296,20 @@ class Reconciliation:
                     self.census(metadata=True)
             with self.measure("legacy_adoption"):
                 self.adopt(roots=roots)
-            refreshed = False
+            cleanup_filters(self, action)
             if m3u:
-                # Include sources adopted during initial discovery, and use the
-                # same exact validation/presence semantics on every M3U check.
+                # Presence is established only by the complete, unfiltered database
+                # census. Never fetch provider data or change native metadata here.
                 for table in ('live', 'live_series'):
                     self.store.db.execute(f'DELETE FROM {table}')
                 with self.measure('catalogue'):
                     self.census(metadata=False)
-                with self.measure("m3u_tracked_show_check"):
-                    refreshed = self.refresh_tracked_series()
-            if refreshed:
-                for table in ("live", "live_series", "catalogue"):
-                    self.store.db.execute(f"DELETE FROM {table}")
-                with self.measure("catalogue"):
-                    self.census(metadata=False)
             self.m3u_complete = m3u
+        except FilterCleanupError:
+            raise
         except Exception as error:
+            if filters_apply(self.settings, action) and not getattr(self, 'filter_cleanup_active', False):
+                raise FilterCleanupError('Generated-file discovery failed; filters were not applied') from error
             self.m3u_complete = False
             self.warning(
                 f"Catalogue check incomplete; M3U cleanup disabled ({type(error).__name__})"
@@ -505,126 +547,11 @@ class Reconciliation:
             if self.census_count // 10000 > previous // 10000:
                 self.progress(f"Checking Dispatcharr sources: {self.census_count:,} rows processed")
 
-    def refresh_tracked_series(self):
-        if not self.store.db.execute(
-            "SELECT 1 FROM files WHERE kind='series' LIMIT 1"
-        ).fetchone():
-            self.progress("No tracked shows require M3U episode refresh")
-            return False
-        from apps.vod.models import M3USeriesRelation
-        from apps.vod.tasks import refresh_series_episodes
-
-        self.progress("Checking M3U removals and refreshing tracked shows")
-        refreshed = False
-        for rel in (
-            M3USeriesRelation.objects.select_related("series")
-            .only(
-                "m3u_account_id",
-                "external_series_id",
-                "last_episode_refresh",
-                "series__name",
-                "series__year",
-                "series__tmdb_id",
-                "series__imdb_id",
-            )
-            .all()
-            .iterator(chunk_size=BATCH_SIZE)
-        ):
-            identity = identity_for(self.plugin, rel.series, "series")
-            owned_show = (
-                self.snapshot is not None
-                and self.settings.get("media_tv_mode", "show") == "show"
-                and self.snapshot.owns(identity)
-            )
-            if self.tracked_series(identity) and not owned_show:
-                with self.measure("provider_episode_refresh", 1):
-                    self.refresh_complete(rel, refresh_series_episodes)
-                refreshed = True
-        return refreshed
-
-    def tracked_series(self, identity):
-        # Separate probes use all columns of the existing indices. A combined
-        # OR only used their kind prefix, scanning every tracked episode per show.
-        for column, value in (("tmdb", identity.tmdb), ("imdb", identity.imdb)):
-            if (
-                value
-                and self.store.db.execute(
-                    f"SELECT 1 FROM files WHERE kind='series' AND {column}=? LIMIT 1",
-                    (value,),
-                ).fetchone()
-            ):
-                return True
-        if not identity.year:
-            return False
-        return bool(
-            self.store.db.execute(
-                """SELECT 1 FROM files WHERE kind='series' AND title=? AND year=?
-               AND (tmdb='' OR ?='' OR tmdb=?)
-               AND (imdb='' OR ?='' OR imdb=?) LIMIT 1""",
-                (
-                    identity.title,
-                    str(identity.year),
-                    identity.tmdb,
-                    identity.tmdb,
-                    identity.imdb,
-                    identity.imdb,
-                ),
-            ).fetchone()
-        )
-
-    @staticmethod
-    def refresh_complete(rel, refresher):
-        # Dispatcharr's task swallows exceptions. Verify the provider response
-        # and the persisted completion timestamp rather than trusting its return.
-        from core.xtream_codes import Client
-
-        account = rel.m3u_account
-        with Client(
-            account.server_url,
-            account.username,
-            account.password,
-            account.get_user_agent_string(),
-        ) as client:
-            info = client.get_series_info(rel.external_series_id)
-        if not isinstance(info, dict) or not isinstance(info.get("episodes"), dict):
-            raise ValueError("Incomplete provider episode response")
-        expected = set()
-        for season, episodes in info["episodes"].items():
-            if int(season) < 0:
-                raise ValueError("Invalid provider season")
-            if not isinstance(episodes, list) or any(
-                not isinstance(e, dict) or not e.get("id") for e in episodes
-            ):
-                raise ValueError("Invalid provider episode response")
-            for episode in episodes:
-                if int(episode.get("episode_num", -1)) < 0:
-                    raise ValueError("Invalid provider episode number")
-                expected.add(str(episode["id"]))
-        previous = rel.last_episode_refresh
-        # A truthy empty season avoids Dispatcharr fetching an empty response again.
-        refresher(
-            account=account,
-            series=rel.series,
-            external_series_id=rel.external_series_id,
-            episodes_data=info["episodes"] or {"0": []},
-        )
-        rel.refresh_from_db()
-        if rel.last_episode_refresh is None or rel.last_episode_refresh == previous:
-            raise ValueError("Provider episode refresh did not complete")
-        from apps.vod.models import M3UEpisodeRelation
-
-        actual = {
-            str(value)
-            for value in M3UEpisodeRelation.objects.filter(
-                m3u_account=account, episode__series=rel.series
-            )
-            .values_list("stream_id", flat=True)
-            .iterator(chunk_size=BATCH_SIZE)
-        }
-        if actual != expected:
-            raise ValueError("Provider episode refresh was incomplete")
-
     def writable(self, path, uuid, kind):
+        with self.measure('output_guard', 1, worker=True):
+            return self._writable(path, uuid, kind)
+
+    def _writable(self, path, uuid, kind):
         if not contained(path, self.roots):
             return False
         if not os.path.lexists(path):
@@ -632,8 +559,7 @@ class Reconciliation:
         if os.path.islink(path):
             return False
         # Workers use short read-only connections; all writes stay on the parent.
-        uri = Path(self.store.db_path).resolve().as_uri() + "?mode=ro"
-        with sqlite3.connect(uri, uri=True) as reader:
+        with closing(sqlite3.connect(self.reader_uri, uri=True)) as reader:
             row = reader.execute(
                 "SELECT strm_url FROM files WHERE path=?", (os.path.abspath(path),)
             ).fetchone()
@@ -781,43 +707,49 @@ class Reconciliation:
         self.progress(
             "Previewing cleanup" if dry_run else "Reconciling generated files"
         )
-        for row in self.store.rows():
-            identity = Identity(
-                row["kind"], row["title"], row["year"], row["tmdb"], row["imdb"]
-            )
-            position = (
-                (row["season"], row["episode"]) if row["kind"] == "series" else None
-            )
-            duplicate = server and self.snapshot.owns(
-                identity, position, self.settings.get("media_tv_mode", "show")
-            )
-            absent = m3u and self.store.absent(row["path"])
-            if not duplicate and not absent:
-                if self.verify_missing and not dry_run and not os.path.lexists(row["path"]):
-                    self.store.forget(row["path"])
-                    self.report["missing"] += 1
-                continue
-            was_existing = os.path.lexists(row["path"])
-            try:
-                outcome = self.store.delete(
-                    row,
-                    self.roots,
-                    self.settings.get("deletion_scope", "strm") == "strm_nfo",
-                    dry_run,
-                    stats=self.report,
-                )
-                self.report[outcome] += 1
-                self.logger.info(
-                    "%s: %s (%s)",
-                    outcome,
-                    row["path"],
-                    "media server" if duplicate else "M3U removal",
-                )
-            except OSError as error:
-                if was_existing and not os.path.lexists(row["path"]):
-                    self.report["deleted"] += 1
-                self.report["errors"] += 1
-                self.logger.error("Cleanup failed for %s: %s", row["path"], error)
+        for batch in self.store.row_batches(skip_filters=getattr(self, 'filter_cleanup_active', False)):
+            with self.measure('cleanup_batch', len(batch)), self.store.forget_batch():
+                for row in batch:
+                    identity = Identity(
+                        row["kind"], row["title"], row["year"], row["tmdb"], row["imdb"]
+                    )
+                    position = (
+                        (row["season"], row["episode"]) if row["kind"] == "series" else None
+                    )
+                    duplicate = server and self.snapshot.owns(
+                        identity, position, self.settings.get("media_tv_mode", "show")
+                    )
+                    absent = m3u and self.store.absent(row["path"])
+                    if not duplicate and not absent:
+                        if self.verify_missing and not dry_run and not os.path.lexists(row["path"]):
+                            self.store.forget(row["path"])
+                            self.report["missing"] += 1
+                        continue
+                    was_existing = os.path.lexists(row["path"])
+                    try:
+                        outcome = self.store.delete(
+                            row,
+                            self.roots,
+                            self.settings.get("deletion_scope", "strm") == "strm_nfo",
+                            dry_run,
+                            stats=self.report,
+                        )
+                        self.report[outcome] += 1
+                        self.logger.info(
+                            "%s: %s (%s)",
+                            outcome,
+                            row["path"],
+                            "media server" if duplicate else "M3U removal",
+                        )
+                    except OSError as error:
+                        if was_existing and not os.path.lexists(row["path"]):
+                            self.report["deleted"] += 1
+                        self.report["errors"] += 1
+                        self.logger.error("Cleanup failed for %s: %s", row["path"], error)
+            self.report['cleanup_checked'] = self.report.get('cleanup_checked', 0) + len(batch)
+            self.progress(
+                f"Reconciling output: {self.report['cleanup_checked']:,} checked, "
+                f"{self.report['deleted']:,} removed; {self.report['errors']:,} errors")
 
     def owns(self, obj, kind, position=None):
         owned = self.snapshot is not None and self.snapshot.owns(
@@ -830,6 +762,19 @@ class Reconciliation:
                 self.report["excluded"] += 1
         return owned
 
+    def series_ownership(self, series):
+        # Refresh may fill identity metadata; take this snapshot afterwards.
+        matches = self.snapshot.matches(identity_for(self.plugin, series, 'series')) if self.snapshot else []
+        show_owned = bool(matches) and self.settings.get('media_tv_mode', 'show') == 'show'
+        positions = {position for match in matches for position in match.episodes}
+        def owned(position):
+            result = show_owned or position in positions
+            if result:
+                with self.counter_lock:
+                    self.report['excluded'] += 1
+            return result
+        return owned
+
     def record(self, path, obj, kind, rel, position=None, nfos=None):
         record = (
             path,
@@ -838,15 +783,26 @@ class Reconciliation:
             position,
             nfos,
         )
-        while not self.cancelled.is_set():
-            try:
-                self.queue.put(record, timeout=0.1)
-                return
-            except Full:
-                continue
+        with self.measure('inventory_enqueue', 1, worker=True):
+            while not self.cancelled.is_set():
+                try:
+                    self.queue.put(record, timeout=0.1)
+                    return
+                except Full:
+                    continue
         raise RuntimeError("Inventory writes cancelled after action failure")
 
     def drain(self):
+        # Free checkpoint slots before slow inventory verification. Capture
+        # checkpoints first: each producer queues its record before its decision,
+        # so their pending records are already in the bounded record queue below.
+        # Persist decisions only after record_many succeeds.
+        decisions = []
+        while len(decisions) < BATCH_SIZE:
+            try:
+                decisions.append(self.cache_queue.get_nowait())
+            except Empty:
+                break
         records = []
         while len(records) < BATCH_SIZE:
             try:
@@ -855,20 +811,15 @@ class Reconciliation:
                 break
         if records:
             try:
-                self.store.record_many(records)
+                with self.measure('inventory_record', len(records), worker=True):
+                    self.store.record_many(records)
             except Exception:
                 # Never checkpoint output decisions whose ownership write failed.
                 self.inventory_write_failed = True
                 self.cancelled.set()
                 raise
-        decisions = []
-        while len(decisions) < BATCH_SIZE:
-            try:
-                decisions.append(self.cache_queue.get_nowait())
-            except Empty:
-                break
         if decisions and not self.inventory_write_failed:
-            with self.store.db:
+            with self.measure('inventory_checkpoint', len(decisions), worker=True), self.store.db:
                 self.store.db.executemany(
                     'INSERT OR REPLACE INTO generation_entries VALUES (?,?,?,?)', decisions,
                 )
@@ -877,12 +828,13 @@ class Reconciliation:
         path = os.path.abspath(path) if path else ''
         if threading.get_ident() == self.action_thread and self.cache_queue.full():
             self.drain()
-        while not self.cancelled.is_set():
-            try:
-                self.cache_queue.put((kind, key, value, path), timeout=0.1)
-                return
-            except Full:
-                continue
+        with self.measure('checkpoint_enqueue', 1, worker=True):
+            while not self.cancelled.is_set():
+                try:
+                    self.cache_queue.put((kind, key, value, path), timeout=0.1)
+                    return
+                except Full:
+                    continue
         raise RuntimeError('Generation decisions cancelled after action failure')
 
     def movies(self, query):
@@ -895,8 +847,7 @@ class Reconciliation:
 
     def episode_cache(self, kind):
         # Workers only read SQLite; the action thread commits successful decisions.
-        uri = Path(self.store.db_path).resolve().as_uri() + '?mode=ro'
-        db = sqlite3.connect(uri, uri=True)
+        db = sqlite3.connect(self.reader_uri, uri=True)
         try:
             return dict(db.execute(
                 'SELECT source,signature FROM generation_entries WHERE kind=?', (kind,),
@@ -904,9 +855,10 @@ class Reconciliation:
         finally:
             db.close()
 
-    def episode_decision(self, rel, path):
+    def episode_decision(self, rel, path, series):
         ep = rel.episode
         return str(ep.uuid), signature(self.settings, [
             rel.m3u_account_id, rel.stream_id, str(ep.uuid), ep.name,
             ep.season_number, ep.episode_number, path,
+            series.rating, series.year, series.genre, series.name,
         ])

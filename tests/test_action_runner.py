@@ -145,11 +145,14 @@ def test_status_reports_phase_and_remaining_deadline(tmp_path, monkeypatch):
     )
     runner.write_json(
         tmp_path / "test.progress.json",
-        {"phase": "Emby snapshot: 500 of 2,000 items fetched"},
+        {"phase": "Emby snapshot: 500 of 2,000 items fetched", 'series_completed': 3,
+         'timings': {'provider_refresh': {'wall_seconds': 2.0}}},
     )
     message = runner.status(tmp_path)["message"]
     assert "500 of 2,000" in message
     assert "elapsed 5 min" in message and "deadline in 15 min" in message
+    assert runner.status(tmp_path)['job']['progress']['series_completed'] == 3
+    assert runner.status(tmp_path)['job']['progress']['timings']['provider_refresh']['wall_seconds'] == 2.0
 
 
 def test_supervisor_metadata_failure_cannot_orphan_worker(tmp_path, monkeypatch):

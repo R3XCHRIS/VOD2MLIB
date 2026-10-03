@@ -76,6 +76,11 @@ def strm_contents(path):
 
 
 def contained(path, roots):
+    # Try the lexical parent first, but still resolve both sides below. This only
+    # changes lookup order: aliases and symlink escapes retain their semantics.
+    absolute = os.path.normcase(os.path.abspath(path))
+    roots = sorted(roots, key=lambda root: not absolute.startswith(
+        os.path.normcase(os.path.abspath(root)).rstrip(os.sep) + os.sep))
     resolved = os.path.realpath(path)
     for root in roots:
         base = os.path.realpath(root)
@@ -85,6 +90,21 @@ def contained(path, roots):
         except ValueError:
             pass
     return False
+
+
+def remove_strm(row, roots, dry_run=False):
+    """Verify and remove one STRM without touching SQLite or shared NFOs."""
+    path = row['path']
+    if not contained(path, roots):
+        return 'preserved'
+    missing = not os.path.lexists(path)
+    if not missing and (os.path.islink(path) or strm_contents(path) != row['strm_url']):
+        return 'preserved'
+    if dry_run:
+        return 'missing' if missing else 'candidate'
+    if not missing:
+        os.remove(path)
+    return 'missing' if missing else 'deleted'
 
 
 class InventoryStore:
@@ -223,19 +243,51 @@ class InventoryStore:
             )
             self.db.executemany("INSERT OR IGNORE INTO sources VALUES (?,?)", sources)
 
-    def rows(self, batch=BATCH_SIZE):
-        cursor = self.db.execute("SELECT * FROM files ORDER BY path")
+    def row_batches(self, batch=BATCH_SIZE, skip_filters=False):
+        sql = 'SELECT f.* FROM files f WHERE f.path>?'
+        if skip_filters:
+            sql += ' AND NOT EXISTS (SELECT 1 FROM filter_handled h WHERE h.path=f.path)'
+        sql += ' ORDER BY f.path LIMIT ?'
+        last_path = ''
         while True:
-            rows = cursor.fetchmany(batch)
+            rows = self.db.execute(sql, (last_path, batch)).fetchall()
             if not rows:
                 break
+            last_path = rows[-1]['path']
+            yield rows
+
+    def rows(self, batch=BATCH_SIZE, skip_filters=False):
+        for rows in self.row_batches(batch, skip_filters):
             yield from rows
 
+    @contextmanager
+    def forget_batch(self):
+        """Commit one bounded group of removals; rolled-back paths remain retryable."""
+        if getattr(self, '_forget_batch_active', False):
+            raise RuntimeError('Inventory removal batches cannot nest')
+        self._forget_batch_active = True
+        self._cleanup_folders = {}
+        try:
+            with self.db:
+                yield
+                for folder, (roots, stats) in sorted(
+                        self._cleanup_folders.items(), key=lambda item: len(item[0]), reverse=True):
+                    self._remove_empty_parents(folder, roots, stats)
+        finally:
+            self._forget_batch_active = False
+            self._cleanup_folders = {}
+
     def forget(self, path):
-        with self.db:
-            self.db.execute("DELETE FROM generation_entries WHERE path=?", (path,))
-            self.db.execute("DELETE FROM sources WHERE path=?", (path,))
-            self.db.execute("DELETE FROM files WHERE path=?", (path,))
+        if getattr(self, '_forget_batch_active', False):
+            self._forget(path)
+        else:
+            with self.db:
+                self._forget(path)
+
+    def _forget(self, path):
+        self.db.execute("DELETE FROM generation_entries WHERE path=?", (path,))
+        self.db.execute("DELETE FROM sources WHERE path=?", (path,))
+        self.db.execute("DELETE FROM files WHERE path=?", (path,))
 
     def absent(self, path):
         # Unknown legacy references cannot establish absence.
@@ -252,18 +304,16 @@ class InventoryStore:
         )
 
     def delete(self, row, roots, include_nfo=False, dry_run=False, stats=None):
-        path = row["path"]
-        if not contained(path, roots):
-            return "preserved"
-        missing = not os.path.lexists(path)
-        if not missing and (
-            os.path.islink(path) or strm_contents(path) != row["strm_url"]
-        ):
-            return "preserved"
-        if dry_run:
-            return "missing" if missing else "candidate"
-        if not missing:
-            os.remove(path)
+        outcome = remove_strm(row, roots, dry_run)
+        return self.finish_delete(row, roots, outcome, include_nfo, dry_run, stats)
+
+    def finish_delete(self, row, roots, outcome, include_nfo=False, dry_run=False, stats=None):
+        """Finalize file-only worker results on the inventory's owning thread."""
+        if outcome not in ('preserved', 'candidate', 'missing', 'deleted'):
+            raise ValueError('Invalid STRM removal result')
+        if dry_run or outcome in ('preserved', 'candidate'):
+            return outcome
+        path = row['path']
         # Retain the record if an NFO deletion fails, so the next run can retry.
         if include_nfo:
             for nfo, digest in json.loads(row["nfos"]).items():
@@ -281,7 +331,15 @@ class InventoryStore:
                     if stats is not None:
                         stats["deleted_nfo"] = stats.get("deleted_nfo", 0) + 1
         self.forget(path)
-        folder = Path(path).parent
+        folder = str(Path(path).parent)
+        if getattr(self, '_forget_batch_active', False):
+            self._cleanup_folders[folder] = (roots, stats)
+        else:
+            self._remove_empty_parents(folder, roots, stats)
+        return outcome
+
+    def _remove_empty_parents(self, folder, roots, stats):
+        folder = Path(folder)
         while contained(str(folder), roots):
             try:
                 folder.rmdir()
@@ -290,4 +348,3 @@ class InventoryStore:
             except OSError:
                 break
             folder = folder.parent
-        return "missing" if missing else "deleted"

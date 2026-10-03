@@ -1,7 +1,7 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.19.0-rc.13 — incremental generation and targeted M3U source verification.
+v1.20.0-rc.9 — independent movie and series metadata filters.
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -10,6 +10,9 @@ Upstream:   https://github.com/shedunraid/VOD2MLIB
 This fork:  https://github.com/R3XCHRIS/VOD2MLIB
 """
 import os
+import time
+import hashlib
+from contextlib import nullcontext
 from pathlib import Path
 import re
 from enum import Enum
@@ -20,11 +23,13 @@ try:
     from .reconciliation import Reconciliation
     from . import action_runner
     from .media_library import create_adapter
+    from .metadata_filters import FIELDS as FILTER_FIELDS, SECTION as FILTER_SECTION, configuration, passing_relations, catalogue_counts
 except ImportError:
     from inventory import action_lock, state_directory, file_hash, contained, BATCH_SIZE
     from reconciliation import Reconciliation
     import action_runner
     from media_library import create_adapter
+    from metadata_filters import FIELDS as FILTER_FIELDS, SECTION as FILTER_SECTION, configuration, passing_relations, catalogue_counts
 
 
 class VODType(Enum):
@@ -36,7 +41,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
 
     name = "VOD to Media Library"
-    version = "1.19.0-rc.13"
+    version = "1.20.0-rc.9"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -288,21 +293,13 @@ class Plugin:
                    "result. For a big catalogue don't use 'All' here: set the cron to 'Full rescan' and click "
                    '[SCHEDULE] Apply / Update. Scheduled runs execute on the Celery worker with no HTTP '
                    'timeout.'},
+     {'id': 'series_workers', 'label': 'Parallel Series Workers', 'type': 'select', 'default': '3', 'options': [{'value': '1', 'label': '1'}, {'value': '2', 'label': '2'}, {'value': '3', 'label': '3'}, {'value': '4', 'label': '4'}, {'value': '5', 'label': '5'}, {'value': '6', 'label': '6'}], 'help_text': 'Concurrent series generation tasks using Dispatcharr database metadata. Default 3; increase after measuring database and storage performance. Movies continue using 3 workers.'},
      {'id': 'generate_series_nfo',
       'label': 'Generate Series NFO Files',
       'type': 'boolean',
       'default': True,
       'help_text': 'Create tvshow.nfo and per-episode .nfo metadata files.'},
-     {'id': 'refresh_existing',
-      'label': 'Refresh Existing Series (rescan-friendly)',
-      'type': 'boolean',
-      'default': False,
-      'help_text': 'Re-evaluate series that already have folders, picking up new episodes added upstream AND '
-                   'rewriting existing episode .strm files so they pick up the current Dispatcharr URL. .nfo '
-                   'files (including tvshow.nfo) are only written when missing, so your edits are preserved. Off '
-                   '= fast manual iteration (skip done series); On = scan everything for new content and refresh '
-                   'existing URLs. Turn ON before clicking Apply Schedule for cron rescans of target '
-                   "'generate_series'. Note: 'rescan_all' forces this ON regardless."},
+     {'id': 'refresh_existing', 'label': 'Refresh Existing Series (rescan-friendly)', 'type': 'boolean', 'default': False, 'help_text': 'Re-evaluate existing series using only metadata and episodes already stored in Dispatcharr. Include newly stored episodes and refresh changed managed STRM/NFO output while preserving edited files. No provider requests or native metadata updates occur. Off skips already-generated series; On rechecks them. Full rescan forces this On. Refresh or fetch episode data in Dispatcharr before generating if its database is incomplete or stale.'},
      {'id': 'nest_series_by_category',
       'label': 'Nest Series by Category',
       'type': 'boolean',
@@ -469,19 +466,19 @@ class Plugin:
       'button_color': 'blue'},
      {'id': 'generate_movies',
       'label': '[GENERATE] Movies',
-      'description': 'Process movies per Batch Size. Existing .strm files are skipped.',
+      'description': 'Remove verified output failing current movie filters, then generate per Batch Size.',
       'button_label': 'Generate',
       'button_variant': 'filled',
       'button_color': 'green'},
      {'id': 'generate_series',
       'label': '[GENERATE] Series',
-      'description': "Create episode .strm files. See 'Refresh Existing Series' setting.",
+      'description': "Remove verified output failing current series filters, then generate episode files.",
       'button_label': 'Generate',
       'button_variant': 'filled',
       'button_color': 'green'},
      {'id': 'rescan_all',
       'label': '[GENERATE] Full rescan',
-      'description': 'Rescan then force regenerate Movies + Series.',
+      'description': 'Apply current filters to existing output, then rescan Movies and Series.',
       'button_label': 'Rescan all',
       'button_variant': 'filled',
       'button_color': 'teal',
@@ -510,7 +507,7 @@ class Plugin:
                              'action.'}},
      {'id': 'apply_schedule',
       'label': '[SCHEDULE] Apply / Update',
-      'description': 'Register or update the cron task. Re-click after changing any setting.',
+      'description': 'Register or update the cron task. Re-apply after operational changes; filters are read live.',
       'button_label': 'Apply',
       'button_variant': 'outline',
       'button_color': 'blue'},
@@ -548,6 +545,8 @@ class Plugin:
                              'scope includes NFOs and their generated hashes match. Unverified and edited files '
                              'are preserved.'}}]
 
+    fields.extend([FILTER_SECTION, *FILTER_FIELDS])
+
     actions.extend([{'id': 'action_status', 'label': '[ACTION] Status',
                      'description': 'Show the running background action or its final result.'},
                     {'id': 'stop_action', 'label': '[ACTION] Stop running action',
@@ -559,6 +558,11 @@ class Plugin:
             return action_runner.status()
         if action == "stop_action":
             return action_runner.stop()
+        try:
+            configuration(settings)
+            self._series_worker_count(settings)
+        except ValueError as error:
+            return {"status": "error", "message": str(error)}
         if action in {"generate_movies", "generate_series", "rescan_all", "cleanup_movies", "cleanup_series", "preview_cleanup", "selective_cleanup", "list_media_libraries", "rebuild_inventory"}:
             return action_runner.start(action, params, settings)
         return self._run_action(action, params, context)
@@ -576,6 +580,8 @@ class Plugin:
             return self._run_action(action, params, context)
         reconciliation = None
         try:
+            configuration(settings)
+            self._series_worker_count(settings)
             with action_lock(state_directory()):
                 reconciliation = Reconciliation(self, settings, logger, state_directory())
                 self._reconciliation = reconciliation
@@ -591,7 +597,9 @@ class Plugin:
                     with reconciliation.measure("inventory_drain"):
                         reconciliation.drain()
                     result['reconciliation'] = reconciliation.report
-                    result['message'] += f"; excluded {reconciliation.report['excluded']}, deleted {reconciliation.report['deleted']}, cleanup errors {reconciliation.report['errors']}"
+                    result['message'] += f"; excluded {reconciliation.report['excluded']}, deleted {reconciliation.report['deleted']} ({reconciliation.report['filter_deleted']} by filters), cleanup errors {reconciliation.report['errors']}"
+                    if action == 'preview_cleanup':
+                        result['message'] += f"; filter removal candidates {reconciliation.report['filter_candidates']}"
                     if reconciliation.report['warnings']:
                         result['message'] += "; WARNING: " + "; ".join(reconciliation.report['warnings'])
                     return result
@@ -690,6 +698,10 @@ class Plugin:
 
     def _scan_all_vods(self, settings: Dict[str, Any], logger):
         """Scan and show total movies and series available."""
+        try:
+            filter_rules = configuration(settings)
+        except ValueError as error:
+            return {"status": "error", "message": str(error)}
         logger.info("Scanning VODs in Dispatcharr...")
         logger.info("")
 
@@ -709,6 +721,12 @@ class Plugin:
             eligible_series = self._eligible_vod_relations(
                 M3USeriesRelation.objects.all(), VODType.SERIES,
             )
+            filter_counts = {
+                'movies': catalogue_counts(eligible_movies, 'movie', filter_rules['movie']),
+                'series': catalogue_counts(eligible_series, 'series', filter_rules['series']),
+            }
+            for kind, counts in filter_counts.items():
+                logger.info("Metadata filters %s (before library checks): %s", kind, counts)
             active_movie = eligible_movies.values("movie_id").distinct().count()
             active_series = eligible_series.values("series_id").distinct().count()
             total_movie = Movie.objects.count()
@@ -750,7 +768,7 @@ class Plugin:
             logger.info("Use 'Generate Movie .strm Files' for movies")
             logger.info("Use 'Generate Series .strm Files' for series")
 
-            message = f"Found {active_movie} movies and {active_series} series"
+            message = f"Found {active_movie} movies and {active_series} series; metadata filters pass {filter_counts['movies']['passing']} movies and {filter_counts['series']['passing']} series"
             if orphan_movie or orphan_series:
                 message += f" ({orphan_movie + orphan_series} orphaned — no active provider with an enabled category)"
 
@@ -759,6 +777,7 @@ class Plugin:
                 "message": message,
                 "movies": active_movie,
                 "series": active_series,
+                "metadata_filters": filter_counts,
                 "movies_orphaned": orphan_movie,
                 "series_orphaned": orphan_series,
             }
@@ -901,6 +920,10 @@ class Plugin:
         user-visible setting). When True, existing .strm files are rewritten
         with the current Dispatcharr URL; .nfo files are still preserved.
         """
+        try:
+            filter_rules = configuration(settings)
+        except ValueError as error:
+            return {"status": "error", "message": str(error)}
         root_folder = settings.get("root_folder", "/VODS/Movies")
         dispatcharr_url = (settings.get("dispatcharr_url") or "").rstrip("/")
         batch_size = settings.get("batch_size") or "250"
@@ -980,7 +1003,7 @@ class Plugin:
         logger.info("-" * 60)
 
         rec = getattr(self, '_reconciliation', None)
-        relations = rec.movies(query) if rec else query.iterator()
+        relations = rec.movies(query) if rec else passing_relations(query, 'movie', filter_rules['movie'])
         for relation in relations:
             scanned += 1
             movie = relation.movie
@@ -1167,8 +1190,20 @@ class Plugin:
         except OSError:
             return False
 
+    @staticmethod
+    def _series_worker_count(settings):
+        value = str(settings.get('series_workers', '3'))
+        if not value.isascii() or not value.isdigit() or not 1 <= int(value) <= 6:
+            raise ValueError('Parallel series workers must be an integer from 1 to 6')
+        return int(value)
+
     def _generate_series(self, settings: Dict[str, Any], logger):
         """Generate series .strm files with episodes using parallel processing."""
+        try:
+            filter_rules = configuration(settings)
+            workers = self._series_worker_count(settings)
+        except ValueError as error:
+            return {"status": "error", "message": str(error)}
         series_root = settings.get("series_root_folder", "/VODS/Series")
         dispatcharr_url = (settings.get("dispatcharr_url") or "").rstrip("/")
         batch_size = settings.get("series_batch_size") or "10"
@@ -1194,7 +1229,7 @@ class Plugin:
             "Refresh Existing": "Yes" if refresh_existing else "No",
             "Nest by category": "Yes" if nest_by_cat else "No",
             "Dedupe across cats": "Yes" if dedupe_across_cats else "No",
-            "Workers": self.MAX_WORKERS,
+            "Workers": workers,
         })
 
         try:
@@ -1244,7 +1279,7 @@ class Plugin:
             nonlocal deduped
             submitted = 0
             seen = set() if dedupe_across_cats else None
-            for rel in query.iterator(chunk_size=BATCH_SIZE):
+            for rel in passing_relations(query, 'series', filter_rules['series']):
                 if self._owned(rel.series, "series"):
                     continue
                 if seen is not None:
@@ -1267,16 +1302,32 @@ class Plugin:
         errors = 0
         series_created = 0
         series_uptodate = 0
+        episodes_evaluated = 0
         failures = []
 
-        logger.info("Processing series with %d parallel workers", self.MAX_WORKERS)
-        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
+        rec = getattr(self, '_reconciliation', None)
+        last_progress = 0.0
+        def progress(force=False):
+            nonlocal last_progress
+            now = time.monotonic()
+            if rec and (force or now - last_progress >= 2):
+                with rec.counter_lock:
+                    rec.report['series_completed'] = idx
+                    rec.report['episodes_evaluated'] = episodes_evaluated
+                rec.progress(f"Generating series: {idx:,} completed, {len(futures)} active; "
+                    f"{episodes_evaluated:,} episodes evaluated, {created_strm:,} new, "
+                    f"{refreshed_strm:,} refreshed; {errors:,} errors")
+                last_progress = now
+
+        logger.info("Processing series with %d parallel workers", workers)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             try:
                 futures = {}
                 exhausted = False
                 idx = 0
+                progress(force=True)
                 while futures or not exhausted:
-                    while not exhausted and len(futures) < self.MAX_WORKERS:
+                    while not exhausted and len(futures) < workers:
                         try: rel = next(to_process)
                         except StopIteration:
                             exhausted = True
@@ -1287,6 +1338,7 @@ class Plugin:
                     if not futures: break
                     completed, _ = wait(futures, timeout=0.1, return_when=FIRST_COMPLETED)
                     self._drain_inventory()
+                    progress()
                     for future in completed:
                         rel = futures.pop(future)
                         idx += 1
@@ -1303,10 +1355,12 @@ class Plugin:
                             created_strm += result["episodes"]
                             refreshed_strm += result.get("refreshed", 0)
                         created_nfo += result.get("nfo_files", 0)
+                        episodes_evaluated += result.get('evaluated_episodes', 0)
                         if "error" in result:
                             errors += 1
                             failures.append(f"{result.get('series_name', '?')}: {result['error']}")
                         logger.info("[%d] %s", idx, result["message"])
+                progress(force=True)
             except BaseException:
                 rec = getattr(self, '_reconciliation', None)
                 if rec: rec.cancelled.set()
@@ -1361,15 +1415,14 @@ class Plugin:
 
         With refresh_existing=False, callers should pre-filter already-done
         series for performance. With refresh_existing=True, every series is
-        re-evaluated and the M3U source is re-fetched so newly-aired episodes
-        are picked up.
+        re-evaluated using the episodes and metadata already stored in Dispatcharr.
 
         When nest_by_cat=True the series folder is wrapped in a subfolder
         named by the M3U category (raw, sanitised) or 'Unassigned'.
         """
         from apps.vod.models import M3UEpisodeRelation
-        from apps.vod.tasks import refresh_series_episodes
 
+        rec = getattr(self, '_reconciliation', None)
         series = series_rel.series
         if self._owned(series, "series"):
             return {"created": False, "episodes": 0, "nfo_files": 0, "message": "Excluded owned series"}
@@ -1379,29 +1432,19 @@ class Plugin:
         )
 
         try:
-            custom_props = series_rel.custom_properties or {}
-            should_refetch = refresh_existing or not custom_props.get('episodes_fetched', False)
-            if should_refetch:
-                try:
-                    refresh_series_episodes(
-                        account=series_rel.m3u_account,
-                        series=series_rel.series,
-                        external_series_id=series_rel.external_series_id,
-                    )
-                except Exception as fetch_err:
-                    logger.warning("refresh_series_episodes failed for %s: %s", series_name, fetch_err)
-
             # `id` is a deterministic tiebreaker: without it the winner among
             # duplicate relations for one episode varies run to run, so the
             # same .strm would flip between provider URLs on every rescan.
-            episode_rels = list(
-                M3UEpisodeRelation.objects.filter(
-                    m3u_account=series_rel.m3u_account,
-                    episode__series=series,
+            with (rec.measure('episode_load', 1, worker=True) if rec else nullcontext()), \
+                    (rec.episode_query() if rec else nullcontext()):
+                episode_rels = list(
+                    M3UEpisodeRelation.objects.filter(
+                        m3u_account=series_rel.m3u_account,
+                        episode__series=series,
+                    )
+                    .select_related('episode')
+                    .order_by('episode__season_number', 'episode__episode_number', 'id')
                 )
-                .select_related('episode')
-                .order_by('episode__season_number', 'episode__episode_number', 'id')
-            )
 
             # One Episode can be reached by several relations. Every relation
             # resolves to the same filename (the name comes from the Episode),
@@ -1428,7 +1471,8 @@ class Plugin:
             episode_count = len(episodes)
             rec = getattr(self, '_reconciliation', None)
             episode_cache_kind = f'episode:{series_rel.m3u_account_id}:{series.uuid}'
-            episode_cache = rec.episode_cache(episode_cache_kind) if rec else {}
+            with rec.measure('episode_cache_read', 1, worker=True) if rec else nullcontext():
+                episode_cache = rec.episode_cache(episode_cache_kind) if rec else {}
 
             if episode_count == 0:
                 return {
@@ -1440,88 +1484,96 @@ class Plugin:
                     "message": f"{series_name} - No episodes found",
                 }
 
-            if not contained(series_folder, [series_root]):
-                raise ValueError("Series folder resolves outside configured root")
-            os.makedirs(series_folder, exist_ok=True)
+            with rec.measure('episode_ownership', 1, worker=True) if rec else nullcontext():
+                episode_owned = rec.series_ownership(series) if rec else lambda position: False
 
-            new_episodes = 0
-            refreshed_episodes = 0
-            unchanged_episodes = 0
-            new_nfo = 0
+            with rec.measure('series_files', episode_count, worker=True) if rec else nullcontext():
+                if not contained(series_folder, [series_root]):
+                    raise ValueError("Series folder resolves outside configured root")
+                os.makedirs(series_folder, exist_ok=True)
 
-            shared_nfos = {}
-            if generate_nfo:
-                tvshow_nfo_path = os.path.join(series_folder, "tvshow.nfo")
-                if not os.path.lexists(tvshow_nfo_path):
-                    category_name = series_rel.category.name if series_rel.category else ""
-                    tvshow_content = self._generate_tvshow_nfo(series, category_name, nfo_omit_title)
-                    with open(tvshow_nfo_path, 'w', encoding='utf-8') as f:
-                        f.write(tvshow_content)
-                    new_nfo += 1
-                try:
-                    if Path(tvshow_nfo_path).read_text(encoding="utf-8") == self._generate_tvshow_nfo(series, cat_name, nfo_omit_title):
-                        shared_nfos[tvshow_nfo_path] = file_hash(tvshow_nfo_path)
-                except (OSError, UnicodeError):
-                    pass  # Unreadable or custom metadata is preserved.
+                new_episodes = 0
+                refreshed_episodes = 0
+                unchanged_episodes = 0
+                new_nfo = 0
 
-            for episode_rel in episodes:
-                episode = episode_rel.episode
-                season_num = episode.season_number or 0
-                episode_num = episode.episode_number or 0
-                if self._owned(series, "series", (season_num, episode_num)):
-                    continue
-                generated_nfos = dict(shared_nfos)
-
-                season_folder_name = f"Season {season_num:02d}"
-                season_folder = os.path.join(series_folder, season_folder_name)
-
-                episode_title = episode.name or ""
-                if episode_title:
-                    clean_title = self._clean_title(episode_title)
-                    filename = f"{series_name} - S{season_num:02d}E{episode_num:02d} - {clean_title}"
-                else:
-                    filename = f"{series_name} - S{season_num:02d}E{episode_num:02d}"
-                filename = self._sanitize_filename(filename)
-
-                strm_path = os.path.join(season_folder, f"{filename}.strm")
-                decision = rec.episode_decision(episode_rel, strm_path) if rec else None
-                if decision and episode_cache.get(decision[0]) == decision[1]:
-                    unchanged_episodes += 1
-                    with rec.counter_lock:
-                        rec.report['generation_unchanged'] += 1
-                    continue
-                is_existing = os.path.isfile(strm_path)
-                if is_existing and not refresh_existing:
-                    continue
-                if not self._writable_strm(strm_path, episode.uuid, "episode"):
-                    logger.warning("Preserving unverified or edited STRM: %s", strm_path)
-                    continue
-
-                os.makedirs(season_folder, exist_ok=True)
-                proxy_url = self._build_proxy_url(
-                    dispatcharr_url, "episode", episode.uuid, episode_rel.stream_id, omit_stream_id,
-                )
-                # Only write when the URL actually changed, preserving mtime so
-                # media servers don't re-index the whole library (#11).
-                changed = self._write_if_different_preserve_times(strm_path, proxy_url)
-                if not changed:
-                    unchanged_episodes += 1
-                elif is_existing:
-                    refreshed_episodes += 1
-                else:
-                    new_episodes += 1
-
+                shared_nfos = {}
+                prepared_seasons = set()
                 if generate_nfo:
-                    nfo_path = os.path.join(season_folder, f"{filename}.nfo")
-                    if not os.path.lexists(nfo_path):
-                        with open(nfo_path, 'w', encoding='utf-8') as f:
-                            f.write(self._generate_episode_nfo(episode))
+                    tvshow_nfo_path = os.path.join(series_folder, "tvshow.nfo")
+                    tvshow_content = self._generate_tvshow_nfo(series, cat_name, nfo_omit_title)
+                    if not os.path.lexists(tvshow_nfo_path):
+                        with open(tvshow_nfo_path, 'w', encoding='utf-8') as f:
+                            f.write(tvshow_content)
                         new_nfo += 1
-                        generated_nfos[nfo_path] = file_hash(nfo_path)
-                self._track(strm_path, series, "series", episode_rel, (season_num, episode_num), generated_nfos)
-                if decision:
-                    rec.cache_complete(episode_cache_kind, *decision, strm_path)
+                    try:
+                        contents = Path(tvshow_nfo_path).read_bytes()
+                        if contents.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n") == tvshow_content:
+                            shared_nfos[tvshow_nfo_path] = hashlib.sha256(contents).hexdigest()
+                    except (OSError, UnicodeError):
+                        pass  # Unreadable or custom metadata is preserved.
 
+                for episode_rel in episodes:
+                    episode = episode_rel.episode
+                    season_num = episode.season_number or 0
+                    episode_num = episode.episode_number or 0
+                    if episode_owned((season_num, episode_num)):
+                        continue
+                    generated_nfos = dict(shared_nfos)
+
+                    season_folder_name = f"Season {season_num:02d}"
+                    season_folder = os.path.join(series_folder, season_folder_name)
+
+                    episode_title = episode.name or ""
+                    if episode_title:
+                        clean_title = self._clean_title(episode_title)
+                        filename = f"{series_name} - S{season_num:02d}E{episode_num:02d} - {clean_title}"
+                    else:
+                        filename = f"{series_name} - S{season_num:02d}E{episode_num:02d}"
+                    filename = self._sanitize_filename(filename)
+
+                    strm_path = os.path.join(season_folder, f"{filename}.strm")
+                    decision = rec.episode_decision(episode_rel, strm_path, series) if rec else None
+                    if decision and episode_cache.get(decision[0]) == decision[1]:
+                        unchanged_episodes += 1
+                        with rec.counter_lock:
+                            rec.report['generation_unchanged'] += 1
+                        continue
+                    is_existing = os.path.isfile(strm_path)
+                    if is_existing and not refresh_existing:
+                        continue
+                    if not self._writable_strm(strm_path, episode.uuid, "episode"):
+                        logger.warning("Preserving unverified or edited STRM: %s", strm_path)
+                        continue
+
+                    if season_folder not in prepared_seasons:
+                        os.makedirs(season_folder, exist_ok=True)
+                        prepared_seasons.add(season_folder)
+                    proxy_url = self._build_proxy_url(
+                        dispatcharr_url, "episode", episode.uuid, episode_rel.stream_id, omit_stream_id,
+                    )
+                    # Only write when the URL actually changed, preserving mtime so
+                    # media servers don't re-index the whole library (#11).
+                    with rec.measure('strm_write', 1, worker=True) if rec else nullcontext():
+                        changed = self._write_if_different_preserve_times(strm_path, proxy_url, directory_ready=True)
+                    if not changed:
+                        unchanged_episodes += 1
+                    elif is_existing:
+                        refreshed_episodes += 1
+                    else:
+                        new_episodes += 1
+
+                    if generate_nfo:
+                        nfo_path = os.path.join(season_folder, f"{filename}.nfo")
+                        with rec.measure('episode_nfo', 1, worker=True) if rec else nullcontext():
+                            if not os.path.lexists(nfo_path):
+                                with open(nfo_path, 'w', encoding='utf-8') as f:
+                                    f.write(self._generate_episode_nfo(episode))
+                                new_nfo += 1
+                                generated_nfos[nfo_path] = file_hash(nfo_path)
+                    self._track(strm_path, series, "series", episode_rel, (season_num, episode_num), generated_nfos)
+                    if decision:
+                        rec.cache_complete(episode_cache_kind, *decision, strm_path)
             if new_episodes == 0 and refreshed_episodes == 0:
                 return {
                     "created": False,
@@ -1530,6 +1582,7 @@ class Plugin:
                     "episodes": 0,
                     "refreshed": 0,
                     "unchanged": unchanged_episodes,
+                    "evaluated_episodes": episode_count,
                     "nfo_files": new_nfo,
                     "message": f"{series_name} - up-to-date ({episode_count} episodes on disk)",
                 }
@@ -1548,6 +1601,7 @@ class Plugin:
                 "episodes": new_episodes,
                 "refreshed": refreshed_episodes,
                 "unchanged": unchanged_episodes,
+                "evaluated_episodes": episode_count,
                 "nfo_files": new_nfo,
                 "message": msg,
             }
@@ -2085,7 +2139,7 @@ class Plugin:
 
         return name or "Unknown"
 
-    def _write_if_different_preserve_times(self, path: str, new_contents: str) -> bool:
+    def _write_if_different_preserve_times(self, path: str, new_contents: str, directory_ready=False) -> bool:
         """Write a .strm only when its contents actually change, preserving the
         original mtime when updating an existing file.
 
@@ -2105,7 +2159,7 @@ class Plugin:
         Reported with a patch by @bruor (issue #11).
         """
         dir_path = os.path.dirname(path)
-        if dir_path:
+        if dir_path and not directory_ready:
             os.makedirs(dir_path, exist_ok=True)
 
         if not os.path.exists(path):
@@ -2143,7 +2197,7 @@ class Plugin:
         rescans (and manual Rescan All clicks) reliably pick up new content AND
         rewrite existing .strm files so URL changes propagate. Movies use an
         internal kwarg on _generate_movies; series uses the user-visible
-        refresh_existing setting (which also enables new-episode discovery).
+        refresh_existing setting (which rechecks episodes already stored in Dispatcharr).
         Existing .nfo files are preserved either way.
         """
         logger.info("Combined rescan: scan + movies + series (refresh URLs forced ON)")
@@ -2311,7 +2365,7 @@ class Plugin:
         logger.info("%s schedule: %s @ '%s' (%s) → action '%s'", verb, self.SCHEDULE_TASK_NAME, cron_expr, tz_str, target)
         logger.info("Settings snapshot keys: %s", sorted(snapshot.keys()))
         logger.info("")
-        logger.info("Note: re-run 'Apply Schedule' after changing settings to refresh the snapshot.")
+        logger.info("Filters are read live at run start. Re-apply after changing other schedule settings.")
 
         warning = ""
         refresh_on = bool(snapshot.get("refresh_existing", False))
@@ -2417,10 +2471,8 @@ class Plugin:
         """Return the list of setting keys whose live value differs from the
         snapshot stored in the PeriodicTask at the last Apply Schedule.
 
-        Compared over the SNAPSHOT's keys only (intersection), so newly-added
-        settings introduced by a plugin upgrade don't raise a false "changed"
-        flag for users who never touched them. `schedule_`-prefixed keys are
-        excluded — they're cron config, not part of the rescan snapshot.
+        Compare operational snapshot keys, excluding filters which are read live
+        at task start. `schedule_` keys configure the cron itself.
         """
         import json
         try:
@@ -2431,7 +2483,23 @@ class Plugin:
             k: v for k, v in (current_settings or {}).items()
             if not k.startswith("schedule_")
         }
-        return sorted(k for k in stored if stored.get(k) != current.get(k))
+        filter_keys = {field['id'] for field in FILTER_FIELDS}
+        changed = {k for k in stored if k not in filter_keys and stored.get(k) != current.get(k)}
+        if 'series_workers' not in stored and current.get('series_workers', '3') != '3':
+            changed.add('series_workers')
+        return sorted(changed)
+
+    @staticmethod
+    def _scheduled_settings(snapshot):
+        # Operational schedule settings retain their applied snapshot. Filters
+        # always reflect the user's latest saved choices, including cleared rules.
+        from apps.plugins.models import PluginConfig
+        saved = PluginConfig.objects.get(key='vod2mlib').settings or {}
+        settings = dict(snapshot or {})
+        settings.update({field['id']: saved.get(field['id'], field['default'])
+                         for field in FILTER_FIELDS})
+        configuration(settings)
+        return settings
 
     def _schedule_test_fire(self, settings: Dict[str, Any], logger):
         """Enqueue the registered schedule's task on Celery, returning immediately.
@@ -2457,7 +2525,7 @@ class Plugin:
             return {"status": "error", "message": f"Stored task kwargs invalid JSON: {e}"}
 
         action = kwargs.get("action") or "rescan_all"
-        snapshot_settings = kwargs.get("settings") or {}
+        snapshot_settings = self._scheduled_settings(kwargs.get("settings") or {})
 
         if action not in self._valid_schedule_targets():
             return {"status": "error", "message": f"Stored action '{action}' is not a valid target."}
@@ -2497,7 +2565,7 @@ try:
         """
         import logging
         logger = logging.getLogger("vod2mlib.schedule")
-        result = action_runner.run_and_wait(action, {}, settings or {})
+        result = action_runner.run_and_wait(action, {}, Plugin._scheduled_settings(settings))
         try:
             from django.utils import timezone
             from django_celery_beat.models import PeriodicTask

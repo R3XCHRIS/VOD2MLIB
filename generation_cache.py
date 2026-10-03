@@ -11,8 +11,10 @@ from types import SimpleNamespace
 
 try:
     from .inventory import BATCH_SIZE, LOOKUP_BATCH_SIZE
+    from .metadata_filters import SETTING_KEYS, configuration
 except ImportError:
     from inventory import BATCH_SIZE, LOOKUP_BATCH_SIZE
+    from metadata_filters import SETTING_KEYS, configuration
 
 
 def signature(settings, values):
@@ -23,7 +25,7 @@ def signature(settings, values):
         'tmdb_tag_format', 'omit_stream_id', 'nfo_omit_title',
         'media_library_enabled', 'media_tv_mode',
     )
-    return json.dumps([[settings.get(k) for k in keys], values], default=str,
+    return json.dumps([[settings.get(k) for k in (*keys, *SETTING_KEYS)], values], default=str,
                       ensure_ascii=False, separators=(',', ':'))
 
 
@@ -46,7 +48,8 @@ def movie_key(row):
 
 def movie_candidates(rec, query, settings):
     fields = ('id', 'm3u_account_id', 'stream_id', 'movie__uuid', 'movie__name',
-              'movie__year', 'movie__tmdb_id', 'movie__imdb_id', 'category__name', 'movie__id')
+              'movie__year', 'movie__tmdb_id', 'movie__imdb_id', 'category__name', 'movie__id', 'movie__rating')
+    rules = configuration(settings)['movie']
     iterator = query.values_list(*fields).iterator(chunk_size=BATCH_SIZE)
     seen = set() if settings.get('dedupe_movies_across_categories', False) else None
     while True:
@@ -59,6 +62,8 @@ def movie_candidates(rec, query, settings):
         changed = []
         for row in rows:
             rec.report['generation_checked'] += 1
+            if not rules.evaluate(row[10], row[5], title=row[4])[0]:
+                continue
             if seen is not None:
                 if row[3] in seen:
                     rec.report['generation_deduped'] += 1
