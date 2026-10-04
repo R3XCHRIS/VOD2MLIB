@@ -4,46 +4,37 @@
 
 <h1 align="center">VOD to Media Library</h1>
 
-<p align="center">A Dispatcharr plugin that turns your VOD catalogue into a folder of <code>.strm</code> files (with optional NFO metadata) that media servers — Jellyfin, Emby, Kodi, ChannelsDVR — can index and play.</p>
+<p align="center">Generate <code>.strm</code> files and optional NFO metadata from Dispatcharr's stored VOD catalogue for a media server that supports stream-link files.</p>
 
-<p align="center">
-  <i>v1.18.0 — slug <code>vod2mlib</code></i>
-</p>
+<p align="center"><i>Stable v1.20.2 · plugin identifier <code>vod2mlib</code></i></p>
 
-> **Note on scheduled rescans.** The cron task routes via Dispatcharr's `dvr` Celery worker as a workaround for an upstream plugin-task-registration issue affecting the default prefork worker pool ([Dispatcharr#1244](https://github.com/Dispatcharr/Dispatcharr/issues/1244)). The routing is transparent — no user action required for new installs. If you originally set up your schedule on **v1.14.1 or earlier**, click `[SCHEDULE] Apply / Update` once after upgrading so the stored task picks up the new routing.
+The plugin supports native category eligibility, optional Emby ownership checks, safe managed-file cleanup, persistent inventory and incremental generation, independent movie/series filters, timing telemetry, and scheduling controlled entirely through Settings → Save.
 
-> **Plex users:** Plex does *not* play `.strm` files. Jellyfin and ChannelsDVR do. See [Plex compatibility](#plex-compatibility) below.
+**Dispatcharr owns catalogue fetching.** The plugin reads movie, series, and episode models already in Dispatcharr's database. It does not contact VOD provider APIs, run native importers, enrich metadata, or change Dispatcharr freshness timestamps or flags. New episodes can generate only after Dispatcharr stores them. Optional Emby requests check ownership of real media; they do not supply filter metadata.
 
 ## Credits
 
 - **Original author:** [shedunraid](https://github.com/shedunraid) — created v0.x–v1.3 ([upstream repo](https://github.com/shedunraid/VOD2MLIB)).
-- **Fork maintainer:** [R3XCHRIS](https://github.com/R3XCHRIS) — v1.4+ adds scheduling and bug fixes. Listed in the [official Dispatcharr Plugins catalogue](https://github.com/Dispatcharr/Plugins/tree/main/plugins/vod2mlib) since v1.14.3. Upstream has been dormant since early 2026; this fork continues maintenance.
-- MIT License.
+- **Fork maintainer:** [R3XCHRIS](https://github.com/R3XCHRIS) — v1.4+ adds scheduling and bug fixes. Listed in the [official Dispatcharr Plugins catalogue](https://github.com/Dispatcharr/Plugins/tree/main/plugins/vod2mlib).
+- [MIT License](LICENSE). Original copyright notices are retained.
 
----
+## Install and upgrade
 
-## Install
+1. Map persistent output storage into Dispatcharr and make the same files visible to your media server. Defaults are `/VODS/Movies` and `/VODS/Series`; see [Sharing the VODs folder](#sharing-the-vods-folder-with-media-servers).
+2. Install **VOD to Media Library** from Dispatcharr → Plugins → **Find Plugins** in the official catalogue. Alternatively, import `plugin-vod2mlib-v<version>.zip` from the [project releases](https://github.com/R3XCHRIS/VOD2MLIB/releases). For a separately packaged downstream build, follow that distribution's installation instructions.
+3. Enable the plugin, configure reachable paths and the Dispatcharr URL, and click **Save**.
 
-1. **Map a host folder to `/VODS` in your Dispatcharr container** (see [Sharing the VODs folder](#sharing-the-vods-folder-with-media-servers) for *why* this matters and how to share with other apps).
+The plugin identifier remains `vod2mlib`; upgrades preserve saved settings and schedule identity. Requires Dispatcharr **v0.24.0 or later**. Scheduling uses Django, Celery, and django-celery-beat supplied by Dispatcharr. Keep the `/data` volume persistent: plugin state lives outside the installation at `/data/vod2mlib`. Existing schedules retain their enabled state on upgrade; fresh installations default to scheduling disabled. After an upgrade, reload the plugin and ensure idle Celery workers load the current plugin task code before using the schedule. The plugin does not modify Dispatcharr source files.
 
-   ```yaml
-   # docker-compose.yml
-   services:
-     dispatcharr:
-       volumes:
-         - /opt/dispatcharr-vods:/VODS
-   ```
+## Quick start
 
-2. **Install the plugin** — two options:
+1. Let Dispatcharr populate its VOD catalogue and episodes. Enable the wanted categories for each active M3U account and VOD type in Dispatcharr.
+2. Save the plugin's movie root, series root, and reachable Dispatcharr URL. Configure optional filters and Emby integration before generating.
+3. Run **Catalogue snapshot** to inspect native eligibility and filter counts. If output already exists, use **Preview selective cleanup** to review proposed removals.
+4. Start with a small movie or series batch. Use **[ACTION] Status** to observe the background action and final result, then inspect the output in your media server.
+5. Increase batch sizes when satisfied. For regular runs, choose a Scheduled Action, enter a valid cron and timezone, turn **Enable Auto-Rescan** on, and **Save**.
 
-   - **From the official catalogue (recommended):** Dispatcharr → Plugins → **Find Plugins** → search "VOD to Media Library" → Install. Updates also surface here.
-   - **Manual:** download `plugin-vod2mlib-v<version>.zip` from a [GitHub release](https://github.com/R3XCHRIS/VOD2MLIB/releases), then Dispatcharr → Plugins → **Import** → upload the zip.
-
-3. Enable the plugin from the Plugins tab.
-
-Requires Dispatcharr **v0.24.0** or later. The auto-rescan feature additionally needs `django-celery-beat` (Dispatcharr ships with it).
-
----
+Saving settings does not run generation or remove media files immediately. Changes affect the next action; Save updates the scheduling trigger immediately. Enabled filters can remove verified generated output on the next applicable generation or selective cleanup run, including output created before the filters were enabled.
 
 ## Sharing the VODs folder with media servers
 
@@ -94,7 +85,7 @@ sudo exportfs -ra
 
 # On the media server host:
 sudo mount -t nfs dispatcharr-host:/opt/dispatcharr-vods /mnt/vods
-# ... then point Jellyfin/Plex/Emby at /mnt/vods/{Movies,Series}
+# ... then point Jellyfin/Emby/Kodi at /mnt/vods/{Movies,Series}
 ```
 
 SMB works equally well; pick whatever your stack already uses.
@@ -113,123 +104,203 @@ The `Dispatcharr URL` in plugin settings is **baked into every `.strm` file** �
 
 ## Settings
 
-The Settings tab is grouped into four sections:
+Every section in Settings has a heading and a description. Manual actions, cron runs, and Test fire read the same current saved configuration and defaults at execution start. A running job keeps that configuration until it finishes, fails, times out, or is stopped; later saves affect subsequent jobs. Persistent idle Celery workers wait for jobs and do not keep a separate settings snapshot.
 
-| Section | Field | What it does |
-|---|---|---|
-| **Paths & hosts** | Root Folder for Movies / Series | Paths inside the container (defaults `/VODS/Movies`, `/VODS/Series`) |
-|  | Dispatcharr URL | Externally-reachable URL of Dispatcharr (NOT `localhost`). Baked into every `.strm`. |
-| **Movies** | Batch Size | How many movies to process per click |
-|  | Generate Movie NFO Files | Toggle Kodi/Jellyfin metadata generation |
-|  | Omit `<title>` from NFO files | Leave the title out of movie/tvshow NFOs so Jellyfin/Emby take it from TMDB instead. Useful when your provider prefixes titles (`4K-A+`, `EN-TOP`, `AMZ`) — Jellyfin treats an NFO `<title>` as authoritative and won't override it. Off by default. |
-|  | Nest Movies by Category | Wrap each movie folder inside a subfolder named by its M3U category (off by default; movies without a category go to `Unassigned/`) |
-|  | Dedupe Movies Across Categories | When nesting is ON and a movie is tagged with multiple categories upstream, write under the first category only (alphabetical) instead of duplicating. No effect when nesting is OFF. Off by default (preserves 4K-vs-HD variant-stream behaviour). ⚠ Doesn't remove existing duplicate folders — `[⚠ DANGER] Clean up` + re-generate to migrate. |
-|  | Append TMDB ID to folder names | Append a TMDB id tag to Movie *and* Series folder names when a TMDB ID is known — e.g. `Cool Hand Luke (1967) {tmdb-378}/`. Media servers honour this as a forced exact metadata match. Off by default. ⚠ Doesn't rename existing folders in place — writes new names alongside the old ones; `[⚠ DANGER] Clean up` + re-generate to migrate cleanly. |
-|  | TMDB Folder Tag Format | Which tag convention to write: **Plex / ChannelsDVR** `{tmdb-123}` (default) or **Jellyfin / Emby** `[tmdbid-123]`. Each server ignores the other's format — Jellyfin/Emby users should switch this. Only applies when the setting above is ON. |
-|  | Don't pin .strm to a specific stream | Omit `?stream_id=` from `.strm` URLs so Dispatcharr can fail over across providers. Off by default; only useful with a Dispatcharr build that has VOD failover ([#1398](https://github.com/Dispatcharr/Dispatcharr/pull/1398)). |
-|  | Category Filter (include only) | Comma-separated **category-name** prefixes (e.g. `[EN],[FR]`, case-insensitive). Only generate content whose category starts with one of them — filters at query level so unwanted folders are never created. Applies to Movies *and* Series. Empty = all. ⚠ Matches the *category* name, not the title. |
-|  | Category Exclude (block list) | Comma-separated category-name prefixes to **skip** (e.g. `FOR ADULTS,XXX`). Applied after the include filter. Usually the right tool for "everything except adult content" — leave the filter empty and list what you don't want here. Content with no category is never excluded. |
-| **Series** | Batch Size (Series) | How many series to process per click |
-|  | Generate Series NFO Files | Toggle `tvshow.nfo` and per-episode `.nfo` |
-|  | Refresh Existing Series | Re-evaluate already-processed series for new episodes AND rewrite existing episode `.strm` URLs (cron-friendly). Preserves `tvshow.nfo` and episode `.nfo` edits. |
-|  | Nest Series by Category | Wrap each series folder inside a subfolder named by its M3U category (off by default; series without a category go to `Unassigned/`) |
-|  | Dedupe Series Across Categories | When nesting is ON and a series is tagged with multiple categories upstream, write under the first category only (alphabetical) instead of duplicating. No effect when nesting is OFF. Off by default. ⚠ Doesn't remove existing duplicate folders — `[⚠ DANGER] Clean up` + re-generate to migrate. |
-| **Auto-rescan schedule** | Schedule (cron) | Standard 5-field expression. Default `0 3 * * *` (daily 03:00) |
-|  | Schedule Timezone | IANA timezone the cron is interpreted in (e.g. `Europe/London`). Empty = UTC. Handles DST automatically. |
-|  | Scheduled Action | What the cron fires (full rescan recommended) |
+### Paths and output
 
-## Workflow
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| Root Folder for Movies / Series | `/VODS/Movies`, `/VODS/Series` | Output paths inside Dispatcharr; use persistent shared storage. |
+| Dispatcharr URL | Required | Reachable base URL written into STRMs. Localhost addresses are rejected. |
+| Batch Size (Movies) | 250 | Limit new/pending movie work; `all` removes the limit. |
+| Batch Size (Series) | 10 | Limit series work; `all` removes the limit. Existing filter/ownership cleanup runs independently of creation limits. |
+| Parallel Series Workers | 3 | Database-read and generation concurrency, from 1–6. Movies use 3 workers. |
+| Generate Movie / Series NFO Files | On | Write movie NFOs, `tvshow.nfo`, and episode NFOs when absent; preserve existing NFO edits. |
+| Omit `<title>` from NFO files | Off | Omit movie/show titles to let a media server identify them itself. Episode titles remain. |
+| Refresh Existing Series | Off | Revisit processed shows using stored episodes and refresh changed STRM URLs. No provider requests. |
+| Nest Movies / Series by Category | Off | Create category subfolders; uncategorized content uses `Unassigned/`. |
+| Dedupe Movies / Series Across Categories | Off | With nesting enabled, use the first category alphabetically instead of duplicate category output. |
+| Append TMDB ID to folder names | Off | Add a known TMDB ID using the selected format; unknown IDs are reported. |
+| TMDB Folder Tag Format | Plex / ChannelsDVR | `{tmdb-123}` or Jellyfin / Emby `[tmdbid-123]`. |
+| Don't pin STRMs to a specific provider stream | Off | Omit `?stream_id=`. Requires a Dispatcharr build that can resolve/fail over VOD without this parameter. |
+| Maximum action runtime (minutes) | 30 | Deadline for manual and scheduled background actions. |
 
-**First run.** Configure paths → click `[LIBRARY] Catalogue snapshot` to verify the plugin can see your VODs → click `[GENERATE] Movies` with Batch Size 10 → spot-check the output → scale up.
+Changing roots, category nesting, deduplication, or TMDB tag format does not rename or migrate old folders. Review existing output and ownership-protected cleanup before changing its layout. NFO title cleanup removes provider/quality tags; NFO writing can use title/category fallbacks, but those fallbacks are **not** metadata-filter inputs. The plugin does not download artwork files; an NFO may contain a stored poster URL for the media server to retrieve.
 
-**Scaling up.** Increase Batch Size, click again. Existing files are skipped, so each click only processes new ones. (If you need to refresh URLs in already-generated files — typically after changing the `Dispatcharr URL` setting — use `[GENERATE] Full rescan` instead; it rewrites all existing `.strm` while preserving your `.nfo` edits.)
+Native category eligibility requires an active account and an enabled category for that same account and VOD type. The old plugin Category Filter/Exclude fields are removed and ignored. Disabling a native category alone does not treat its source as removed or delete existing output; metadata filters and optional Emby/M3U cleanup are separate policies.
 
-**Auto-rescan.**
-1. Turn ON **Refresh Existing Series**.
-2. Set **Scheduled Action** to **Full rescan**.
-3. Click `[SCHEDULE] Apply / Update`.
-4. Verify with `[SCHEDULE] Show status` — last run / total runs populate after the first cron tick.
-5. Optional: click `[SCHEDULE] Test fire now` to immediately replay the scheduled action without waiting for the next cron tick.
+### NFO metadata and Emby
 
-The cron snapshots your settings at click-time. **Re-click Apply after changing any setting** to refresh the snapshot.
+The **NFO Metadata** settings group controls the plugin's movie/show/episode sidecar writing. If Emby manages metadata and its NFO saver is enabled, turn **Generate Movie NFO Files** and **Generate Series NFO Files** off to give Emby responsibility for writing metadata. Existing NFOs are not erased by changing these toggles. Defaults remain on for compatibility; saved choices are preserved.
 
-## Plex compatibility
+Emby integration is an independent real-media ownership check. It does not enable Emby's NFO reader/saver or replace Emby's metadata/image providers. Plugin NFOs can seed identification with stored Dispatcharr metadata, but cannot guarantee that Emby avoids additional metadata or artwork requests. The plugin does not overwrite existing Emby or edited NFOs.
 
-Plex does **not** play `.strm` files (it can index them but the URL inside doesn't play). This is a long-standing Plex limitation — it's been an unfulfilled feature request for 5+ years.
+### Independent metadata and title filters
 
-Workable alternatives:
+All filter rules are disabled by default. Movies and series have independent settings:
 
-- **Jellyfin alongside Plex.** Jellyfin plays `.strm` natively. Run it in a container next to Plex, point both at the same library folder (see [Sharing the VODs folder](#sharing-the-vods-folder-with-media-servers) above).
-- **ChannelsDVR's Personal Media** — works perfectly out of the box. Point CDVR at the Movies/Series root.
-- **Kodi** — works.
-- **Emby** — works.
+| Rule | Movies | Series |
+| --- | --- | --- |
+| Minimum Score | Stored numeric score, 0–10 setting | Separate stored numeric score |
+| Earliest / Latest Year | Stored release year | Stored debut year |
+| Missing Metadata | Keep unknowns by default; optionally reject | Independent policy |
+| Title Include / Exclude Regex | Original stored title | Independent patterns |
+| Genre Include / Exclude | Unavailable | Comma-separated complete genre names |
+
+Blank score/year bounds and blank include/exclude values disable their rules. Enabled rules combine with AND; score/year boundaries are inclusive. Years must be positive integers and earliest must not exceed latest. Missing, zero, nonnumeric, nonfinite, negative, or above-10 model scores are unknown; missing or invalid model years are unknown. **Reject unknowns** applies only to enabled rules, including enabled genre/title rules.
+
+Genre matching is case-insensitive and matches complete names. `Action & Adventure` and `Sci-Fi & Fantasy` each remain one genre. Only commas separate names in both configuration and stored genre metadata. Any included genre qualifies; any excluded genre rejects, even if another genre qualifies. Genres are plain text, not regex.
+
+Title patterns are Python regular expressions searched case-insensitively against the original stored title, before provider tags or years are stripped. An include requires a match; an exclude rejects a match and wins over include. For example:
+
+```text
+Title Exclude Regex: ^\s*(AF|AR)\s*[-:|]\s*
+```
+
+This matches `AF - Yard Palava`, `AR: Title`, and `AR|Title`. For bracketed tags use `^\s*\[(AF|AR)\]\s*`. Commas and whitespace remain part of the pattern, including quantifiers such as `{1,2}`. A country/language prefix rule is a provider naming heuristic, not verification of a production's country of origin.
+
+Filters use Dispatcharr model metadata directly, without NFOs, Emby enrichment, title-derived years, or category-derived genres. Age classifications such as `PG-13` are unknown numeric scores. Missing metadata varies by provider; **Keep unknowns** can retain many titles. Invalid scores, bounds, policies, or regex patterns are rejected before generation/reconciliation; settings Save also validates them while the plugin's save hooks are loaded.
+
+**Catalogue snapshot** reports separate movie/series eligible, passing, per-rule rejection, and retained-unknown counts. Counts are unique titles after native category/account eligibility and before Emby ownership checks. Rejection counts may overlap because one title can fail several rules.
+
+Each applicable run checks tracked output against current filters before creation batching. Movies generation removes failing movie output; series generation removes failing episode output; full rescan and selective cleanup cover both. Verified generated STRMs and matching generated NFOs can be removed. Edited/unverified STRMs, unresolved sources, and shared output with any passing or unresolved source remain protected. Legacy/edited NFOs are preserved or archived as described below. All bounded metadata lookups must finish before deletion starts. Filter NFO removal is automatic and independent of the separate Emby/M3U deletion-scope setting. Catalogue snapshot deletes nothing; Preview selective cleanup reports candidates without changing output files.
+
+Filters also archive **NFO-only title folders**, including legacy NFOs without recorded ownership hashes and NFOs written or edited by Emby. This handles enabling filters after unfiltered generation or after STRM-only cleanup. Complete, bounded Dispatcharr relation projections identify exact folders using the current roots/naming settings; all matching sources must fail. NFO contents never supply filter metadata. Folders with a remaining STRM, symlink, unrelated file, or unresolved identity stay in place. Historical folders with a different naming layout are not guessed or automatically moved.
+
+Archives retain the metadata under `/data/vod2mlib/filtered-nfo/<run>/<movie|series>/...`, with a `manifest.jsonl` mapping original paths to backups. `VOD2MLIB_STATE_DIR` changes that base. Keep state outside media-server library paths. Same-device moves are verified renames; cross-device copies are verified before originals are removed. Copy failures leave originals available for retry. Archives are retained until you remove them yourself; relaxing filters can regenerate eligible STRMs but does not automatically restore archived metadata. Rescan Emby after cleanup to remove cached empty-show entries.
+
+This archive pass runs independently of both NFO-generation toggles and **Deletion scope**, and is limited to the media types selected by the action. Preview reports the folders/NFOs it would archive, including metadata that would remain after planned STRM removal. Results include archive counts, protected/error counts, and the archive location.
+
+Enabled **Emby ownership cleanup** also archives NFO-only output for movies or whole shows already present in the selected real-media libraries, even if they pass all metadata filters. This prevents retained legacy/Emby NFOs from keeping an empty duplicate visible after its STRMs are removed. It uses the same complete Emby snapshot, conservative identity matching, both output roots, automatic timing and failure policy as existing ownership cleanup. Manual selective cleanup applies it immediately; a full-rescan-only or manual-only policy is respected during ordinary generation. Provider-ID conflicts and any unowned matching source protect shared paths.
+
+Whole-show ownership mode can archive a series folder containing only episode NFOs, with no `tvshow.nfo`. Episode mode preserves series NFO-only folders because whole-folder metadata cannot establish ownership of missing episode positions. Metadata is retained in the same persistent archive location, with `reason: ownership` in its recovery manifest. A failed Emby snapshot or incomplete native ownership lookup cannot trigger archival. Real-media files and their metadata are outside plugin output roots and are not moved.
+
+Rejected titles do not consume creation batch slots or trigger episode loading. Incremental signatures include filter settings and metadata, so changing stored metadata or relaxing rules causes affected candidates to be reconsidered and eligible output can return. Filter rejection never establishes upstream absence: M3U cleanup uses an unfiltered database source census.
+
+### Media-library integration and cleanup
+
+Optional integration supports **one Emby server** and is disabled by default. Jellyfin and Plex ownership adapters are not implemented.
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| Enable media-library integration | Off | Exclude media already owned as real files in the selected Emby libraries. |
+| Media server / Emby URL / API token | Emby; empty URL/token | Configure the server connection. |
+| Library names or IDs | Empty | Required when integration is enabled. Use **List media libraries** to find selections. |
+| TV handling | Skip entire owned show | Alternatively fill missing season/episode positions, including specials. |
+| Server-check failure | Continue with warning | Skip Emby exclusions/deletion for the run, or stop before output-file changes. |
+| Existing duplicate cleanup | Every generation | Alternatively full rescans only or disabled. Ownership exclusions still apply when deletion is disabled. |
+| Clean up M3U removals | Off | Remove verified output whose provider/account sources are absent from Dispatcharr. |
+| M3U cleanup timing | Full rescans | Alternatively manual selective cleanup only. |
+| Deletion scope | STRMs only | Optionally remove unedited generated NFOs for ownership/source cleanup. |
+
+Library names match exactly, case-insensitively, and are resolved each run; duplicate names require an ID. There is no all-libraries selection. Empty, missing, and ambiguous selections stop the action even under Continue with warning. Select real-media libraries; leave generated VOD/STRM libraries out of the check. STRM-only, remote, and virtual entries do not establish real ownership.
+
+Movies and shows match separately by TMDB/IMDb ID first. Where comparable IDs are unavailable, exact cleaned titles and known matching years can match. Conflicting IDs, unknown years, and fuzzy titles are retained. A show needs real non-STRM episodes to count as owned; missing-episode mode retains uncertain positions. Full rescans share one complete paginated Emby snapshot across the generators. Failed, interrupted, repeated, or inconsistent pagination never establishes ownership for deletion.
+
+Automatic duplicate cleanup checks managed output before generation, independently of creation limits. **Run selective cleanup** runs enabled server/source checks immediately regardless of their automatic timing, and also applies current filters. **Preview selective cleanup** reports those candidates without deleting output files; it may initialize/adopt inventory records but does not refresh Dispatcharr metadata or contact VOD providers.
+
+M3U cleanup uses account/provider stream identities, not UUIDs alone, and checks the complete **unfiltered** Dispatcharr database catalogue, including inactive accounts and disabled categories. Confirmed absence can delete output on the first successful complete check; there is no grace period. Failed/incomplete database checks disable source-removal deletion for that run. Dispatcharr must refresh its own catalogue before newly removed upstream items can be detected.
+
+Removal verifies the recorded STRM URL text and path containment. Edited STRMs, symlinks, files outside configured roots, ambiguous/unrecognized legacy files, artwork, subtitles, and unrelated files remain protected. Optional NFO deletion requires matching recorded generated hashes. Legacy/edited NFOs are never deleted on that basis; filters can instead archive a confirmed rejected NFO-only title folder as described above. Shared `tvshow.nfo` survives while protected episode STRMs remain. Empty directories may be pruned; roots remain. Media files themselves are never hashed.
+
+### Scheduling
+
+Turn **Enable Auto-Rescan** on with a valid five-field cron and IANA timezone, select the scheduled action, and **Save**. The default cron is `0 3 * * *`; an empty timezone means UTC. Invalid enabled cron/timezone/target settings are rejected before persistence. New installs default off; upgrades preserve existing schedule enabled state.
+
+Save immediately creates, updates, or disables the trigger through plugin-owned Django model signals. There is no Apply or Unschedule action. Turning the toggle off leaves manual actions available and makes queued cron/Test fire tasks skip execution; it does not cancel a job already running. Disabling the plugin also disables its trigger. Test fire requires scheduling enabled and reads current settings again when the worker executes it.
+
+The beat task keeps its stable identity `vod2mlib.auto_rescan`, routes `vod2mlib.scheduled_rescan` to the `dvr` queue, and stores no settings or credentials in its payload. Settings Save does not generate files. **[SCHEDULE] Show status** reports enabled state, registered cron/timezone, current target, last run, and run count. Persistent idle workers are distinct from an action's execution lifecycle.
+
+## Actions and observability
+
+| Action | Purpose |
+| --- | --- |
+| Catalogue snapshot | Read-only database eligibility and filter counts; no output deletion. |
+| Generate Movies / Series | Apply current filters and configured cleanup, then generate the selected media type. |
+| Full rescan | Scan and run both generators with URL refresh/series revisit semantics forced on; configured batch sizes still apply. |
+| List media libraries | List Emby names/IDs for explicit library selection. |
+| Preview selective cleanup | Show proposed removals without deleting output files. |
+| Run selective cleanup | Apply current filters and enabled ownership/source removal checks immediately. |
+| Rebuild / discover inventory | Rediscover recognizable STRMs and reset generation decisions; deletes no output and requires no Emby connection. |
+| Clean up Movies / Series | Remove verified managed output in that root; preserve edited/unverified files and follow deletion scope. |
+| Schedule status / Test fire | Inspect the trigger or enqueue its selected action using saved settings. |
+| Action status / Stop running action | Observe the background job or cancel its worker group. |
+
+Generation, inventory rebuild, library listing, preview, and cleanup use isolated background processes. Buttons return immediately; read final counters, warnings, and errors through **[ACTION] Status**. The supervisor enforces the saved runtime limit, including blocked network calls. Stop keeps completed changes; an interrupted inventory batch remains retryable. One process lock serializes plugin generation/cleanup; overlapping work is rejected rather than run against the same inventory concurrently.
+
+Changed STRM URLs are refreshed while preserving modification time; identical contents are left untouched. Existing NFOs are not overwritten. Full rescan does not fetch missing episodes from providers and does not bypass configured batch limits: choose `all` for both media types when you want all eligible pending work considered in one run.
+
+Telemetry is local. Detailed completed timings are in the action result and `/data/vod2mlib/timings.json` (or the overridden state directory); Action status shows a short phase summary and live progress. Series counters update approximately every two seconds. No telemetry is sent externally, and timing records omit credentials, settings, URLs, and output paths.
+
+Measurements include wall/CPU seconds, item/batch counts, and phases for Emby, database catalogue reads, discovery, filter checks, cleanup, movie/series generation, episode reads, output, and inventory/checkpoint work. `episode_sql` is SQL execution; `episode_query` includes query/hydration; `episode_load` covers the complete read. `cleanup_strm_io` is cumulative verification/removal time across filesystem workers. `filter_cleanup_batch` and `cleanup_batch` include serialized inventory finalization and pruning. Parent phases include child measurements, and concurrent worker durations can exceed elapsed action time; do not add them together. Worker phases use thread CPU time, while action totals use process CPU time and exclude supervisor startup. There is no provider-fetch phase.
+
+`filter_nfo_metadata_read` measures native identity/filter projections for legacy folders; `filter_nfo_archive` measures folder inspection and archiving. `filter_nfo_folders_*`, `filter_nfo_candidates`, `filter_nfo_archived`, and `filter_nfo_errors` distinguish archived metadata from deleted STRMs/NFOs.
+
+`ownership_nfo_metadata_read`, `ownership_nfo_archive` and corresponding `ownership_nfo_*` counters report Emby-excluded NFO-only metadata separately. Preview accounts for the configured STRM/NFO deletion scope and never counts the same folder twice when both filters and ownership exclude it.
+
+## Inventory, incremental generation, and performance
+
+State lives at `/data/vod2mlib/inventory.sqlite3`. `VOD2MLIB_STATE_DIR` can override the location; keep it on persistent storage outside plugin installations and both media roots. Inventory upgrades use schema versioning and preserve recorded ownership and generated-NFO hashes.
+
+Initial discovery and explicit rebuild adopt recognizable Dispatcharr STRMs using proxy URLs and complete stored source metadata. Ambiguous or unrelated files stay unmanaged. Successful discovery markers are retained per root and Dispatcharr connection context, so routine runs avoid rescanning every directory. New roots, changed connection context, missing/rebuilt inventory, and incomplete discovery cause a new scan. A cold first run can therefore be much slower than a routine run.
+
+Routine generation uses persistent decisions for managed output. Movies stream eligible identities/output-affecting fields before hydrating new or changed candidates. Episodes are loaded from Dispatcharr before unchanged output decisions are skipped. Settings, metadata, output-layout/URL changes, Emby ownership, and plugin deletions invalidate relevant decisions. Unchanged runs avoid statting every managed STRM. When files are added, changed, or removed externally, run **Rebuild / discover inventory**, then generation; missing entire roots invalidate decisions automatically.
+
+Database/filter reads are bounded projections. Title regexes run in the shared Python evaluator over those projections, not through a SQLite REGEXP query. Inventory changes commit in batches of up to 1,000 records with normal SQLite durability. Generation queues are bounded and inventory records commit before their completion checkpoints. Metadata-filter deletion uses three bounded filesystem workers; shared NFO handling, SQLite finalization, and parent pruning remain serialized. Season directories are prepared once per show. Worker-count changes do not invalidate output signatures.
+
+For comparisons, hold saved settings, Dispatcharr models/episodes, selected Emby data, inventory state, and filesystem layout constant. Record cold discovery separately from routine runs. Use telemetry to find the dominant phase; cumulative parallel timing is not end-to-end latency. No fixed runtime is promised for a catalogue or storage system.
 
 ## Troubleshooting
 
-**"Unknown action" error in the toast.** Dispatcharr cached an old version of the plugin module. `docker restart dispatcharr` clears it. Toggling enable/disable on the plugin also forces a reload.
+- **Fewer exclusions than expected:** inspect Catalogue snapshot and the actual model values. Keep unknowns retains missing years/scores/genres. Genre names are complete comma-delimited names; title prefixes do not prove country of origin. Emby exclusions are separate from snapshot filter counts.
+- **Old filtered output remains:** run the applicable generator or selective cleanup. Preview never deletes output. Edited/unverified files and unresolved/shared sources are protected; check the removal counters and warnings. Disabling a native category alone is not a deletion policy.
+- **No new episodes:** check that Dispatcharr has stored episode relations, then use Refresh Existing Series or Full rescan. The plugin does no provider refresh. Also check batches, filters, and real-media ownership.
+- **A file removed outside the plugin is not recreated:** run Rebuild / discover inventory, then generation, to invalidate persistent decisions.
+- **Schedule does not fire:** enable Auto-Rescan and Save, check Schedule status, ensure beat and the `dvr` worker are running with current plugin code, then use Test fire and Action status. Read Dispatcharr logs for validation or task errors.
+- **Unknown action or old fields after upgrading:** reload the plugin; stale worker task code may require restarting idle workers. Apply and Unschedule are intentionally removed.
+- **Files are invisible to the media server:** check shared storage mappings and read permissions. A container path may differ from the media server's path while referring to the same host files.
+- **Playback fails:** inspect the STRM URL and test it from the media server's network. Fix the Dispatcharr URL and use Full rescan to update changed URLs. Catalogue/UUID changes, provider availability, and playback connection limits are Dispatcharr/player concerns; this plugin does not patch playback handling.
+- **Unexpected artwork downloads:** artwork fetching is controlled by the media server. Configure its metadata/image providers before indexing a large VOD library. NFOs only contain available stored metadata and references; they do not guarantee complete offline metadata.
+- **Naming/layout changes leave old folders:** generation does not migrate old paths. Preview and review ownership-protected cleanup before recreating output.
 
-**The Run button drops below the action title instead of right-aligning.** That's Dispatcharr's UI flex-wrap when the description spans 2+ lines. We keep descriptions single-line to avoid this; if it happens again, the description is too long for your viewport.
+This plugin has no Plex playback adapter. The player must support STRM URLs; successful indexing alone does not establish playback compatibility.
 
-**Cron task registered but didn't fire.** Check `[SCHEDULE] Show status` — `last_run` should populate after the first scheduled tick. If still `never` after the expected time:
-- Verify Celery beat is running in your Dispatcharr deployment.
-- Check container logs for `core.scheduling Updated periodic task 'vod2mlib.auto_rescan'`.
-- Click `[SCHEDULE] Test fire now` to confirm the task itself works (proves it's a scheduling-layer issue, not a plugin issue).
+## Development and architecture
 
-**Schedule fires but no new files appear.** Most likely: `Refresh Existing Series` is OFF and your existing series already have folders, so the cron only adds *new* series. Toggle Refresh Existing ON, click Apply Schedule again to update the snapshot.
+The entry point is `plugin.py` (`Plugin.fields`, `Plugin.actions`, `Plugin.run`). `plugin.json` mirrors UI metadata/version and links to the project. Ship **all runtime modules** in a release:
 
-**Media server can't see the generated files at all.** The host path isn't shared with the media server's process. See [Sharing the VODs folder](#sharing-the-vods-folder-with-media-servers).
+| Module | Responsibility |
+| --- | --- |
+| `action_runner.py` | Supervisor, isolated action process, deadlines, cancellation, status. |
+| `metadata_filters.py` | Shared pure rules, projected eligibility, preview counts. |
+| `filter_cleanup.py` | Bounded checks and removal of managed output failing current filters. |
+| `orphan_nfo.py` | Native path matching, preview and verified archival of rejected NFO-only title folders. |
+| `reconciliation.py` | Emby/source checks, discovery, action telemetry, inventory queues. |
+| `media_library.py` | Emby adapter, complete snapshots, conservative identity/ownership matching. |
+| `inventory.py` | SQLite state, ownership verification, containment, batched writes/removals. |
+| `generation_cache.py` | Persistent incremental movie and episode decisions. |
+| `schedule_settings.py` | Plugin-owned validation/save/delete signals and schedule-state upgrade. |
 
-**Media server sees the files but playback fails immediately.** Open one of the `.strm` files in a text editor — it contains a single URL. Try fetching that URL from the machine running your media server (`curl -I <url>`). If that fails, the `Dispatcharr URL` setting isn't reachable from there. Fix the URL, then run `[GENERATE] Full rescan` — every existing `.strm` is rewritten with the new URL, and your `.nfo` edits are preserved. (Pre-v1.13.0 you had to `[⚠ DANGER] Clean up` then regenerate, which also wiped any user `.nfo` edits.)
-
-**Playback worked initially but starts failing after a few days / after a Dispatcharr refresh.** (Symptom: Emby/Jellyfin reports "No compatible streams" on titles that previously played fine; CDVR reports 404s on files that worked yesterday.) Upstream Dispatcharr bug — VOD movie/episode UUIDs are regenerated on every M3U refresh, so the URLs your media server cached at library-scan time become orphaned ([Dispatcharr#961](https://github.com/Dispatcharr/Dispatcharr/issues/961)). The plugin can't fix this externally — rewriting `.strm` files doesn't help because Emby/Jellyfin only re-reads them at library-scan time, not on playback retry. The read-side fix [Dispatcharr#1315](https://github.com/Dispatcharr/Dispatcharr/pull/1315) is **merged to `dev`** (verified working in production): switch your Dispatcharr container from `:latest` to `:dev` and dead-UUID requests will resolve via the stable `stream_id` that every VOD2MLIB URL already carries.
-
-```yaml
-# docker-compose.yml
-services:
-  dispatcharr:
-    image: ghcr.io/dispatcharr/dispatcharr:dev    # was :latest
-    # ...rest of your config
-```
-
-Closed [Dispatcharr#973](https://github.com/Dispatcharr/Dispatcharr/pull/973) would be the complementary write-side root fix (preserves UUIDs across refresh instead of just tolerating the orphaning); it's stalled and needs reviving. This note will be removed once a tagged Dispatcharr release contains the fix.
-
-**Jellyfin/Emby downloads tens of GB of images after adding a VOD library.** Not a plugin issue, but it bites hard: media servers fetch artwork for *every* item, and a large VOD library can pull 70 GB+ before you notice.
-
-The important part is **turn off the library's *metadata downloaders*, not just its image fetchers.** Unticking image fetchers stops posters and backdrops, but **cast/crew ("people") images are fetched separately and there is currently no setting to disable them** in Jellyfin — it's a standing [feature request](https://features.jellyfin.org/posts/1646/disable-actors-metadata), and excluding a provider from the library's image fetchers [does not stop them](https://forum.jellyfin.org/t-exclude-tvdb-people-cast-crew-images). With thousands of titles, those people images are a large share of the total. Turning the *metadata downloaders* off means Jellyfin never builds a cast list for the item in the first place, so there are no people to fetch images for.
-
-That works here because **this plugin's NFOs already carry the metadata**: title, year, genre(s), plot, rating, TMDB id, and a poster URL. So you can point Jellyfin at a VOD library with online metadata and image fetching fully off and still get a populated, artworked library — it reads what's in the `.nfo` instead of going to the internet per item. (VOD2MLIB never writes `<actor>` entries, so nothing here creates people records.)
-
-In Jellyfin: Dashboard → Libraries → (your VOD library) → Manage Library, then untick the metadata downloaders and image fetchers. Do this **before** the first scan. If you've already been hit, delete the cached images and re-scan with them off — a routine scan won't re-fetch them, but note that a *metadata refresh* will (check the library's periodic-refresh cadence), and deleted cast images are re-fetched lazily when someone clicks a blank actor tile, [which happens even with online providers disabled](https://github.com/jellyfin/jellyfin/issues/8288). Turning the metadata downloaders off avoids that too, since no cast list is built in the first place.
-
-**Want to browse and hand-pick VOD into Emby rather than import everything?** [VodLink](https://github.com/jdfrey1/vodlink) reads this plugin's `.strm` + `.nfo` output and lets you browse/search your VOD catalogue and link individual movies and series into an Emby library directory, instead of pointing Emby at the whole generated tree. It also runs a stream proxy that converts `HEAD` to `GET` and caches Dispatcharr session URLs, so seeking and resume behave. Emby-specific, Docker-based. Keep `Generate NFO Files` ON if you use it, since it reads those `.nfo` files. For coarser filtering at generation time, use `Category Filter` / `Category Exclude` (above).
-
-**"All profiles at capacity" error when playing on TiviMate / Android.** Not a `.strm` issue — this is a known Dispatcharr connection-counting bug ([Dispatcharr #451](https://github.com/Dispatcharr/Dispatcharr/issues/451)). TiviMate (and similar Android players) makes multiple simultaneous Range requests to probe a file before playback; Dispatcharr counts each request as a separate provider connection, blowing through `max_streams=1` before playback even starts. The community plugin [`dispatcharr_vod_fix`](https://github.com/cedric-marcoux/dispatcharr_vod_fix) patches Dispatcharr's request handling to track slots by (client IP + content UUID) so multiple Range requests share one slot. Install it alongside this plugin if your Android clients can't play VOD content.
-
-**Folders named `Aladdin (2026) (2026)` (duplicate year).** This was a bug in v1.4 and earlier. Fixed in v1.5+ but pre-existing duplicate-year folders aren't auto-renamed. Run `[⚠ DANGER] Clean up Movies` once to remove them, then re-run `[GENERATE] Movies` to regenerate cleanly. (Cleanup deletes only `.strm`/`.nfo` — user-added subtitles/posters survive.)
-
-**Generate Series fails for some series.** The summary lists the failed series names with their errors. Common causes: M3U upstream timeout, malformed episode metadata. The plugin continues with the rest of the batch.
-
-**`localhost`/`127.0.0.1` in Dispatcharr URL.** The plugin refuses to write `.strm` with a localhost URL — your media server can't resolve it. Use the container's reachable IP/hostname.
-
-## Development
-
-Pure-helper unit tests live in `tests/`. From the repo root:
+Scheduling uses Django model signals; Dispatcharr files are unchanged. Runtime dependencies come from Dispatcharr. Tests include pure helpers, model-backed generation/cleanup fixtures, process/deadline checks, and a real Django/beat Save integration test using an isolated SQLite database; a running Dispatcharr or live provider/Emby server is not required.
 
 ```bash
-python3 -m pytest tests/ -v
+python -m pip install pytest django celery django-celery-beat
+python -m pytest -q
+python -m compileall -q plugin.py action_runner.py metadata_filters.py filter_cleanup.py orphan_nfo.py reconciliation.py media_library.py inventory.py generation_cache.py schedule_settings.py
 ```
 
-The tests don't need Django or a running Dispatcharr — they exercise `_clean_title`, `_strip_trailing_year`, `_sanitize_filename`, `_parse_cron`, `_extract_genres`, `_mask_url`, and the path-building helpers in isolation. 45 tests, ~50ms.
+GitHub CI tests Python 3.10 and 3.12. The v1.20.2 suite passes 457 tests on Linux and 452 tests with 5 platform-specific skips on Windows. Behavioral changes should update the README and [CHANGELOG.md](CHANGELOG.md), keep Python/manifest fields and versions aligned, and include all runtime modules when publishing. ZIP publication verifies checksums before updating the catalogue feed; do not replace an existing version's package with different bytes.
 
-The bundled logo is reproducible — replace `tools/source_logo.png` and run `python3 tools/build_logo.py` to regenerate `logo.png` at 512×512 with NEAREST resampling (preserves pixel-art crispness).
+The bundled logo is reproducible: replace `tools/source_logo.png` and run `python tools/build_logo.py`.
 
-## Architecture (for contributors)
+## Release history
 
-- The plugin is a single `plugin.py` declaring a `Plugin` class with `fields`, `actions`, and `run()` per Dispatcharr's plugin contract.
-- `plugin.json` is the manifest the [Dispatcharr/Plugins catalogue](https://github.com/Dispatcharr/Plugins) reads. Dispatcharr's runtime reads action metadata from the Python class — the JSON is for the catalogue and pre-enable preview.
-- Schedule registration uses `django-celery-beat`'s `PeriodicTask` + `CrontabSchedule`. The cron-fired task is a module-level `@shared_task` named `vod2mlib.scheduled_rescan` that constructs a fresh `Plugin()` and dispatches.
-- Settings are snapshotted into the PeriodicTask's `kwargs` at Apply-time so the cron runs with deterministic config. Re-click Apply to refresh.
+| Version | Changes |
+| --- | --- |
+| 1.20.2 | Archive filter- and Emby ownership-excluded NFO-only folders with recovery manifests, preview and telemetry; clarify NFO controls; preserve right-aligned action buttons. |
+| 1.20.1 | One saved configuration for actions/schedules; Save validates and applies cron/timezone; enable toggle; legacy schedule-state preservation; Apply/Unschedule removed. |
+| 1.20.0 | Independent score/year/unknown/genre and title regex filters; next-run managed-output removal; database-only metadata/episodes; finer telemetry and faster output/cleanup handling. |
+| 1.19.0 | Optional Emby reconciliation, safe source/ownership cleanup, persistent SQLite inventory/discovery, incremental decisions, isolated actions, deadlines/cancellation, and timing telemetry. |
+| 1.18.1 | Native per-account/category eligibility; legacy category-prefix fields removed. |
 
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+See [CHANGELOG.md](CHANGELOG.md) for earlier release notes and [Credits](#credits) for attribution.

@@ -1,6 +1,6 @@
 {
   "name": "VOD to Media Library",
-  "version": "1.18.0",
+  "version": "1.20.2",
   "description": "VOD → media library bridge. Generates .strm + NFO files from Dispatcharr's VOD catalogue, with optional cron-driven auto-rescan that picks up newly-added episodes.",
   "author": "R3XCHRIS",
   "license": "MIT",
@@ -13,7 +13,7 @@
       "id": "_about",
       "label": "About",
       "type": "info",
-      "description": "Workflow:\n  1. Configure paths below.\n  2. Actions → Scan → see catalogue totals.\n  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n  4. (Optional) Turn ON Refresh Existing Series, set cron, click Apply Schedule for nightly auto-rescan.\n\nDocs: https://github.com/R3XCHRIS/VOD2MLIB"
+      "description": "Workflow:\n  1. Configure paths below.\n  2. Actions → Scan → see catalogue totals.\n  3. Actions → Generate Movies / Generate Series (start with Batch Size 10).\n  4. (Optional) Turn ON Refresh Existing Series, enable Auto-Rescan, set cron, and Save for nightly auto-rescan.\n\nDocs: https://github.com/R3XCHRIS/VOD2MLIB"
     },
     {
       "id": "_section_paths",
@@ -44,6 +44,33 @@
       "help_text": "Required. The externally-reachable URL of your Dispatcharr instance — this gets baked into every .strm file, so it must resolve from wherever your media server runs. localhost works ONLY if the media server is on the same host with shared network namespace; otherwise use a routable LAN IP/hostname. Don't forget to click Save."
     },
     {
+      "id": "_section_nfo",
+      "label": "[NFO METADATA]",
+      "type": "info",
+      "description": "Choose who writes metadata: this plugin or Emby. Disable both generation toggles if Emby manages metadata and saves NFOs. Emby integration checks real-media ownership independently. Filters and enabled Emby ownership cleanup archive excluded NFO-only folders even when generation is off or Deletion scope is STRMs only."
+    },
+    {
+      "id": "generate_nfo",
+      "label": "Generate Movie NFO Files",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Write Dispatcharr metadata when the movie NFO is absent. Turn this off if Emby manages metadata and saves its own NFOs. Emby integration only checks library ownership; it does not configure metadata saving. Turning this off preserves existing NFOs. Filters and enabled Emby ownership cleanup archive excluded NFO-only folders independently of this toggle and Deletion scope."
+    },
+    {
+      "id": "generate_series_nfo",
+      "label": "Generate Series NFO Files",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Write Dispatcharr metadata when tvshow.nfo or an episode NFO is absent. Turn this off if Emby manages metadata and saves its own NFOs. Existing NFOs are preserved during generation. Filters and enabled Emby ownership cleanup archive excluded NFO-only folders independently of this toggle and Deletion scope."
+    },
+    {
+      "id": "nfo_omit_title",
+      "label": "Omit <title> from NFO files",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Leave the `<title>` element OUT of generated movie and tvshow NFO files. Jellyfin (and Emby) treat a `<title>` in the NFO as authoritative and will NOT override it from TMDB — so if your provider prefixes titles with tags like `4K-A+`, `EN-TOP` or `AMZ`, that junk becomes the displayed name. With this ON the plugin still writes the NFO (IDs, plot, genres, rating, poster) but omits the title, letting your media server take the clean title from TMDB via the `<tmdbid>` we already emit. OFF by default (unchanged behaviour). Note v1.18.0 also cleans provider junk out of the title, so try that first — this is the belt-and-braces option. Episode NFOs always keep their title (media servers match episodes by season/episode number)."
+    },
+    {
       "id": "_section_movies",
       "label": "[MOVIES]",
       "type": "info",
@@ -55,29 +82,36 @@
       "type": "select",
       "default": "250",
       "options": [
-        {"value": "10", "label": "10 movies"},
-        {"value": "100", "label": "100 movies"},
-        {"value": "200", "label": "200 movies"},
-        {"value": "250", "label": "250 movies"},
-        {"value": "500", "label": "500 movies"},
-        {"value": "1000", "label": "1000 movies"},
-        {"value": "all", "label": "All movies"}
+        {
+          "value": "10",
+          "label": "10 movies"
+        },
+        {
+          "value": "100",
+          "label": "100 movies"
+        },
+        {
+          "value": "200",
+          "label": "200 movies"
+        },
+        {
+          "value": "250",
+          "label": "250 movies"
+        },
+        {
+          "value": "500",
+          "label": "500 movies"
+        },
+        {
+          "value": "1000",
+          "label": "1000 movies"
+        },
+        {
+          "value": "all",
+          "label": "All movies"
+        }
       ],
       "help_text": "Number of movies to process in this run. Start small (10) to verify, then scale up."
-    },
-    {
-      "id": "generate_nfo",
-      "label": "Generate Movie NFO Files",
-      "type": "boolean",
-      "default": true,
-      "help_text": "Create .nfo metadata files alongside each movie .strm."
-    },
-    {
-      "id": "nfo_omit_title",
-      "label": "Omit <title> from NFO files",
-      "type": "boolean",
-      "default": false,
-      "help_text": "Leave the `<title>` element OUT of generated movie and tvshow NFO files. Jellyfin (and Emby) treat a `<title>` in the NFO as authoritative and will NOT override it from TMDB — so if your provider prefixes titles with tags like `4K-A+`, `EN-TOP` or `AMZ`, that junk becomes the displayed name. With this ON the plugin still writes the NFO (IDs, plot, genres, rating, poster) but omits the title, letting your media server take the clean title from TMDB via the `<tmdbid>` we already emit. OFF by default (unchanged behaviour). Note v1.18.0 also cleans provider junk out of the title, so try that first — this is the belt-and-braces option. Episode NFOs always keep their title (media servers match episodes by season/episode number)."
     },
     {
       "id": "nest_movies_by_category",
@@ -106,8 +140,14 @@
       "type": "select",
       "default": "plex",
       "options": [
-        {"value": "plex", "label": "Plex / ChannelsDVR — {tmdb-123}"},
-        {"value": "jellyfin", "label": "Jellyfin / Emby — [tmdbid-123]"}
+        {
+          "value": "plex",
+          "label": "Plex / ChannelsDVR — {tmdb-123}"
+        },
+        {
+          "value": "jellyfin",
+          "label": "Jellyfin / Emby — [tmdbid-123]"
+        }
       ],
       "help_text": "Which convention to use for the TMDB folder tag — media servers disagree, and each ignores the other's format. `Plex / ChannelsDVR` writes `Cool Hand Luke (1967) {tmdb-378}`; `Jellyfin / Emby` writes `Cool Hand Luke (1967) [tmdbid-378]`. Only has an effect when `Append TMDB ID to folder names` is ON. Defaults to Plex for backwards compatibility with libraries generated before v1.16.1 — if you use Jellyfin or Emby, switch this to `jellyfin` or the tag is silently ignored by your server. ⚠ MIGRATION: changing the format renames every folder, and the plugin does NOT rename in place — the new names are written ALONGSIDE the old ones. Run `[⚠ DANGER] Clean up Movies` / `Series` first, then re-generate."
     },
@@ -117,20 +157,6 @@
       "type": "boolean",
       "default": false,
       "help_text": "When ON, .strm URLs omit ?stream_id=, so Dispatcharr's VOD proxy resolves and fails over across every account carrying the title instead of being locked to the one relation this plugin happened to pick. Requires a patched Dispatcharr with VOD failover support (PR #1398). When OFF (default), the .strm is pinned to this plugin's selected relation, matching original behavior."
-    },
-    {
-      "id": "category_filter",
-      "label": "Category Filter (include only)",
-      "type": "string",
-      "default": "",
-      "help_text": "Only generate content whose M3U CATEGORY name STARTS WITH one of these comma-separated prefixes — e.g. `[EN],[FR]` or `EN`. Case-insensitive. Leave empty to generate all (active) content. Ideal for large multi-language catalogues where you only want one or two languages: it filters at the database-query level, so unwanted folders are never created (no generate-then-clean-up waste). Applies to BOTH Movies and Series. When a filter is set, content with no category — or a category that doesn't match — is skipped. ⚠ This matches the CATEGORY name, NOT the movie/series title — many providers put a language tag in the title (`|EN| The Matrix`) while the category is something else entirely (`FOR ADULTS`). Run `[LIBRARY] Catalogue snapshot` to print your real category names and see exactly which ones your filter matches."
-    },
-    {
-      "id": "category_exclude",
-      "label": "Category Exclude (block list)",
-      "type": "string",
-      "default": "",
-      "help_text": "Skip content whose M3U CATEGORY name starts with any of these comma-separated prefixes — e.g. `FOR ADULTS,XXX`. Case-insensitive. Applied AFTER the include filter, so you can use both together. This is usually what you want for 'everything EXCEPT adult content': leave `Category Filter` empty and put the unwanted categories here, rather than trying to list every category you do want. Content with no category is never excluded. Run `[LIBRARY] Catalogue snapshot` to see your exact category names. ⚠ Already-generated folders are not removed when you add an exclude — run `[⚠ DANGER] Clean up` once, then re-generate."
     },
     {
       "id": "_section_series",
@@ -144,30 +170,80 @@
       "type": "select",
       "default": "10",
       "options": [
-        {"value": "1", "label": "1 series (testing)"},
-        {"value": "5", "label": "5 series"},
-        {"value": "10", "label": "10 series"},
-        {"value": "25", "label": "25 series"},
-        {"value": "50", "label": "50 series"},
-        {"value": "100", "label": "100 series"},
-        {"value": "250", "label": "250 series"},
-        {"value": "all", "label": "All series (may time out — use the schedule)"}
+        {
+          "value": "1",
+          "label": "1 series (testing)"
+        },
+        {
+          "value": "5",
+          "label": "5 series"
+        },
+        {
+          "value": "10",
+          "label": "10 series"
+        },
+        {
+          "value": "25",
+          "label": "25 series"
+        },
+        {
+          "value": "50",
+          "label": "50 series"
+        },
+        {
+          "value": "100",
+          "label": "100 series"
+        },
+        {
+          "value": "250",
+          "label": "250 series"
+        },
+        {
+          "value": "all",
+          "label": "All series (may time out — use the schedule)"
+        }
       ],
-      "help_text": "Number of series to process per click (episodes are auto-fetched for each, so series are much slower than movies). ⚠ This button runs synchronously and your reverse proxy will usually cut it off after ~60s with a 504 — the run keeps going server-side, but you lose the result. For a big catalogue don't use 'All' here: set the cron to 'Full rescan' and click [SCHEDULE] Apply / Update. Scheduled runs execute on the Celery worker with no HTTP timeout."
+      "help_text": "Number of series to process per run using episodes stored in Dispatcharr. Actions run in the background. For automatic full rescans, select Full rescan, enable Auto-Rescan, and Save."
     },
     {
-      "id": "generate_series_nfo",
-      "label": "Generate Series NFO Files",
-      "type": "boolean",
-      "default": true,
-      "help_text": "Create tvshow.nfo and per-episode .nfo metadata files."
+      "id": "series_workers",
+      "label": "Parallel Series Workers",
+      "type": "select",
+      "default": "3",
+      "options": [
+        {
+          "value": "1",
+          "label": "1"
+        },
+        {
+          "value": "2",
+          "label": "2"
+        },
+        {
+          "value": "3",
+          "label": "3"
+        },
+        {
+          "value": "4",
+          "label": "4"
+        },
+        {
+          "value": "5",
+          "label": "5"
+        },
+        {
+          "value": "6",
+          "label": "6"
+        }
+      ],
+      "help_text": "Concurrent series generation tasks using Dispatcharr database metadata. Default 3; increase after measuring database and storage performance. Movies continue using 3 workers."
     },
     {
       "id": "refresh_existing",
       "label": "Refresh Existing Series (rescan-friendly)",
       "type": "boolean",
       "default": false,
-      "help_text": "Re-evaluate series that already have folders, picking up new episodes added upstream AND rewriting existing episode .strm files so they pick up the current Dispatcharr URL. .nfo files (including tvshow.nfo) are only written when missing, so your edits are preserved. Off = fast manual iteration (skip done series); On = scan everything for new content and refresh existing URLs. Turn ON before clicking Apply Schedule for cron rescans of target 'generate_series'. Note: 'rescan_all' forces this ON regardless."
+      "help_text": "Re-evaluate existing series using only metadata and episodes already stored in Dispatcharr. Include newly stored episodes and refresh changed managed STRM/NFO output while preserving edited files. No provider requests or native metadata updates occur. Off skips already-generated series; On rechecks them. Full rescan forces this On. Refresh or fetch episode data in Dispatcharr before generating if its database is incomplete or stale."
     },
     {
       "id": "nest_series_by_category",
@@ -187,14 +263,21 @@
       "id": "_section_schedule",
       "label": "[AUTO-RESCAN SCHEDULE]",
       "type": "info",
-      "description": "Configure the cron job. Click Apply in the Actions tab to register or update."
+      "description": "Scheduled jobs use the same saved settings as manual actions. Enable auto-rescan and Save to register or update a valid cron schedule; disable it and Save for manual actions only."
+    },
+    {
+      "id": "schedule_enabled",
+      "label": "Enable Auto-Rescan",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Enable scheduled runs with a valid cron and timezone. Save applies all settings. Turn off and Save for manual actions only."
     },
     {
       "id": "schedule_cron",
       "label": "Auto-Rescan Schedule (cron)",
       "type": "string",
       "default": "0 3 * * *",
-      "help_text": "Standard 5-field cron: 'minute hour day-of-month month day-of-week'. Default '0 3 * * *' = every day at 03:00. Used by Apply Schedule."
+      "help_text": "Standard 5-field cron: 'minute hour day-of-month month day-of-week'. Default '0 3 * * *' = every day at 03:00. Validated when scheduling is enabled; Save applies changes."
     },
     {
       "id": "schedule_timezone",
@@ -210,19 +293,359 @@
       "type": "select",
       "default": "rescan_all",
       "options": [
-        {"value": "scan_all_vods", "label": "Scan only (totals)"},
-        {"value": "generate_movies", "label": "Movies only"},
-        {"value": "generate_series", "label": "Series only"},
-        {"value": "rescan_all", "label": "Full rescan (movies + series)"}
+        {
+          "value": "scan_all_vods",
+          "label": "Scan only (totals)"
+        },
+        {
+          "value": "generate_movies",
+          "label": "Movies only"
+        },
+        {
+          "value": "generate_series",
+          "label": "Series only"
+        },
+        {
+          "value": "rescan_all",
+          "label": "Full rescan (movies + series)"
+        }
       ],
       "help_text": "Which action the scheduler should run on each tick. 'Full rescan' is recommended."
+    },
+    {
+      "id": "_section_media_library",
+      "label": "[MEDIA LIBRARY & CLEANUP]",
+      "type": "info",
+      "description": "Skip content already available as real media and optionally remove generated files for duplicates or M3U removals."
+    },
+    {
+      "id": "media_library_enabled",
+      "label": "Enable media-library integration",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Check the configured media server before generation to skip content already available as real media. Disabled by default."
+    },
+    {
+      "id": "media_server",
+      "label": "Media server",
+      "type": "select",
+      "default": "emby",
+      "options": [
+        {
+          "value": "emby",
+          "label": "Emby"
+        }
+      ],
+      "help_text": "Choose the media server to check for existing real media. This release supports one Emby server."
+    },
+    {
+      "id": "media_server_url",
+      "label": "Emby server URL",
+      "type": "string",
+      "default": "",
+      "help_text": "URL of your Emby server as reachable from the Dispatcharr container, for example http://emby:8096. Include any configured base path."
+    },
+    {
+      "id": "media_server_token",
+      "label": "Emby API key/token",
+      "type": "string",
+      "default": "",
+      "help_text": "Emby API key used to read libraries and media metadata. Create one in the Emby dashboard under API Keys."
+    },
+    {
+      "id": "media_library_ids",
+      "label": "Library names or IDs",
+      "type": "string",
+      "default": "",
+      "help_text": "Required comma-separated library names or IDs, for example Movies, TV Shows. Names are resolved on every run, so recreated libraries keep working under the same name. Run List media libraries to discover names/IDs; omit generated VOD/STRM libraries. Empty, missing or ambiguous selections stop actions; use IDs for duplicate names."
+    },
+    {
+      "id": "media_tv_mode",
+      "label": "TV handling",
+      "type": "select",
+      "default": "show",
+      "options": [
+        {
+          "value": "show",
+          "label": "Skip entire owned show"
+        },
+        {
+          "value": "episodes",
+          "label": "Fill missing episodes"
+        }
+      ],
+      "help_text": "Skip entire owned show excludes all episodes when Emby has any real episode of that show. Fill missing episodes excludes only season/episode positions Emby owns and revisits existing series folders to generate missing episodes. STRM-only episodes do not count."
+    },
+    {
+      "id": "media_server_failure",
+      "label": "Server-check failure",
+      "type": "select",
+      "default": "continue",
+      "options": [
+        {
+          "value": "continue",
+          "label": "Continue with warning"
+        },
+        {
+          "value": "stop",
+          "label": "Stop before file changes"
+        }
+      ],
+      "help_text": "Continue with warning generates without media-server exclusions or duplicate cleanup if the server check fails; enabled M3U cleanup can still run. Stop before file changes aborts the action before changing output files."
+    },
+    {
+      "id": "media_duplicate_cleanup",
+      "label": "Existing duplicate cleanup",
+      "type": "select",
+      "default": "every",
+      "options": [
+        {
+          "value": "every",
+          "label": "Every generation"
+        },
+        {
+          "value": "rescan",
+          "label": "Full rescans only"
+        },
+        {
+          "value": "disabled",
+          "label": "Disabled"
+        }
+      ],
+      "help_text": "Choose when generation removes verified STRMs that duplicate real media on the server. Cleanup checks all tracked output, regardless of batch size. Disabled stops automatic deletion but still skips owned content during generation. Run selective cleanup checks immediately."
+    },
+    {
+      "id": "m3u_cleanup_enabled",
+      "label": "Clean up M3U removals",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Remove verified generated STRMs when their account/provider source is confirmed missing from the complete Dispatcharr catalogue, with no grace period. This ignores generation batches and category selections. Failed queries or episode refreshes do not establish removal. Disabled by default."
+    },
+    {
+      "id": "m3u_cleanup_timing",
+      "label": "M3U cleanup timing",
+      "type": "select",
+      "default": "rescan",
+      "options": [
+        {
+          "value": "rescan",
+          "label": "Full rescans"
+        },
+        {
+          "value": "manual",
+          "label": "Manual action only"
+        }
+      ],
+      "help_text": "When M3U cleanup is enabled, Full rescans checks removals during each Full rescan, including scheduled rescans. Manual action only waits for Run selective cleanup. Preview selective cleanup shows candidates without deleting output files."
+    },
+    {
+      "id": "deletion_scope",
+      "label": "Deletion scope",
+      "type": "select",
+      "default": "strm",
+      "options": [
+        {
+          "value": "strm",
+          "label": "STRMs only"
+        },
+        {
+          "value": "strm_nfo",
+          "label": "STRMs and unedited generated NFOs"
+        }
+      ],
+      "help_text": "For Emby/source-removal and explicit root cleanup, STRMs only preserves NFO metadata. Filters and enabled Emby ownership cleanup independently archive excluded NFO-only folders outside the library. STRMs and unedited generated NFOs also removes NFOs whose recorded generated hashes still match. Edited or unverified files, artwork and subtitles are preserved. Applies to automatic, selective and Movies/Series cleanup actions."
+    },
+    {
+      "id": "action_timeout_minutes",
+      "label": "Maximum action runtime (minutes)",
+      "type": "select",
+      "default": "30",
+      "options": [
+        {
+          "value": "5",
+          "label": "5"
+        },
+        {
+          "value": "15",
+          "label": "15"
+        },
+        {
+          "value": "30",
+          "label": "30"
+        },
+        {
+          "value": "60",
+          "label": "60"
+        },
+        {
+          "value": "120",
+          "label": "120"
+        }
+      ],
+      "help_text": "Stops a generation, library check or cleanup and all its workers after this deadline. Background actions continue after the browser closes. Use Action status for results or Stop running action to cancel sooner. Completed file changes remain; retry resumes normal processing."
+    },
+    {
+      "id": "_section_metadata_filters",
+      "label": "[METADATA FILTERS]",
+      "type": "info",
+      "description": "Filter movies and series independently by score, year, and title regex, and series by genre, using Dispatcharr metadata. Blank rules are disabled; unknown metadata is kept by default. The next generation run removes verified generated STRMs and NFOs that fail current filters, while preserving edited files. Scheduled runs use current saved filters automatically."
+    },
+    {
+      "id": "movie_minimum_score",
+      "label": "Minimum Score (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive numeric score 0–10. Blank disables. Zero or invalid model ratings are unknown."
+    },
+    {
+      "id": "movie_earliest_year",
+      "label": "Earliest Year (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive positive integer year. Blank disables."
+    },
+    {
+      "id": "movie_latest_year",
+      "label": "Latest Year (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive positive integer year. Blank disables."
+    },
+    {
+      "id": "movie_missing_metadata",
+      "label": "Missing Metadata (Movie)",
+      "type": "select",
+      "default": "keep",
+      "options": [
+        {
+          "value": "keep",
+          "label": "Keep unknowns"
+        },
+        {
+          "value": "reject",
+          "label": "Reject unknowns"
+        }
+      ],
+      "help_text": "Applies only to enabled metadata rules. Uses Dispatcharr model metadata."
+    },
+    {
+      "id": "movie_title_include",
+      "label": "Title Include Regex (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Case-insensitive regular expression searched in the original Dispatcharr title before cleanup. Use ^\\s*(AF|AR)\\s*[-:|]\\s* for provider prefixes or ^\\s*\\[(AF|AR)\\]\\s* for bracketed tags. Include requires a match; exclude rejects a match and wins over include. Blank disables."
+    },
+    {
+      "id": "movie_title_exclude",
+      "label": "Title Exclude Regex (Movie)",
+      "type": "string",
+      "default": "",
+      "help_text": "Case-insensitive regular expression searched in the original Dispatcharr title before cleanup. Use ^\\s*(AF|AR)\\s*[-:|]\\s* for provider prefixes or ^\\s*\\[(AF|AR)\\]\\s* for bracketed tags. Include requires a match; exclude rejects a match and wins over include. Blank disables."
+    },
+    {
+      "id": "series_minimum_score",
+      "label": "Minimum Score (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive numeric score 0–10. Blank disables. Zero or invalid model ratings are unknown."
+    },
+    {
+      "id": "series_earliest_year",
+      "label": "Earliest Year (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive positive integer year. Blank disables."
+    },
+    {
+      "id": "series_latest_year",
+      "label": "Latest Year (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Inclusive positive integer year. Blank disables."
+    },
+    {
+      "id": "series_missing_metadata",
+      "label": "Missing Metadata (Series)",
+      "type": "select",
+      "default": "keep",
+      "options": [
+        {
+          "value": "keep",
+          "label": "Keep unknowns"
+        },
+        {
+          "value": "reject",
+          "label": "Reject unknowns"
+        }
+      ],
+      "help_text": "Applies only to enabled metadata rules. Uses Dispatcharr model metadata."
+    },
+    {
+      "id": "series_title_include",
+      "label": "Title Include Regex (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Case-insensitive regular expression searched in the original Dispatcharr title before cleanup. Use ^\\s*(AF|AR)\\s*[-:|]\\s* for provider prefixes or ^\\s*\\[(AF|AR)\\]\\s* for bracketed tags. Include requires a match; exclude rejects a match and wins over include. Blank disables."
+    },
+    {
+      "id": "series_title_exclude",
+      "label": "Title Exclude Regex (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Case-insensitive regular expression searched in the original Dispatcharr title before cleanup. Use ^\\s*(AF|AR)\\s*[-:|]\\s* for provider prefixes or ^\\s*\\[(AF|AR)\\]\\s* for bracketed tags. Include requires a match; exclude rejects a match and wins over include. Blank disables."
+    },
+    {
+      "id": "series_genre_include",
+      "label": "Genre Include (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Comma-separated complete genre names, case-insensitive. Compound names remain intact. Any include qualifies; any exclude rejects. Blank disables."
+    },
+    {
+      "id": "series_genre_exclude",
+      "label": "Genre Exclude (Series)",
+      "type": "string",
+      "default": "",
+      "help_text": "Comma-separated complete genre names, case-insensitive. Compound names remain intact. Any include qualifies; any exclude rejects. Blank disables."
     }
   ],
   "actions": [
     {
+      "id": "rebuild_inventory",
+      "label": "[LIBRARY] Rebuild / discover inventory",
+      "description": "Rediscover STRMs; reset decisions. Deletes no files.",
+      "button_label": "Rebuild",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "list_media_libraries",
+      "label": "List media libraries",
+      "description": "List Emby library names and IDs.",
+      "button_label": "List",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "preview_cleanup",
+      "label": "Preview selective cleanup",
+      "description": "Preview removals and NFO archives; changes no files.",
+      "button_label": "Preview",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "selective_cleanup",
+      "label": "Run selective cleanup",
+      "description": "Apply filters and enabled ownership/source cleanup.",
+      "button_label": "Clean up",
+      "button_variant": "filled",
+      "button_color": "orange"
+    },
+    {
       "id": "scan_all_vods",
       "label": "[LIBRARY] Catalogue snapshot",
-      "description": "Count unique Movies and Series in the Dispatcharr database. Read-only.",
+      "description": "Count native movie/series eligibility. Read-only.",
       "button_label": "Scan",
       "button_variant": "outline",
       "button_color": "blue"
@@ -230,7 +653,7 @@
     {
       "id": "generate_movies",
       "label": "[GENERATE] Movies",
-      "description": "Process movies per Batch Size. Existing .strm files are skipped.",
+      "description": "Apply movie filters, then generate up to Batch Size.",
       "button_label": "Generate",
       "button_variant": "filled",
       "button_color": "green"
@@ -238,7 +661,7 @@
     {
       "id": "generate_series",
       "label": "[GENERATE] Series",
-      "description": "Create episode .strm files. See 'Refresh Existing Series' setting.",
+      "description": "Apply series filters, then generate episode files.",
       "button_label": "Generate",
       "button_variant": "filled",
       "button_color": "green"
@@ -246,14 +669,14 @@
     {
       "id": "rescan_all",
       "label": "[GENERATE] Full rescan",
-      "description": "Rescan then force regenerate Movies + Series.",
+      "description": "Apply filters, then rescan movies and series.",
       "button_label": "Rescan all",
       "button_variant": "filled",
       "button_color": "teal",
       "confirm": {
         "required": true,
         "title": "Run full rescan now?",
-        "message": "Full rescan walks every Movie and every Series, re-fetching episode lists from the M3U source and writing any missing files. On large catalogues this can take many minutes. The cron schedule already runs this action nightly — only click here for an immediate refresh."
+        "message": "Apply current filters and configured cleanup, then process movies and series from Dispatcharr database metadata using saved batch limits. Rejected managed STRMs can be removed and rejected NFO-only folders archived. Only episodes already stored by Dispatcharr are available. This can take several minutes."
       }
     },
     {
@@ -267,62 +690,57 @@
     {
       "id": "schedule_test_fire",
       "label": "[SCHEDULE] Test fire now",
-      "description": "Fire the scheduled task immediately. Verifies the cron pipeline.",
+      "description": "Run the saved scheduled action now.",
       "button_label": "Test fire",
       "button_variant": "outline",
       "button_color": "blue",
       "confirm": {
         "required": true,
         "title": "Fire scheduled task now?",
-        "message": "Runs the same action the cron will fire (with the snapshotted settings) right now. Useful to verify the pipeline works. May take many minutes depending on the action."
-      }
-    },
-    {
-      "id": "apply_schedule",
-      "label": "[SCHEDULE] Apply / Update",
-      "description": "Register or update the cron task. Re-click after changing any setting.",
-      "button_label": "Apply",
-      "button_variant": "outline",
-      "button_color": "blue"
-    },
-    {
-      "id": "remove_schedule",
-      "label": "[SCHEDULE] Unschedule",
-      "description": "Remove the periodic auto-rescan task.",
-      "button_label": "Remove",
-      "button_variant": "outline",
-      "button_color": "orange",
-      "confirm": {
-        "required": true,
-        "title": "Remove auto-rescan schedule?",
-        "message": "This unregisters the periodic task. You can re-create it any time with Apply."
+        "message": "Runs the current saved scheduled action with the current saved settings right now. Useful to verify the pipeline works. May take many minutes depending on the action."
       }
     },
     {
       "id": "cleanup_movies",
       "label": "[⚠ DANGER] Clean up Movies",
-      "description": "Delete plugin .strm/.nfo from Movies root. User files preserved.",
+      "description": "Delete verified movie output per Deletion scope.",
       "button_label": "Clean up",
       "button_variant": "filled",
       "button_color": "red",
       "confirm": {
         "required": true,
         "title": "Delete generated movie files?",
-        "message": "This deletes every .strm and .nfo file this plugin created under your Movies root. User-added files (subtitles, posters, custom .nfo) in those folders are preserved. Continue?"
+        "message": "Delete verified generated STRMs in this root? NFOs are deleted only if Deletion scope includes NFOs and their generated hashes match. Unverified and edited files are preserved."
       }
     },
     {
       "id": "cleanup_series",
       "label": "[⚠ DANGER] Clean up Series",
-      "description": "Delete plugin .strm/.nfo from Series root. User files preserved.",
+      "description": "Delete verified series output per Deletion scope.",
       "button_label": "Clean up",
       "button_variant": "filled",
       "button_color": "red",
       "confirm": {
         "required": true,
         "title": "Delete generated series files?",
-        "message": "This deletes every .strm and .nfo file this plugin created under your Series root. User-added files in those folders are preserved. Continue?"
+        "message": "Delete verified generated STRMs in this root? NFOs are deleted only if Deletion scope includes NFOs and their generated hashes match. Unverified and edited files are preserved."
       }
+    },
+    {
+      "id": "action_status",
+      "label": "[ACTION] Status",
+      "description": "Show the running action or its final result.",
+      "button_label": "Status",
+      "button_variant": "outline",
+      "button_color": "blue"
+    },
+    {
+      "id": "stop_action",
+      "label": "[ACTION] Stop running action",
+      "description": "Stop workers; keep completed file changes.",
+      "button_label": "Stop",
+      "button_variant": "filled",
+      "button_color": "red"
     }
   ]
 }

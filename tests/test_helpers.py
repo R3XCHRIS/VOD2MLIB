@@ -569,7 +569,7 @@ class TestMovieTargetPaths:
             name = "Aladdin"
             year = 1992
         folder, strm, name, year = p._movie_target_paths(M(), "/VODS/Movies")
-        assert folder == "/VODS/Movies/Aladdin (1992)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Aladdin (1992)"
         assert strm == "Aladdin (1992).strm"
         assert name == "Aladdin"
         assert year == 1992
@@ -582,7 +582,7 @@ class TestMovieTargetPaths:
             year = 2026
         folder, strm, name, year = p._movie_target_paths(M(), "/VODS/Movies")
         # The fix: no double year
-        assert folder == "/VODS/Movies/Aladdin (2026)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Aladdin (2026)"
         assert strm == "Aladdin (2026).strm"
         assert name == "Aladdin"
         assert year == 2026
@@ -594,7 +594,7 @@ class TestMovieTargetPaths:
             name = "Aladdin (1992)"
             year = None
         folder, strm, name, year = p._movie_target_paths(M(), "/VODS/Movies")
-        assert folder == "/VODS/Movies/Aladdin (1992)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Aladdin (1992)"
         assert year == 1992
 
     def test_no_year_anywhere(self, p):
@@ -604,7 +604,7 @@ class TestMovieTargetPaths:
             name = "Mystery Title"
             year = None
         folder, strm, name, year = p._movie_target_paths(M(), "/VODS/Movies")
-        assert folder == "/VODS/Movies/Mystery Title"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Mystery Title"
         assert strm == "Mystery Title.strm"
         assert year is None
 
@@ -643,20 +643,20 @@ class TestMovieTargetPathsNested:
 
     def test_nest_off_unchanged(self, p):
         folder, _, _, _ = p._movie_target_paths(self._M(), "/VODS/Movies", "Action", nest=False)
-        assert folder == "/VODS/Movies/Aladdin (1992)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Aladdin (1992)"
 
     def test_nest_on_with_category(self, p):
         folder, _, _, _ = p._movie_target_paths(self._M(), "/VODS/Movies", "Action", nest=True)
-        assert folder == "/VODS/Movies/Action/Aladdin (1992)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Action/Aladdin (1992)"
 
     def test_nest_on_empty_category(self, p):
         folder, _, _, _ = p._movie_target_paths(self._M(), "/VODS/Movies", "", nest=True)
-        assert folder == "/VODS/Movies/Unassigned/Aladdin (1992)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Unassigned/Aladdin (1992)"
 
     def test_nest_on_raw_category_preserved(self, p):
         # Raw category — even ugly ones go in verbatim (per design choice 1)
         folder, _, _, _ = p._movie_target_paths(self._M(), "/VODS/Movies", "EN - Action (movie)", nest=True)
-        assert folder == "/VODS/Movies/EN - Action (movie)/Aladdin (1992)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/EN - Action (movie)/Aladdin (1992)"
 
 
 class TestSeriesTargetFolderNested:
@@ -668,111 +668,52 @@ class TestSeriesTargetFolderNested:
 
     def test_nest_off_unchanged(self, p):
         folder, _, _ = p._series_target_folder(self._S(), "/VODS/Series", "Drama", nest=False)
-        assert folder == "/VODS/Series/Tidelands (2018)"
+        assert folder.replace("\\", "/") == "/VODS/Series/Tidelands (2018)"
 
     def test_nest_on_with_category(self, p):
         folder, _, _ = p._series_target_folder(self._S(), "/VODS/Series", "Drama", nest=True)
-        assert folder == "/VODS/Series/Drama/Tidelands (2018)"
+        assert folder.replace("\\", "/") == "/VODS/Series/Drama/Tidelands (2018)"
 
     def test_nest_on_empty_category(self, p):
         folder, _, _ = p._series_target_folder(self._S(), "/VODS/Series", "", nest=True)
-        assert folder == "/VODS/Series/Unassigned/Tidelands (2018)"
+        assert folder.replace("\\", "/") == "/VODS/Series/Unassigned/Tidelands (2018)"
 
 
 # ---------- cleanup walk ----------
 
 class TestWalkAndCleanup:
-    """Tests _walk_and_cleanup_plugin_files against real temp dirs.
-
-    Uses tmp_path (pytest builtin) — covers both flat and nested layouts and
-    the user-files-preserved case.
-    """
-
-    def test_flat_layout_cleaned(self, p, tmp_path):
-        log = CapturingLogger()
-        # Movies/Aladdin (1992)/{.strm, .nfo}
-        movie = tmp_path / "Aladdin (1992)"
+    def test_unverified_files_are_preserved(self, p, tmp_path):
+        movie = tmp_path / "Aladdin"
         movie.mkdir()
-        (movie / "Aladdin (1992).strm").write_text("http://...")
-        (movie / "Aladdin (1992).nfo").write_text("<movie/>")
+        (movie / "movie.strm").write_text("http://unrelated")
+        (movie / "movie.nfo").write_text("<movie/>")
+        result = p._walk_and_cleanup_plugin_files(str(tmp_path), CapturingLogger())
+        assert result["deleted_strm"] == 0
+        assert result["deleted_nfo"] == 0
+        assert (movie / "movie.strm").exists()
 
-        r = p._walk_and_cleanup_plugin_files(str(tmp_path), log)
-        assert r["deleted_strm"] == 1
-        assert r["deleted_nfo"] == 1
-        assert r["removed_dirs"] == 1
-        assert r["errors"] == 0
-        assert not movie.exists()
-        assert tmp_path.exists()  # root preserved
-
-    def test_nested_layout_cleaned(self, p, tmp_path):
-        log = CapturingLogger()
-        # Movies/Action/Aladdin (1992)/{.strm, .nfo}
-        cat = tmp_path / "Action"
-        cat.mkdir()
-        movie = cat / "Aladdin (1992)"
-        movie.mkdir()
-        (movie / "Aladdin (1992).strm").write_text("http://...")
-        (movie / "Aladdin (1992).nfo").write_text("<movie/>")
-
-        r = p._walk_and_cleanup_plugin_files(str(tmp_path), log)
-        assert r["deleted_strm"] == 1
-        assert r["deleted_nfo"] == 1
-        # Both the movie folder AND the category folder removed (both empty)
-        assert r["removed_dirs"] == 2
-        assert not cat.exists()
-        assert tmp_path.exists()
-
-    def test_series_with_seasons(self, p, tmp_path):
-        log = CapturingLogger()
-        # Series/Tidelands/{tvshow.nfo, Season 01/{strm, nfo}}
-        series = tmp_path / "Tidelands"
-        series.mkdir()
-        (series / "tvshow.nfo").write_text("<tvshow/>")
-        season = series / "Season 01"
-        season.mkdir()
-        (season / "ep1.strm").write_text("http://...")
-        (season / "ep1.nfo").write_text("<episodedetails/>")
-
-        r = p._walk_and_cleanup_plugin_files(str(tmp_path), log)
-        assert r["deleted_strm"] == 1
-        assert r["deleted_nfo"] == 2  # episode.nfo + tvshow.nfo
-        assert r["removed_dirs"] == 2  # Season 01 + series folder
-
-    def test_user_files_preserved(self, p, tmp_path):
-        log = CapturingLogger()
-        movie = tmp_path / "Aladdin (1992)"
-        movie.mkdir()
-        (movie / "Aladdin (1992).strm").write_text("http://...")
-        (movie / "Aladdin (1992).nfo").write_text("<movie/>")
-        # User added files
-        (movie / "poster.jpg").write_text("not a real image")
-        (movie / "Aladdin (1992).en.srt").write_text("subtitles")
-
-        r = p._walk_and_cleanup_plugin_files(str(tmp_path), log)
-        assert r["deleted_strm"] == 1
-        assert r["deleted_nfo"] == 1
-        assert r["removed_dirs"] == 0  # movie folder preserved (user files inside)
-        assert r["preserved_dirs"] >= 1
-        assert movie.exists()
-        assert (movie / "poster.jpg").exists()
-        assert (movie / "Aladdin (1992).en.srt").exists()
+    def test_verified_files_and_empty_dirs_removed(self, p, tmp_path):
+        from inventory import InventoryStore, file_hash
+        from media_library import Identity
+        from types import SimpleNamespace
+        root = tmp_path / "Movies"
+        movie = root / "Action" / "Aladdin"
+        movie.mkdir(parents=True)
+        strm, nfo = movie / "movie.strm", movie / "movie.nfo"
+        strm.write_text("http://d/proxy/vod/movie/u")
+        nfo.write_text("<movie/>")
+        store = InventoryStore(tmp_path / "state")
+        store.record(str(strm), Identity("movie", "Aladdin", 1992), nfos={str(nfo): file_hash(nfo)})
+        p._reconciliation = SimpleNamespace(store=store, settings={"deletion_scope": "strm_nfo"})
+        result = p._walk_and_cleanup_plugin_files(str(root), CapturingLogger())
+        assert result["deleted_strm"] == 1
+        assert result["deleted_nfo"] == 1
+        assert result["removed_dirs"] == 2
+        assert root.exists()
+        store.close()
 
     def test_nonexistent_root_no_error(self, p, tmp_path):
-        log = CapturingLogger()
-        missing = tmp_path / "does-not-exist"
-        r = p._walk_and_cleanup_plugin_files(str(missing), log)
-        assert r["errors"] == 0
-        assert r["deleted_strm"] == 0
-
-    def test_root_itself_never_removed(self, p, tmp_path):
-        log = CapturingLogger()
-        # Tree that becomes entirely empty
-        (tmp_path / "Aladdin (1992)").mkdir()
-        (tmp_path / "Aladdin (1992)" / "Aladdin (1992).strm").write_text("x")
-        r = p._walk_and_cleanup_plugin_files(str(tmp_path), log)
-        # Root must still exist
-        assert tmp_path.exists()
-        assert r["removed_dirs"] == 1  # only the Aladdin folder, not the root
+        assert p._walk_and_cleanup_plugin_files(str(tmp_path / "missing"), CapturingLogger())["errors"] == 0
 
 
 # ---------- _extract_clean_name_and_year (v1.15.0) ----------
@@ -933,7 +874,7 @@ class TestMovieTargetPathsWithTmdbSuffix:
     def test_dirty_provider_name_cleaned_to_canonical_folder(self, p):
         # Without the toggle, just the cleanup applies.
         folder, strm, name, year = p._movie_target_paths(self._M(), "/VODS/Movies")
-        assert folder == "/VODS/Movies/Cool Hand Luke (1967)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Cool Hand Luke (1967)"
         assert strm == "Cool Hand Luke (1967).strm"
         assert name == "Cool Hand Luke"
         assert year == 1967
@@ -942,7 +883,7 @@ class TestMovieTargetPathsWithTmdbSuffix:
         folder, strm, name, year = p._movie_target_paths(
             self._M(), "/VODS/Movies", category_name="", nest=False, append_tmdb_id=True,
         )
-        assert folder == "/VODS/Movies/Cool Hand Luke (1967) {tmdb-378}"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Cool Hand Luke (1967) {tmdb-378}"
         # The strm filename inside the folder is unaffected — scrapers only
         # care about the folder name.
         assert strm == "Cool Hand Luke (1967).strm"
@@ -951,7 +892,7 @@ class TestMovieTargetPathsWithTmdbSuffix:
         class M:
             id = 1; uuid = "x"; name = "Mystery"; year = None; tmdb_id = ""
         folder, _, _, _ = p._movie_target_paths(M(), "/VODS/Movies", append_tmdb_id=True)
-        assert folder == "/VODS/Movies/Mystery"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Mystery"
 
 
 class TestSeriesTargetFolderWithTmdbSuffix:
@@ -964,7 +905,7 @@ class TestSeriesTargetFolderWithTmdbSuffix:
 
     def test_dirty_series_name_cleaned(self, p):
         folder, name, year = p._series_target_folder(self._S(), "/VODS/Series")
-        assert folder == "/VODS/Series/Breaking Bad (2008)"
+        assert folder.replace("\\", "/") == "/VODS/Series/Breaking Bad (2008)"
         assert name == "Breaking Bad"
         assert year == 2008
 
@@ -972,7 +913,7 @@ class TestSeriesTargetFolderWithTmdbSuffix:
         folder, _, _ = p._series_target_folder(
             self._S(), "/VODS/Series", category_name="", nest=False, append_tmdb_id=True,
         )
-        assert folder == "/VODS/Series/Breaking Bad (2008) {tmdb-1396}"
+        assert folder.replace("\\", "/") == "/VODS/Series/Breaking Bad (2008) {tmdb-1396}"
 
 
 # ---------- NFO emits <thumb> when logo URL present (v1.15.0) ----------
@@ -1179,7 +1120,7 @@ class TestMovieTargetPathsBareYear:
             name = "Wicked: For Good - 2025"
             year = 2025
         folder, strm, name, year = p._movie_target_paths(M(), "/VODS/Movies")
-        assert folder == "/VODS/Movies/Wicked For Good (2025)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Wicked For Good (2025)"
         assert strm == "Wicked For Good (2025).strm"
         assert year == 2025
 
@@ -1190,52 +1131,8 @@ class TestMovieTargetPathsBareYear:
             name = "Wicked: For Good - 2025"
             year = None
         folder, strm, name, year = p._movie_target_paths(M(), "/VODS/Movies")
-        assert folder == "/VODS/Movies/Wicked For Good (2025)"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Wicked For Good (2025)"
         assert year == 2025
-
-
-# ---------- _settings_drift_keys (v1.15.2) ----------
-
-class _FakeTask:
-    def __init__(self, kwargs_str):
-        self.kwargs = kwargs_str
-
-
-class TestSettingsDriftKeys:
-    def test_no_drift_when_identical(self, p):
-        import json
-        snap = {"action": "rescan_all", "settings": {"batch_size": "250", "generate_nfo": True}}
-        task = _FakeTask(json.dumps(snap))
-        current = {"batch_size": "250", "generate_nfo": True, "schedule_cron": "0 3 * * *"}
-        assert p._settings_drift_keys(task, current) == []
-
-    def test_detects_changed_value(self, p):
-        import json
-        snap = {"settings": {"append_tmdb_id_to_folder": False, "batch_size": "250"}}
-        task = _FakeTask(json.dumps(snap))
-        current = {"append_tmdb_id_to_folder": True, "batch_size": "250"}
-        assert p._settings_drift_keys(task, current) == ["append_tmdb_id_to_folder"]
-
-    def test_new_setting_not_in_snapshot_is_not_flagged(self, p):
-        # A setting added by a plugin upgrade (absent from the old snapshot)
-        # must not raise a false drift warning.
-        import json
-        snap = {"settings": {"batch_size": "250"}}
-        task = _FakeTask(json.dumps(snap))
-        current = {"batch_size": "250", "dedupe_movies_across_categories": True}
-        assert p._settings_drift_keys(task, current) == []
-
-    def test_malformed_kwargs_returns_empty(self, p):
-        task = _FakeTask("{not valid json")
-        assert p._settings_drift_keys(task, {"batch_size": "250"}) == []
-
-    def test_schedule_prefixed_keys_ignored(self, p):
-        import json
-        snap = {"settings": {"batch_size": "250"}}
-        task = _FakeTask(json.dumps(snap))
-        # changing schedule_cron must NOT count as settings drift
-        current = {"batch_size": "250", "schedule_cron": "0 4 * * *"}
-        assert p._settings_drift_keys(task, current) == []
 
 
 # ---------- _build_proxy_url (#6 / omit_stream_id) ----------
@@ -1300,24 +1197,6 @@ class TestLanguagePrefixFormats:
 
     def test_no_prefix_unchanged(self, p):
         assert p._clean_title("The Matrix") == "The Matrix"
-
-
-# ---------- _parse_category_filter (v1.16.0) ----------
-
-class TestParseCategoryFilter:
-    def test_empty_returns_empty_list(self, p):
-        assert p._parse_category_filter("") == []
-        assert p._parse_category_filter(None) == []
-        assert p._parse_category_filter("   ") == []
-
-    def test_single_prefix(self, p):
-        assert p._parse_category_filter("[EN]") == ["[EN]"]
-
-    def test_comma_separated_trimmed(self, p):
-        assert p._parse_category_filter("[EN], [FR] , [DE]") == ["[EN]", "[FR]", "[DE]"]
-
-    def test_drops_empty_segments(self, p):
-        assert p._parse_category_filter("[EN],,, [FR] ,") == ["[EN]", "[FR]"]
 
 
 # ---------- _write_if_different_preserve_times (v1.16.1, issue #11) ----------
@@ -1404,7 +1283,7 @@ class TestTmdbTagFormat:
             M(), "/VODS/Movies", category_name="", nest=False,
             append_tmdb_id=True, tmdb_tag_format="jellyfin",
         )
-        assert folder == "/VODS/Movies/Cool Hand Luke (1967) [tmdbid-378]"
+        assert folder.replace("\\", "/") == "/VODS/Movies/Cool Hand Luke (1967) [tmdbid-378]"
 
     def test_series_target_folder_uses_jellyfin_format(self, p):
         class S:
@@ -1413,41 +1292,7 @@ class TestTmdbTagFormat:
             S(), "/VODS/Series", category_name="", nest=False,
             append_tmdb_id=True, tmdb_tag_format="jellyfin",
         )
-        assert folder == "/VODS/Series/Breaking Bad (2008) [tmdbid-1396]"
-
-
-# ---------- category exclude + prefix matching (v1.17.0, issue #8) ----------
-
-class TestMatchesCategoryPrefixes:
-    def test_no_prefixes_never_matches(self, p):
-        assert p._matches_category_prefixes("Action", []) is False
-
-    def test_case_insensitive_startswith(self, p):
-        assert p._matches_category_prefixes("FOR ADULTS (movie)", ["for adults"]) is True
-        assert p._matches_category_prefixes("for adults", ["FOR ADULTS"]) is True
-
-    def test_only_matches_at_the_start(self, p):
-        # "EN" appears inside, but not as a prefix -> no match.
-        assert p._matches_category_prefixes("KIDS EN Cartoons", ["EN"]) is False
-
-    def test_any_of_several_prefixes(self, p):
-        assert p._matches_category_prefixes("[FR] Cinema", ["[EN]", "[FR]"]) is True
-
-    def test_missing_or_blank_category_never_matches(self, p):
-        # Mirrors the DB behaviour: NULL category can't satisfy istartswith.
-        assert p._matches_category_prefixes(None, ["EN"]) is False
-        assert p._matches_category_prefixes("", ["EN"]) is False
-        assert p._matches_category_prefixes("   ", ["EN"]) is False
-
-    def test_prefix_whitespace_is_tolerated(self, p):
-        assert p._matches_category_prefixes("Action", ["  action "]) is True
-
-    def test_logand99_scenario(self, p):
-        # Issue #8: the user filtered on "|EN|" (a TITLE prefix their provider
-        # uses) while the category was "FOR ADULTS (movie)" — so nothing
-        # matched. The exclude-list is the right tool for their goal.
-        assert p._matches_category_prefixes("FOR ADULTS (movie)", ["|EN|"]) is False
-        assert p._matches_category_prefixes("FOR ADULTS (movie)", ["FOR ADULTS"]) is True
+        assert folder.replace("\\", "/") == "/VODS/Series/Breaking Bad (2008) [tmdbid-1396]"
 
 
 # ---------- NFO title cleanup + omission (v1.18.0, matrix26) ----------
