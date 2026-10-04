@@ -1,39 +1,37 @@
 # Changelog
 
-## Unreleased
+## v1.20.2 — NFO-only cleanup and action layout (2026-10-03)
 
 - Keep action descriptions and button labels compact so buttons follow the existing right-aligned layout.
-
 - Extend NFO-only archival to enabled Emby ownership cleanup for movies and whole-show mode. Passing-filter titles such as A Different World can otherwise retain an empty VOD duplicate after owned STRMs are removed. Match existing cleanup scope/timing and provider-ID protections, preserve episode-mode folders, and report ownership archives separately in preview, results and telemetry.
-
 - Active metadata filters archive confirmed rejected NFO-only movie/series folders, including legacy or Emby-written metadata, outside output roots with a recovery manifest. Archives preserve metadata; STRMs, symlinks, unrelated files and passing sources protect folders.
 - Handle enabling filters after unfiltered generation or STRM-only cleanup, even with NFO generation disabled. Preview models planned STRM/NFO removal and reports matching archive candidates.
 - Add native lookup/archive telemetry and action-result counts. Complete native lookups precede filter changes; copy verification and inventory protections preserve retryability.
 - Group NFO controls under a UI heading and description; explain how plugin NFO writing, Emby ownership integration and deletion scope interact. Preserve saved settings and compatible defaults.
 
-## v1.20.1 ? one saved configuration and Save-driven scheduling
+## v1.20.1 — one saved configuration and Save-driven scheduling
 
 - Manual and scheduled actions use current saved settings and the same defaults at run start.
 - Enable Auto-Rescan controls scheduling; Save validates and updates cron/timezone or disables the trigger. Apply and Unschedule actions are removed.
 - Existing schedules retain their enabled state; new installations default off. Legacy payload snapshots are cleared and disabled queued ticks are skipped.
 - Plugin-owned Django signals implement Save behavior without changing Dispatcharr source.
-- README reviewed against the fork's category, reconciliation, filtering, performance, and scheduling commits; installation links, architecture, tests, and cleanup behavior corrected.
+- README reviewed against the category, reconciliation, filtering, performance, and scheduling commits; installation links, architecture, tests, and cleanup behavior corrected.
 
-## v1.20.0 ? database-only filters and managed-output cleanup
+## v1.20.0 — database-only filters and managed-output cleanup
 
 - Independent movie/series score, year, unknown-data, and title regex rules; series genre names remain comma-delimited text.
 - Generation applies current filters to existing managed output before creation batching, with edited/unverified/shared-file protections.
 - Dispatcharr models are the only VOD metadata/episode source; provider fetches and native importer/freshness writes are removed.
 - Finer timing telemetry, configurable series concurrency, incremental signatures, bounded parallel STRM removal, and serialized durable inventory finalization.
-- Stable mwongj fork identity and documentation links.
+- Preserve plugin identity and documentation links across upgrades.
 
-## v1.19.0 ? Emby reconciliation, inventory, and background actions
+## v1.19.0 — Emby reconciliation, inventory, and background actions
 
 - Optional Emby ownership checks with explicit libraries, conservative identity matching, whole-show or missing-episode handling, and configured failure policy.
 - Ownership/source-removal preview and cleanup; verified STRM/NFO protection and persistent SQLite inventory.
 - Isolated actions with deadlines, cancellation, progress and local telemetry; persistent discovery and incremental generation decisions.
 
-## v1.18.1 ? native category eligibility
+## v1.18.1 — native category eligibility
 
 - Generation and Catalogue Snapshot use active accounts and per-account/type enabled Dispatcharr categories.
 - Remove legacy plugin Category Filter/Exclude fields; disabling categories alone does not remove output.

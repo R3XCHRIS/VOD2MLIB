@@ -2,31 +2,29 @@
   <img src="logo.png" alt="VOD to Media Library" width="200">
 </p>
 
-<h1 align="center">VOD to Media Library (mwongj fork)</h1>
+<h1 align="center">VOD to Media Library</h1>
 
 <p align="center">Generate <code>.strm</code> files and optional NFO metadata from Dispatcharr's stored VOD catalogue for a media server that supports stream-link files.</p>
 
-<p align="center"><i>Stable v1.20.1 · plugin identifier <code>vod2mlib</code></i></p>
+<p align="center"><i>Stable v1.20.2 · plugin identifier <code>vod2mlib</code></i></p>
 
-This fork adds native category eligibility, optional Emby ownership checks, safe managed-file cleanup, persistent inventory and incremental generation, independent movie/series filters, timing telemetry, and scheduling controlled entirely through Settings → Save.
+The plugin supports native category eligibility, optional Emby ownership checks, safe managed-file cleanup, persistent inventory and incremental generation, independent movie/series filters, timing telemetry, and scheduling controlled entirely through Settings → Save.
 
 **Dispatcharr owns catalogue fetching.** The plugin reads movie, series, and episode models already in Dispatcharr's database. It does not contact VOD provider APIs, run native importers, enrich metadata, or change Dispatcharr freshness timestamps or flags. New episodes can generate only after Dispatcharr stores them. Optional Emby requests check ownership of real media; they do not supply filter metadata.
+
+## Credits
+
+- **Original author:** [shedunraid](https://github.com/shedunraid) — created v0.x–v1.3 ([upstream repo](https://github.com/shedunraid/VOD2MLIB)).
+- **Fork maintainer:** [R3XCHRIS](https://github.com/R3XCHRIS) — v1.4+ adds scheduling and bug fixes. Listed in the [official Dispatcharr Plugins catalogue](https://github.com/Dispatcharr/Plugins/tree/main/plugins/vod2mlib).
+- [MIT License](LICENSE). Original copyright notices are retained.
 
 ## Install and upgrade
 
 1. Map persistent output storage into Dispatcharr and make the same files visible to your media server. Defaults are `/VODS/Movies` and `/VODS/Series`; see [Sharing the VODs folder](#sharing-the-vods-folder-with-media-servers).
-2. In Dispatcharr's plugin repositories, add **mwongj Plugin Forks** using this manifest URL:
+2. Install **VOD to Media Library** from Dispatcharr → Plugins → **Find Plugins** in the official catalogue. Alternatively, import `plugin-vod2mlib-v<version>.zip` from the [project releases](https://github.com/R3XCHRIS/VOD2MLIB/releases). For a separately packaged downstream build, follow that distribution's installation instructions.
+3. Enable the plugin, configure reachable paths and the Dispatcharr URL, and click **Save**.
 
-   ```text
-   https://raw.githubusercontent.com/mwongj/Dispatcharr-Plugins/releases/manifest.json
-   ```
-
-3. Select **VOD to Media Library (mwongj fork)** from that repository and install it. Alternatively, import `vod2mlib-1.20.1.zip` from the [fork distribution releases](https://github.com/mwongj/Dispatcharr-Plugins/releases).
-4. Enable the plugin, configure reachable paths and the Dispatcharr URL, and click **Save**.
-
-The source repository is [mwongj/VOD2MLIB](https://github.com/mwongj/VOD2MLIB); ZIPs and update manifests are published by [mwongj/Dispatcharr-Plugins](https://github.com/mwongj/Dispatcharr-Plugins). The official catalogue's upstream plugin is a separate distribution. Use **mwongj Plugin Forks** for this fork's updates. The identifier remains `vod2mlib`, so installing the fork over an existing managed installation keeps the same settings and schedule identity; the two distributions are not intended to run as separate plugins.
-
-Requires Dispatcharr **v0.24.0 or later**. Scheduling uses Django, Celery, and django-celery-beat supplied by Dispatcharr. Keep the `/data` volume persistent: plugin state lives outside the installation at `/data/vod2mlib`. Existing schedules retain their enabled state on upgrade; fresh installations default to scheduling disabled. After an upgrade, reload the plugin and ensure idle Celery workers load the current plugin task code before using the schedule. This fork does not modify Dispatcharr source files.
+The plugin identifier remains `vod2mlib`; upgrades preserve saved settings and schedule identity. Requires Dispatcharr **v0.24.0 or later**. Scheduling uses Django, Celery, and django-celery-beat supplied by Dispatcharr. Keep the `/data` volume persistent: plugin state lives outside the installation at `/data/vod2mlib`. Existing schedules retain their enabled state on upgrade; fresh installations default to scheduling disabled. After an upgrade, reload the plugin and ensure idle Celery workers load the current plugin task code before using the schedule. The plugin does not modify Dispatcharr source files.
 
 ## Quick start
 
@@ -269,7 +267,7 @@ This plugin has no Plex playback adapter. The player must support STRM URLs; suc
 
 ## Development and architecture
 
-The entry point is `plugin.py` (`Plugin.fields`, `Plugin.actions`, `Plugin.run`). `plugin.json` mirrors UI metadata/version and links to this fork. Ship **all runtime modules** in a release:
+The entry point is `plugin.py` (`Plugin.fields`, `Plugin.actions`, `Plugin.run`). `plugin.json` mirrors UI metadata/version and links to the project. Ship **all runtime modules** in a release:
 
 | Module | Responsibility |
 | --- | --- |
@@ -291,17 +289,18 @@ python -m pytest -q
 python -m compileall -q plugin.py action_runner.py metadata_filters.py filter_cleanup.py orphan_nfo.py reconciliation.py media_library.py inventory.py generation_cache.py schedule_settings.py
 ```
 
-GitHub CI tests Python 3.10 and 3.12. The v1.20.1 suite passes 417 tests with 4 platform-specific skips on Windows. Behavioral changes should update the README and [CHANGELOG.md](CHANGELOG.md), keep Python/manifest fields and versions aligned, and update the fork distribution's pinned source SHA and file list when publishing. ZIP publication verifies checksums before updating the catalogue feed; do not replace an existing version's package with different bytes.
+GitHub CI tests Python 3.10 and 3.12. The v1.20.2 suite passes 457 tests on Linux and 452 tests with 5 platform-specific skips on Windows. Behavioral changes should update the README and [CHANGELOG.md](CHANGELOG.md), keep Python/manifest fields and versions aligned, and include all runtime modules when publishing. ZIP publication verifies checksums before updating the catalogue feed; do not replace an existing version's package with different bytes.
 
 The bundled logo is reproducible: replace `tools/source_logo.png` and run `python tools/build_logo.py`.
 
-## Fork release history and credits
+## Release history
 
-| Version | Fork changes |
+| Version | Changes |
 | --- | --- |
+| 1.20.2 | Archive filter- and Emby ownership-excluded NFO-only folders with recovery manifests, preview and telemetry; clarify NFO controls; preserve right-aligned action buttons. |
 | 1.20.1 | One saved configuration for actions/schedules; Save validates and applies cron/timezone; enable toggle; legacy schedule-state preservation; Apply/Unschedule removed. |
 | 1.20.0 | Independent score/year/unknown/genre and title regex filters; next-run managed-output removal; database-only metadata/episodes; finer telemetry and faster output/cleanup handling. |
 | 1.19.0 | Optional Emby reconciliation, safe source/ownership cleanup, persistent SQLite inventory/discovery, incremental decisions, isolated actions, deadlines/cancellation, and timing telemetry. |
 | 1.18.1 | Native per-account/category eligibility; legacy category-prefix fields removed. |
 
-Original implementation: [shedunraid](https://github.com/shedunraid/VOD2MLIB). Earlier scheduling, NFO, naming, and deduplication work: [R3XCHRIS](https://github.com/R3XCHRIS/VOD2MLIB). This fork is maintained by [mwongj](https://github.com/mwongj/VOD2MLIB) and distributed through mwongj Plugin Forks. License: [MIT](LICENSE). Earlier upstream release notes remain in [CHANGELOG.md](CHANGELOG.md).
+See [CHANGELOG.md](CHANGELOG.md) for earlier release notes and [Credits](#credits) for attribution.
