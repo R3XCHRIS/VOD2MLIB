@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.18.1: rescans no longer hammer your provider
+
+Fixes [#18](https://github.com/R3XCHRIS/VOD2MLIB/issues/18) (thanks **Freyguy1975**). Upgrade if you run the scheduled rescan.
+
+- **The cause.** To pick up new episodes, a rescan asked Dispatcharr to re-fetch every series' episode list, and each of those is a live `get_series_info` request to your provider. On a catalogue of thousands of series that meant thousands of requests in one burst, three at a time, every night. Providers answered with HTTP 429 and at least one threatened to close an account.
+
+- **Rescans now fetch only what changed.** Dispatcharr's own VOD refresh stores each series' provider `last_modified` timestamp. A rescan now fetches episodes only for series whose `last_modified` is newer than the last fetch. Everything else is built from the episodes Dispatcharr already has. On a quiet night that is close to zero provider requests. Series that have never been fetched are still fetched once, as before.
+
+- **Providers that don't send `last_modified`** get each series re-checked at most once every 7 days instead of every run.
+
+- **Fetches are rate-limited.** Provider requests now go one at a time with at least 0.5 s between them, whatever the worker count. The generation work itself still runs in parallel.
+
+- **The log tells you.** Each series run reports `Provider episode fetches this run: N of M series`, and the summary includes `Provider fetches: N`.
+
+One thing to know: new episodes reach your library after Dispatcharr's VOD refresh has seen the provider's updated `last_modified`, so the rescan picks them up on the run after that refresh. If your M3U refresh runs before the cron, that is the same night.
+
+- **Episode filenames no longer change when the title does.** If an episode already has a `.strm` on disk, the plugin keeps writing to that file even when the episode's title has changed, instead of creating a second copy next to it. This matters with two or more providers: Dispatcharr keeps one name per episode, shared by every provider, and each provider fetch overwrites it with that provider's title (`Shining Girls S01E01` from one, `Cutline` from the other). Fetching less exposed this. In testing on a two-provider instance, an early build of this release wrote about 70,000 duplicate episodes before it was caught. Libraries that already hold several copies of an episode keep them all; the oldest copy is the one kept up to date.
+
+- **Scheduled runs now show up in the Dispatcharr log.** The cron task's output was going nowhere: Dispatcharr's `dvr` Celery worker discards INFO messages, and the plugin's logger had no handler of its own. Scheduled runs now write straight to the worker's stderr, so `docker logs dispatcharr` shows each run, including the provider fetch count.
+
+23 new unit tests (247 total, was 224).
+
 ## v1.18.0 — NFO titles your media server can actually match
 
 Everything here came out of the Dispatcharr Discord thread. No breaking changes, and no folder names change.

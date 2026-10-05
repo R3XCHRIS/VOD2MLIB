@@ -1592,3 +1592,170 @@ class TestProviderPlusTagRegex:
     def test_does_not_match_letter_hyphen_digits(self, p):
         assert p._PROVIDER_PLUS_TAG_RE.sub("", "AC-130") == "AC-130"
         assert p._PROVIDER_PLUS_TAG_RE.sub("", "MI-5") == "MI-5"
+
+
+# ---------- provider episode fetches (#18) ----------
+
+from datetime import datetime, timezone as _tz
+
+
+class TestEpisodeFetchReason:
+    FETCHED_AT = datetime(2026, 10, 1, 3, 0, tzinfo=_tz.utc)
+
+    def _props(self, last_modified=None, fetched=True):
+        props = {"episodes_fetched": fetched}
+        if last_modified is not None:
+            props["basic_data"] = {"last_modified": last_modified}
+        return props
+
+    def _ts(self, dt):
+        return str(int(dt.timestamp()))
+
+    def test_never_fetched_always_fetches(self, p):
+        assert p._episode_fetch_reason({}, None, False) == "never fetched"
+        assert p._episode_fetch_reason(None, None, True) == "never fetched"
+        assert p._episode_fetch_reason(self._props(fetched=False), self.FETCHED_AT, True)
+
+    def test_generate_without_refresh_never_refetches(self, p):
+        changed = self._props(self._ts(datetime(2026, 10, 4, tzinfo=_tz.utc)))
+        assert p._episode_fetch_reason(changed, self.FETCHED_AT, False) is None
+
+    def test_rescan_skips_series_unchanged_at_provider(self, p):
+        # The #18 case: a nightly rescan used to fetch every series.
+        old = self._props(self._ts(datetime(2026, 9, 1, tzinfo=_tz.utc)))
+        assert p._episode_fetch_reason(old, self.FETCHED_AT, True) is None
+
+    def test_rescan_fetches_series_changed_since_last_fetch(self, p):
+        new = self._props(self._ts(datetime(2026, 10, 4, tzinfo=_tz.utc)))
+        assert p._episode_fetch_reason(new, self.FETCHED_AT, True) == "changed at provider"
+
+    def test_change_just_before_fetch_is_within_skew_allowance(self, p):
+        # Provider clock a little ahead of ours: treat as changed, not missed.
+        near = self._props(str(int(self.FETCHED_AT.timestamp()) - 600))
+        assert p._episode_fetch_reason(near, self.FETCHED_AT, True) == "changed at provider"
+
+    def test_missing_fetch_time_fetches(self, p):
+        assert p._episode_fetch_reason(self._props("1700000000"), None, True) == "no last fetch time"
+
+    @pytest.mark.parametrize("value", [None, "", "0", "not-a-number", "2026-10-01"])
+    def test_no_usable_last_modified_falls_back_to_age(self, p, value):
+        props = self._props(value) if value is not None else self._props()
+        soon = self.FETCHED_AT.timestamp() + 3600
+        late = self.FETCHED_AT.timestamp() + p.EPISODE_RECHECK_FALLBACK_HOURS * 3600
+        assert p._episode_fetch_reason(props, self.FETCHED_AT, True, soon) is None
+        assert p._episode_fetch_reason(props, self.FETCHED_AT, True, late) is not None
+
+    def test_integer_last_modified_accepted(self, p):
+        new = {"episodes_fetched": True, "basic_data": {"last_modified": 1791000000}}
+        assert p._episode_fetch_reason(new, self.FETCHED_AT, True) == "changed at provider"
+
+
+class TestThrottledProviderCall:
+    def test_returns_result_and_passes_arguments(self, p):
+        assert p._throttled_provider_call(lambda a, b=0: a + b, 2, b=3) == 5
+
+    def test_calls_never_overlap_across_threads(self, p, monkeypatch):
+        import threading
+        import time as _time
+        monkeypatch.setattr(Plugin, "EPISODE_FETCH_MIN_INTERVAL", 0.01)
+        active = []
+        peak = []
+        guard = threading.Lock()
+
+        def fake_fetch():
+            with guard:
+                active.append(1)
+                peak.append(len(active))
+            _time.sleep(0.02)
+            with guard:
+                active.pop()
+
+        threads = [threading.Thread(target=p._throttled_provider_call, args=(fake_fetch,)) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert max(peak) == 1
+
+    def test_spaces_consecutive_calls(self, p, monkeypatch):
+        import time as _time
+        monkeypatch.setattr(Plugin, "EPISODE_FETCH_MIN_INTERVAL", 0.05)
+        starts = []
+        for _ in range(3):
+            p._throttled_provider_call(lambda: starts.append(_time.monotonic()))
+        assert starts[1] - starts[0] >= 0.045
+        assert starts[2] - starts[1] >= 0.045
+
+    def test_failed_call_still_counts_for_spacing(self, p, monkeypatch):
+        import time as _time
+        monkeypatch.setattr(Plugin, "EPISODE_FETCH_MIN_INTERVAL", 0.05)
+
+        def boom():
+            raise RuntimeError("provider said no")
+
+        with pytest.raises(RuntimeError):
+            p._throttled_provider_call(boom)
+        t0 = _time.monotonic()
+        p._throttled_provider_call(lambda: None)
+        assert _time.monotonic() - t0 >= 0.04
+
+
+# ---------- stable episode filenames (#18 follow-up) ----------
+
+class TestExistingEpisodeBasename:
+    PREFIX = "Shining Girls - S01E01"
+
+    def _touch(self, folder, name, mtime):
+        path = folder / name
+        path.write_text("x")
+        os.utime(path, (mtime, mtime))
+
+    def test_no_folder_returns_none(self, p, tmp_path):
+        assert p._existing_episode_basename(str(tmp_path / "Season 01"), self.PREFIX, {}) is None
+
+    def test_title_change_reuses_existing_name(self, p, tmp_path):
+        # The case found on a two-provider instance: one provider titles the
+        # episode "Shining Girls S01E01", the other "Cutline".
+        self._touch(tmp_path, "Shining Girls - S01E01 - Shining Girls S01E01.strm", 1000)
+        got = p._existing_episode_basename(str(tmp_path), self.PREFIX, {})
+        assert got == "Shining Girls - S01E01 - Shining Girls S01E01"
+
+    def test_matches_untitled_file(self, p, tmp_path):
+        self._touch(tmp_path, "Shining Girls - S01E01.strm", 1000)
+        assert p._existing_episode_basename(str(tmp_path), self.PREFIX, {}) == self.PREFIX
+
+    def test_does_not_match_other_episodes(self, p, tmp_path):
+        self._touch(tmp_path, "Shining Girls - S01E010 - Ten.strm", 1000)
+        self._touch(tmp_path, "Shining Girls - S01E01E02 - Double.strm", 1000)
+        self._touch(tmp_path, "Shining Girls - S01E02 - Evergreen.strm", 1000)
+        self._touch(tmp_path, "Shining Girls - S01E01 - Cutline.nfo", 1000)
+        assert p._existing_episode_basename(str(tmp_path), self.PREFIX, {}) is None
+
+    def test_oldest_copy_wins(self, p, tmp_path):
+        self._touch(tmp_path, "Shining Girls - S01E01 - Cutline.strm", 2000)
+        self._touch(tmp_path, "Shining Girls - S01E01 - Shining Girls S01E01.strm", 1000)
+        got = p._existing_episode_basename(str(tmp_path), self.PREFIX, {})
+        assert got == "Shining Girls - S01E01 - Shining Girls S01E01"
+
+    def test_listing_is_cached_per_folder(self, p, tmp_path):
+        cache = {}
+        assert p._existing_episode_basename(str(tmp_path), self.PREFIX, cache) is None
+        self._touch(tmp_path, "Shining Girls - S01E01 - Cutline.strm", 1000)
+        assert p._existing_episode_basename(str(tmp_path), self.PREFIX, cache) is None
+        assert p._existing_episode_basename(str(tmp_path), self.PREFIX, {}) == "Shining Girls - S01E01 - Cutline"
+
+
+# ---------- scheduled-run logging ----------
+
+class TestScheduleLogger:
+    def test_writes_info_to_real_stderr_once(self, capfd):
+        import plugin as plugin_mod
+        a = plugin_mod._vod2mlib_schedule_logger()
+        b = plugin_mod._vod2mlib_schedule_logger()
+        assert a is b
+        assert sum(getattr(h, "_vod2mlib", False) for h in a.handlers) == 1
+        assert a.propagate is False
+        a.info("Provider episode fetches this run: %d of %d series", 3, 10)
+        err = capfd.readouterr().err
+        assert "Provider episode fetches this run: 3 of 10 series" in err
+        assert err.count("Provider episode fetches") == 1

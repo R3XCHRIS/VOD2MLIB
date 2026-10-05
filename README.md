@@ -207,6 +207,8 @@ In Jellyfin: Dashboard → Libraries → (your VOD library) → Manage Library, 
 
 **Folders named `Aladdin (2026) (2026)` (duplicate year).** This was a bug in v1.4 and earlier. Fixed in v1.5+ but pre-existing duplicate-year folders aren't auto-renamed. Run `[⚠ DANGER] Clean up Movies` once to remove them, then re-run `[GENERATE] Movies` to regenerate cleanly. (Cleanup deletes only `.strm`/`.nfo` — user-added subtitles/posters survive.)
 
+**Provider complains about too many requests (HTTP 429) during rescans.** Fixed in v1.18.1 ([#18](https://github.com/R3XCHRIS/VOD2MLIB/issues/18)). Earlier versions re-fetched every series' episode list from the provider on every rescan. Now a rescan only fetches series the provider has changed since the last fetch, one request at a time, and the run log shows how many fetches it made (`Provider episode fetches this run`).
+
 **Generate Series fails for some series.** The summary lists the failed series names with their errors. Common causes: M3U upstream timeout, malformed episode metadata. The plugin continues with the rest of the batch.
 
 **`localhost`/`127.0.0.1` in Dispatcharr URL.** The plugin refuses to write `.strm` with a localhost URL — your media server can't resolve it. Use the container's reachable IP/hostname.

@@ -1,10 +1,8 @@
 """
 VOD to Media Library — Dispatcharr VOD .strm Generator Plugin
 (slug: vod2mlib)
-v1.18.0 — cleaner NFO titles (provider tags/quality tokens stripped)
-          plus an option to omit <title> entirely so Jellyfin uses TMDB;
-          collapse duplicate episode relations to one .strm; bigger
-          series batch sizes; warn when a TMDB ID is missing.
+v1.18.1 — rescans only fetch episodes from the provider for series the
+          provider has changed, one request at a time (#18).
 
 MIT License
 Copyright (c) 2025-2026 shedunraid (original author)
@@ -14,6 +12,8 @@ This fork:  https://github.com/R3XCHRIS/VOD2MLIB
 """
 import os
 import re
+import threading
+import time
 from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -22,7 +22,7 @@ class Plugin:
     """Generate .strm files for VOD movies from Dispatcharr."""
     
     name = "VOD to Media Library"
-    version = "1.18.0"
+    version = "1.18.1"
     help_url = "https://github.com/R3XCHRIS/VOD2MLIB#readme"
     description = (
         "Convert Dispatcharr VODs into media-server-friendly .strm files, with "
@@ -36,6 +36,19 @@ class Plugin:
     MAX_FILENAME_LEN = 200
     # Cap the category list printed by Scan — catalogues can have hundreds.
     SCAN_CATEGORY_LIMIT = 40
+
+    # Episode fetches go straight to the provider (one get_series_info call
+    # per series), so a rescan over a big catalogue used to send thousands of
+    # them back to back and got accounts rate-limited (#18). Fetches now run
+    # one at a time with a gap between them, and a rescan only fetches series
+    # whose provider `last_modified` is newer than our last fetch.
+    EPISODE_FETCH_MIN_INTERVAL = 0.5
+    # Providers that send no usable `last_modified` get re-checked this often.
+    EPISODE_RECHECK_FALLBACK_HOURS = 168
+    # Allowance for clock skew between the provider and Dispatcharr.
+    EPISODE_CHANGE_SLACK_SECONDS = 3600
+    _provider_fetch_lock = threading.Lock()
+    _provider_fetch_last = 0.0
 
     # Schedule task identity (django-celery-beat row name + Celery task name)
     SCHEDULE_TASK_NAME = "vod2mlib.auto_rescan"
@@ -1176,6 +1189,29 @@ class Plugin:
                 "errors": 0,
             }
 
+        fetch_decisions = {}
+        fetch_count = 0
+        now_ts = time.time()
+        for series_rel in to_process:
+            reason = self._episode_fetch_reason(
+                series_rel.custom_properties,
+                getattr(series_rel, "last_episode_refresh", None),
+                refresh_existing,
+                now_ts,
+            )
+            fetch_decisions[series_rel.pk] = reason is not None
+            if reason is not None:
+                fetch_count += 1
+        logger.info(
+            "Provider episode fetches this run: %d of %d series (%d unchanged at the provider, using Dispatcharr's stored episodes)",
+            fetch_count, len(to_process), len(to_process) - fetch_count,
+        )
+        if fetch_count:
+            logger.info(
+                "Fetches run one at a time, %.1fs apart, to stay within provider rate limits.",
+                self.EPISODE_FETCH_MIN_INTERVAL,
+            )
+
         created_strm = 0
         refreshed_strm = 0
         created_nfo = 0
@@ -1202,6 +1238,7 @@ class Plugin:
                     omit_stream_id,
                     tmdb_tag_format,
                     nfo_omit_title,
+                    fetch_decisions.get(series_rel.pk),
                 ): series_rel
                 for series_rel in to_process
             }
@@ -1235,6 +1272,7 @@ class Plugin:
         logger.info("  Series with new content: %d", series_created)
         logger.info("  Series up-to-date:       %d", series_uptodate)
         logger.info("  New episode .strm files: %d", created_strm)
+        logger.info("  Provider fetches:        %d", fetch_count)
         if refresh_existing:
             logger.info("  Refreshed episode URLs:  %d", refreshed_strm)
         if generate_nfo:
@@ -1269,18 +1307,70 @@ class Plugin:
             "episodes_created": created_strm,
             "episodes_refreshed": refreshed_strm,
             "nfo_created": created_nfo if generate_nfo else 0,
+            "provider_fetches": fetch_count,
             "deduped": deduped,
             "errors": errors,
             "failures": failures,
         }
 
-    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False, tmdb_tag_format="plex", nfo_omit_title=False):
+    def _episode_fetch_reason(self, custom_props, last_episode_refresh, refresh_existing, now_ts=None):
+        """Why this series' episodes should be fetched from the provider, or None.
+
+        A series Dispatcharr has never fetched episodes for always needs one.
+        Otherwise only rescans (refresh_existing) fetch, and only when the
+        provider's `last_modified` for the series (stored by Dispatcharr's VOD
+        refresh in custom_properties.basic_data) is newer than our last fetch.
+        Providers that don't send a usable `last_modified` are re-checked every
+        EPISODE_RECHECK_FALLBACK_HOURS instead of on every run.
+        """
+        props = custom_props or {}
+        if not props.get("episodes_fetched", False):
+            return "never fetched"
+        if not refresh_existing:
+            return None
+        if last_episode_refresh is None:
+            return "no last fetch time"
+        fetched_at = last_episode_refresh.timestamp()
+
+        basic = props.get("basic_data") or {}
+        try:
+            modified_at = int(str(basic.get("last_modified") or "").strip())
+        except ValueError:
+            modified_at = 0
+        if modified_at > 0:
+            if modified_at >= fetched_at - self.EPISODE_CHANGE_SLACK_SECONDS:
+                return "changed at provider"
+            return None
+
+        if now_ts is None:
+            now_ts = time.time()
+        if now_ts - fetched_at >= self.EPISODE_RECHECK_FALLBACK_HOURS * 3600:
+            return "no provider change date, due for re-check"
+        return None
+
+    def _throttled_provider_call(self, fn, *args, **kwargs):
+        """Run a provider request alone, at least EPISODE_FETCH_MIN_INTERVAL
+        after the previous one finished. Shared by all worker threads, so the
+        parallel series workers never hit the provider concurrently (#18)."""
+        cls = type(self)
+        with cls._provider_fetch_lock:
+            wait = cls._provider_fetch_last + self.EPISODE_FETCH_MIN_INTERVAL - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                cls._provider_fetch_last = time.monotonic()
+
+    def _process_single_series(self, series_rel, dispatcharr_url, generate_nfo, series_root, logger, refresh_existing=False, nest_by_cat=False, append_tmdb_id=False, omit_stream_id=False, tmdb_tag_format="plex", nfo_omit_title=False, fetch_episodes=None):
         """Process a single series. Idempotent: writes only missing episode files.
 
         With refresh_existing=False, callers should pre-filter already-done
         series for performance. With refresh_existing=True, every series is
-        re-evaluated and the M3U source is re-fetched so newly-aired episodes
-        are picked up.
+        re-evaluated, and episodes are re-fetched from the provider for series
+        the provider has changed (see _episode_fetch_reason), so newly-aired
+        episodes are picked up. fetch_episodes overrides that decision; None
+        means decide here.
 
         When nest_by_cat=True the series folder is wrapped in a subfolder
         named by the M3U category (raw, sanitised) or 'Unassigned'.
@@ -1295,11 +1385,16 @@ class Plugin:
         )
 
         try:
-            custom_props = series_rel.custom_properties or {}
-            should_refetch = refresh_existing or not custom_props.get('episodes_fetched', False)
-            if should_refetch:
+            if fetch_episodes is None:
+                fetch_episodes = self._episode_fetch_reason(
+                    series_rel.custom_properties,
+                    getattr(series_rel, "last_episode_refresh", None),
+                    refresh_existing,
+                ) is not None
+            if fetch_episodes:
                 try:
-                    refresh_series_episodes(
+                    self._throttled_provider_call(
+                        refresh_series_episodes,
                         account=series_rel.m3u_account,
                         series=series_rel.series,
                         external_series_id=series_rel.external_series_id,
@@ -1359,6 +1454,7 @@ class Plugin:
             refreshed_episodes = 0
             unchanged_episodes = 0
             new_nfo = 0
+            season_listings = {}
 
             if generate_nfo:
                 tvshow_nfo_path = os.path.join(series_folder, "tvshow.nfo")
@@ -1377,13 +1473,23 @@ class Plugin:
                 season_folder_name = f"Season {season_num:02d}"
                 season_folder = os.path.join(series_folder, season_folder_name)
 
+                episode_prefix = f"{series_name} - S{season_num:02d}E{episode_num:02d}"
                 episode_title = episode.name or ""
                 if episode_title:
                     clean_title = self._clean_title(episode_title)
-                    filename = f"{series_name} - S{season_num:02d}E{episode_num:02d} - {clean_title}"
+                    filename = f"{episode_prefix} - {clean_title}"
                 else:
-                    filename = f"{series_name} - S{season_num:02d}E{episode_num:02d}"
+                    filename = episode_prefix
                 filename = self._sanitize_filename(filename)
+                # Keep the name already on disk. The title is not stable: with
+                # two providers, Dispatcharr's shared Episode.name holds
+                # whichever provider fetched last, so a fresh name would write
+                # a second copy of the episode beside the first.
+                existing_name = self._existing_episode_basename(
+                    season_folder, self._sanitize_filename(episode_prefix), season_listings,
+                )
+                if existing_name:
+                    filename = existing_name
 
                 strm_path = os.path.join(season_folder, f"{filename}.strm")
                 is_existing = os.path.isfile(strm_path)
@@ -2013,6 +2119,38 @@ class Plugin:
         text = text.replace("'", '&apos;')
         return text
     
+    def _existing_episode_basename(self, season_folder, episode_prefix, listings):
+        """Basename (no extension) of a .strm already on disk for this episode,
+        or None.
+
+        Matches `<prefix>.strm` and `<prefix> - <title>.strm`, where prefix is
+        `<series> - SxxEyy`, so a changed episode title reuses the existing
+        file instead of adding a duplicate. If a library already holds several
+        copies, the oldest wins, being the one the media server most likely
+        has. `listings` caches each season folder's .strm files for the run.
+        """
+        entries = listings.get(season_folder)
+        if entries is None:
+            entries = []
+            try:
+                for name in os.listdir(season_folder):
+                    if name.endswith(".strm"):
+                        try:
+                            mtime = os.stat(os.path.join(season_folder, name)).st_mtime
+                        except OSError:
+                            continue
+                        entries.append((name[:-5], mtime))
+            except OSError:
+                pass
+            listings[season_folder] = entries
+        matches = [
+            (mtime, base) for base, mtime in entries
+            if base == episode_prefix or base.startswith(episode_prefix + " - ")
+        ]
+        if not matches:
+            return None
+        return min(matches)[1]
+
     def _sanitize_filename(self, name: str) -> str:
         """Sanitize filename by removing invalid characters."""
         if not name:
@@ -2429,6 +2567,28 @@ class Plugin:
         }
 
 
+def _vod2mlib_schedule_logger():
+    """Logger for scheduled runs that actually reaches the container log.
+
+    Dispatcharr starts its `dvr` Celery worker without `-l info`, so the
+    worker drops INFO records from every logger it configures, and a plain
+    named logger went nowhere at all. This one writes straight to the
+    process's real stderr, which uwsgi forwards to `docker logs`. The handler
+    is added once per worker process, since the task runs repeatedly in it.
+    """
+    import logging
+    import sys
+    logger = logging.getLogger("vod2mlib.schedule")
+    if not any(getattr(h, "_vod2mlib", False) for h in logger.handlers):
+        handler = logging.StreamHandler(sys.__stderr__)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        handler._vod2mlib = True
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
+
+
 try:
     from celery import shared_task as _vod2mlib_shared_task
 
@@ -2442,8 +2602,7 @@ try:
         UI would show stale timestamps for Test fire clicks and silently mask
         ticks that beat dispatched but the worker rejected/failed.
         """
-        import logging
-        logger = logging.getLogger("vod2mlib.schedule")
+        logger = _vod2mlib_schedule_logger()
         result = Plugin().run(action, {}, {"logger": logger, "settings": settings or {}})
         try:
             from django.utils import timezone
